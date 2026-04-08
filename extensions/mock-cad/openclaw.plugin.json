@@ -1,9 +1,0 @@
-{
-  "id": "mock-cad",
-  "enabledByDefault": false,
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "properties": {}
-  }
-}

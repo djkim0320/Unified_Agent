@@ -1,9 +1,0 @@
-{
-  "id": "mock-concept",
-  "enabledByDefault": false,
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "properties": {}
-  }
-}

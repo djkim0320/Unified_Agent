@@ -1,9 +1,0 @@
-{
-  "id": "mock-cfd",
-  "enabledByDefault": false,
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "properties": {}
-  }
-}

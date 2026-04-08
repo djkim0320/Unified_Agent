@@ -2,11 +2,29 @@ export type UpdateAvailable = import("../../../src/infra/update-startup.js").Upd
 import type { CronJobBase } from "../../../src/cron/types-shared.js";
 import type { ConfigUiHints } from "../../../src/shared/config-ui-hints-types.js";
 import type {
+  ResearchAddonStatus,
+  ResearchArtifactRecord,
+  ResearchOverview,
+  ResearchProject,
+  ResearchProjectGetResult,
+  ResearchProjectsListResult,
+  ResearchRunRecord,
+} from "../../../src/research/types.js";
+import type {
   GatewayAgentRow as SharedGatewayAgentRow,
   SessionsListResultBase,
   SessionsPatchResultBase,
 } from "../../../src/shared/session-types.js";
 export type { ConfigUiHint, ConfigUiHints } from "../../../src/shared/config-ui-hints-types.js";
+export type {
+  ResearchAddonStatus,
+  ResearchArtifactRecord,
+  ResearchOverview,
+  ResearchProject,
+  ResearchProjectGetResult,
+  ResearchProjectsListResult,
+  ResearchRunRecord,
+};
 
 export type ChannelsStatusSnapshot = {
   ts: number;

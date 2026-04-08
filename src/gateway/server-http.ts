@@ -64,6 +64,7 @@ import {
   resolveHttpBrowserOriginPolicy,
 } from "./http-utils.js";
 import { handleOpenAiModelsHttpRequest } from "./models-http.js";
+import { handleResearchArtifactHttpRequest } from "./research-artifacts-http.js";
 import { resolveRequestClientIp } from "./net.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
 import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
@@ -939,6 +940,17 @@ export function createGatewayHttpServer(opts: {
           rateLimiter,
         }),
       );
+
+      requestStages.push({
+        name: "research-artifacts",
+        run: () =>
+          handleResearchArtifactHttpRequest(req, res, {
+            auth: resolvedAuth,
+            trustedProxies,
+            allowRealIpFallback,
+            rateLimiter,
+          }),
+      });
 
       if (controlUiEnabled) {
         requestStages.push({

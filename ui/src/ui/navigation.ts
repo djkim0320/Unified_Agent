@@ -3,14 +3,16 @@ import type { IconName } from "./icons.js";
 import { normalizeLowercaseStringOrEmpty } from "./string-coerce.ts";
 
 export const TAB_GROUPS = [
-  { label: "chat", tabs: ["chat"] },
   {
-    label: "control",
-    tabs: ["overview", "channels", "instances", "sessions", "usage", "cron"],
+    label: "workspace",
+    tabs: ["overview", "chat", "runs", "artifacts", "addons", "settings", "advanced"],
   },
-  { label: "agent", tabs: ["agents", "skills", "nodes", "dreams"] },
   {
-    label: "settings",
+    label: "legacy",
+    tabs: ["channels", "instances", "sessions", "usage", "cron", "agents", "skills", "nodes", "dreams"],
+  },
+  {
+    label: "system",
     tabs: [
       "config",
       "communications",
@@ -24,9 +26,44 @@ export const TAB_GROUPS = [
   },
 ] as const;
 
+export const RESEARCH_TABS = [
+  "overview",
+  "chat",
+  "runs",
+  "artifacts",
+  "addons",
+  "settings",
+  "advanced",
+] as const satisfies readonly Tab[];
+
+export const LEGACY_TABS = [
+  "agents",
+  "channels",
+  "instances",
+  "sessions",
+  "usage",
+  "cron",
+  "skills",
+  "nodes",
+  "config",
+  "communications",
+  "appearance",
+  "automation",
+  "infrastructure",
+  "aiAgents",
+  "debug",
+  "logs",
+  "dreams",
+] as const satisfies readonly Tab[];
+
 export type Tab =
   | "agents"
   | "overview"
+  | "runs"
+  | "artifacts"
+  | "addons"
+  | "settings"
+  | "advanced"
   | "channels"
   | "instances"
   | "sessions"
@@ -48,6 +85,11 @@ export type Tab =
 const TAB_PATHS: Record<Tab, string> = {
   agents: "/agents",
   overview: "/overview",
+  runs: "/runs",
+  artifacts: "/artifacts",
+  addons: "/addons",
+  settings: "/settings",
+  advanced: "/advanced",
   channels: "/channels",
   instances: "/instances",
   sessions: "/sessions",
@@ -128,7 +170,7 @@ export function tabFromPath(pathname: string, basePath = ""): Tab | null {
     normalized = "/";
   }
   if (normalized === "/") {
-    return "chat";
+    return "overview";
   }
   return PATH_TO_TAB.get(normalized) ?? null;
 }
@@ -159,6 +201,16 @@ export function iconForTab(tab: Tab): IconName {
   switch (tab) {
     case "agents":
       return "folder";
+    case "runs":
+      return "loader";
+    case "artifacts":
+      return "fileText";
+    case "addons":
+      return "zap";
+    case "settings":
+      return "settings";
+    case "advanced":
+      return "bug";
     case "chat":
       return "messageSquare";
     case "overview":
@@ -201,9 +253,25 @@ export function iconForTab(tab: Tab): IconName {
 }
 
 export function titleForTab(tab: Tab) {
+  if (tab === "runs") return "Runs";
+  if (tab === "artifacts") return "Artifacts";
+  if (tab === "addons") return "Add-ons";
+  if (tab === "settings") return "Settings";
+  if (tab === "advanced") return "Advanced";
   return t(`tabs.${tab}`);
 }
 
 export function subtitleForTab(tab: Tab) {
+  if (tab === "overview") return "Research overview";
+  if (tab === "chat") return "Project chat and quick interventions";
+  if (tab === "runs") return "Task-backed research runs";
+  if (tab === "artifacts") return "Generated outputs";
+  if (tab === "addons") return "Research add-ons";
+  if (tab === "settings") return "Project configuration";
+  if (tab === "advanced") return "Legacy operator tools";
   return t(`subtitles.${tab}`);
+}
+
+export function isResearchTab(tab: Tab): tab is (typeof RESEARCH_TABS)[number] {
+  return (RESEARCH_TABS as readonly string[]).includes(tab);
 }

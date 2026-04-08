@@ -36,6 +36,11 @@ import type {
   SkillStatusReport,
   StatusSummary,
   ToolsCatalogResult,
+  ResearchAddonStatus,
+  ResearchArtifactRecord,
+  ResearchOverview,
+  ResearchProject,
+  ResearchRunRecord,
 } from "./types.ts";
 import type { ChatAttachment, ChatQueueItem } from "./ui-types.ts";
 import type { NostrProfileFormState } from "./views/channels.nostr-profile-form.ts";
@@ -171,6 +176,33 @@ export type AppViewState = {
   agentsLoading: boolean;
   agentsList: AgentsListResult | null;
   agentsError: string | null;
+  researchProjectsLoading: boolean;
+  researchProjectsError: string | null;
+  researchProjects: ResearchProject[];
+  researchProjectId: string | null;
+  researchOverviewLoading: boolean;
+  researchOverviewError: string | null;
+  researchOverview: ResearchOverview | null;
+  researchRunsLoading: boolean;
+  researchRunsError: string | null;
+  researchRuns: ResearchRunRecord[];
+  researchSelectedRunId: string | null;
+  researchRunDetailLoading: boolean;
+  researchRunDetailError: string | null;
+  researchRunDetail: { run: ResearchRunRecord; logText: string | null } | null;
+  researchArtifactsLoading: boolean;
+  researchArtifactsError: string | null;
+  researchArtifacts: ResearchArtifactRecord[];
+  researchSelectedArtifactId: string | null;
+  researchArtifactDetailLoading: boolean;
+  researchArtifactDetailError: string | null;
+  researchArtifactDetail: ResearchArtifactRecord | null;
+  researchAddonsLoading: boolean;
+  researchAddonsError: string | null;
+  researchAddons: ResearchAddonStatus[];
+  researchSessionsLoading: boolean;
+  researchSessionsError: string | null;
+  researchSessionsResult: SessionsListResult | null;
   agentsSelectedId: string | null;
   toolsCatalogLoading: boolean;
   toolsCatalogError: string | null;

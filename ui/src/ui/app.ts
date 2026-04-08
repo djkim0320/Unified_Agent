@@ -89,6 +89,11 @@ import type {
   LogLevel,
   ModelCatalogEntry,
   PresenceEntry,
+  ResearchAddonStatus,
+  ResearchArtifactRecord,
+  ResearchOverview,
+  ResearchProject,
+  ResearchRunRecord,
   ChannelsStatusSnapshot,
   SessionCompactionCheckpoint,
   SessionsListResult,
@@ -137,7 +142,7 @@ export class OpenClawApp extends LitElement {
   @state() password = "";
   @state() loginShowGatewayToken = false;
   @state() loginShowGatewayPassword = false;
-  @state() tab: Tab = "chat";
+  @state() tab: Tab = "overview";
   @state() onboarding = resolveOnboardingMode();
   @state() connected = false;
   @state() theme: ThemeName = this.settings.theme ?? "claw";
@@ -275,6 +280,33 @@ export class OpenClawApp extends LitElement {
   @state() agentsLoading = false;
   @state() agentsList: AgentsListResult | null = null;
   @state() agentsError: string | null = null;
+  @state() researchProjectsLoading = false;
+  @state() researchProjectsError: string | null = null;
+  @state() researchProjects: ResearchProject[] = [];
+  @state() researchProjectId: string | null = this.settings.researchProjectId || null;
+  @state() researchOverviewLoading = false;
+  @state() researchOverviewError: string | null = null;
+  @state() researchOverview: ResearchOverview | null = null;
+  @state() researchRunsLoading = false;
+  @state() researchRunsError: string | null = null;
+  @state() researchRuns: ResearchRunRecord[] = [];
+  @state() researchSelectedRunId: string | null = null;
+  @state() researchRunDetailLoading = false;
+  @state() researchRunDetailError: string | null = null;
+  @state() researchRunDetail: { run: ResearchRunRecord; logText: string | null } | null = null;
+  @state() researchArtifactsLoading = false;
+  @state() researchArtifactsError: string | null = null;
+  @state() researchArtifacts: ResearchArtifactRecord[] = [];
+  @state() researchSelectedArtifactId: string | null = null;
+  @state() researchArtifactDetailLoading = false;
+  @state() researchArtifactDetailError: string | null = null;
+  @state() researchArtifactDetail: ResearchArtifactRecord | null = null;
+  @state() researchAddonsLoading = false;
+  @state() researchAddonsError: string | null = null;
+  @state() researchAddons: ResearchAddonStatus[] = [];
+  @state() researchSessionsLoading = false;
+  @state() researchSessionsError: string | null = null;
+  @state() researchSessionsResult: SessionsListResult | null = null;
   @state() agentsSelectedId: string | null = null;
   @state() toolsCatalogLoading = false;
   @state() toolsCatalogError: string | null = null;

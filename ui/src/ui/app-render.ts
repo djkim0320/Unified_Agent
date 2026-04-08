@@ -89,6 +89,16 @@ import {
   toggleSessionCompactionCheckpoints,
 } from "./controllers/sessions.ts";
 import {
+  cancelResearchRunById,
+  loadResearchArtifactDetail,
+  loadResearchChatState,
+  loadResearchRunDetail,
+  loadResearchTabData,
+  saveResearchProjectSettings,
+  selectResearchProject,
+  setResearchAddonEnabled,
+} from "./controllers/research.ts";
+import {
   closeClawHubDetail,
   installFromClawHub,
   installSkill,
@@ -103,7 +113,14 @@ import {
 import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "./external-link.ts";
 import { icons } from "./icons.ts";
 import "./components/dashboard-header.ts";
-import { normalizeBasePath, TAB_GROUPS, subtitleForTab, titleForTab } from "./navigation.ts";
+import {
+  isResearchTab,
+  normalizeBasePath,
+  TAB_GROUPS,
+  subtitleForTab,
+  titleForTab,
+  type Tab,
+} from "./navigation.ts";
 import {
   buildAgentMainSessionKey,
   parseAgentSessionKey,
@@ -129,6 +146,16 @@ import { renderExecApprovalPrompt } from "./views/exec-approval.ts";
 import { renderGatewayUrlConfirmation } from "./views/gateway-url-confirmation.ts";
 import { renderLoginGate } from "./views/login-gate.ts";
 import { renderOverview } from "./views/overview.ts";
+import {
+  renderResearchAddons,
+  renderResearchAdvanced,
+  renderResearchArtifacts,
+  renderResearchChatView,
+  renderResearchOverview,
+  renderResearchRuns,
+  renderResearchSettings,
+  renderResearchWorkspace,
+} from "./views/research-shell.ts";
 
 // Lazy-loaded view modules – deferred so the initial bundle stays small.
 // Each loader resolves once; subsequent calls return the cached module.
@@ -362,14 +389,21 @@ export function renderApp(state: AppViewState) {
   const sessionsCount = state.sessionsResult?.count ?? null;
   const cronNext = state.cronStatus?.nextWakeAtMs ?? null;
   const chatDisabledReason = state.connected ? null : t("chat.disconnected");
-  const isChat = state.tab === "chat";
-  const chatFocus = isChat && (state.settings.chatFocusMode || state.onboarding);
+  const isResearch = isResearchTab(state.tab);
+  const isChat = state.tab === "chat" && !isResearch;
+  const chatFocus = state.tab === "chat" && (state.settings.chatFocusMode || state.onboarding);
   const navDrawerOpen = Boolean(state.navDrawerOpen && !chatFocus && !state.onboarding);
   const navCollapsed = Boolean(state.settings.navCollapsed && !navDrawerOpen);
   const showThinking = state.onboarding ? false : state.settings.chatShowThinking;
   const showToolCalls = state.onboarding ? true : state.settings.chatShowToolCalls;
   const assistantAvatarUrl = resolveAssistantAvatarUrl(state);
   const chatAvatarUrl = state.chatAvatarUrl ?? assistantAvatarUrl ?? null;
+  const currentProject =
+    (state.researchProjectId
+      ? (state.researchProjects.find((project) => project.id === state.researchProjectId) ?? null)
+      : null) ||
+    state.researchProjects[0] ||
+    null;
   const configValue =
     state.configForm ?? (state.configSnapshot?.config as Record<string, unknown> | null);
   const configuredDreaming = resolveConfiguredDreaming(configValue);
@@ -403,6 +437,15 @@ export function renderApp(state: AppViewState) {
   const toolsPanelUsesActiveSession = Boolean(
     resolvedAgentId && activeSessionAgentId && resolvedAgentId === activeSessionAgentId,
   );
+  const researchAgentList = currentProject
+    ? {
+        defaultId: currentProject.agentId,
+        agents:
+          state.agentsList?.agents.filter((agent) => agent.id === currentProject.agentId) ?? [
+            { id: currentProject.agentId, name: currentProject.name },
+          ],
+      }
+    : null;
   const getCurrentConfigValue = () =>
     state.configForm ?? (state.configSnapshot?.config as Record<string, unknown> | null);
   const findAgentIndex = (agentId: string) =>
@@ -483,7 +526,9 @@ export function renderApp(state: AppViewState) {
       },
     })}
     <div
-      class="shell ${isChat ? "shell--chat" : ""} ${chatFocus
+      class="shell ${state.tab === "chat" ? "shell--chat" : ""} ${isResearch
+        ? "shell--research"
+        : ""} ${chatFocus
         ? "shell--chat-focus"
         : ""} ${navCollapsed ? "shell--nav-collapsed" : ""} ${navDrawerOpen
         ? "shell--nav-drawer-open"
@@ -533,7 +578,9 @@ export function renderApp(state: AppViewState) {
           </div>
         </div>
       </header>
-      <div class="shell-nav">
+      ${isResearch
+        ? nothing
+        : html`<div class="shell-nav">
         <aside class="sidebar ${navCollapsed ? "sidebar--collapsed" : ""}">
           <div class="sidebar-shell">
             <div class="sidebar-shell__header">
@@ -646,8 +693,8 @@ export function renderApp(state: AppViewState) {
             </div>
           </div>
         </aside>
-      </div>
-      <main class="content ${isChat ? "content--chat" : ""}">
+      </div>`}
+      <main class="content ${isChat ? "content--chat" : ""} ${isResearch ? "content--research" : ""}">
         ${state.updateAvailable &&
         state.updateAvailable.latestVersion !== state.updateAvailable.currentVersion &&
         !isUpdateBannerDismissed(state.updateAvailable)
@@ -675,7 +722,7 @@ export function renderApp(state: AppViewState) {
               </button>
             </div>`
           : nothing}
-        ${state.tab === "config"
+        ${state.tab === "config" || isResearch
           ? nothing
           : html`<section class="content-header">
               <div>
@@ -718,7 +765,186 @@ export function renderApp(state: AppViewState) {
                 ${isChat ? renderChatControls(state) : nothing}
               </div>
             </section>`}
-        ${state.tab === "overview"
+        ${isResearch
+          ? renderResearchWorkspace({
+              state,
+              currentProject,
+              onProjectSelect: (projectId) => {
+                const rememberedTab = (state.settings.researchLastTabByProject ?? {})[projectId];
+                void (async () => {
+                  await selectResearchProject(state as never, projectId);
+                  if (rememberedTab && isResearchTab(rememberedTab as Tab) && rememberedTab !== state.tab) {
+                    state.setTab(rememberedTab as Tab);
+                    return;
+                  }
+                  if (!isResearchTab(state.tab)) {
+                    state.setTab("overview");
+                    return;
+                  }
+                  await loadResearchTabData(state as never);
+                })();
+              },
+              onResearchTabSelect: (tab) => state.setTab(tab),
+              onLegacyNavigate: (tab) => state.setTab(tab),
+              requestUpdate: requestHostUpdate,
+              content:
+                state.tab === "overview"
+                  ? renderResearchOverview({
+                      state,
+                      currentProject,
+                    })
+                  : state.tab === "chat"
+                    ? renderResearchChatView({
+                        state,
+                        onSessionSelect: (key) => {
+                          switchChatSession(state, key);
+                          void loadResearchChatState(state as never);
+                        },
+                        chatContent: renderChat({
+                          sessionKey: state.sessionKey,
+                          onSessionKeyChange: (next) => {
+                            switchChatSession(state, next);
+                            void loadResearchChatState(state as never);
+                          },
+                          thinkingLevel: state.chatThinkingLevel,
+                          showThinking,
+                          showToolCalls,
+                          loading: state.chatLoading || state.researchSessionsLoading,
+                          sending: state.chatSending,
+                          compactionStatus: state.compactionStatus,
+                          fallbackStatus: state.fallbackStatus,
+                          assistantAvatarUrl: chatAvatarUrl,
+                          messages: state.chatMessages,
+                          toolMessages: state.chatToolMessages,
+                          streamSegments: state.chatStreamSegments,
+                          stream: state.chatStream,
+                          streamStartedAt: state.chatStreamStartedAt,
+                          draft: state.chatMessage,
+                          queue: state.chatQueue,
+                          connected: state.connected,
+                          canSend: state.connected,
+                          disabledReason: chatDisabledReason,
+                          error: state.lastError ?? state.researchSessionsError,
+                          sessions: state.researchSessionsResult,
+                          focusMode: chatFocus,
+                          onRefresh: () => loadResearchChatState(state as never),
+                          onToggleFocusMode: () => {
+                            if (state.onboarding) {
+                              return;
+                            }
+                            state.applySettings({
+                              ...state.settings,
+                              chatFocusMode: !state.settings.chatFocusMode,
+                            });
+                          },
+                          onChatScroll: (event) => state.handleChatScroll(event),
+                          getDraft: () => state.chatMessage,
+                          onDraftChange: (next) => (state.chatMessage = next),
+                          onRequestUpdate: requestHostUpdate,
+                          attachments: state.chatAttachments,
+                          onAttachmentsChange: (next) => (state.chatAttachments = next),
+                          onSend: () => state.handleSendChat(),
+                          canAbort: Boolean(state.chatRunId),
+                          onAbort: () => void state.handleAbortChat(),
+                          onQueueRemove: (id) => state.removeQueuedMessage(id),
+                          onNewSession: async () => {
+                            await state.handleSendChat("/new", { restoreDraft: true });
+                            await loadResearchChatState(state as never);
+                          },
+                          onClearHistory: async () => {
+                            if (!state.client || !state.connected) {
+                              return;
+                            }
+                            try {
+                              await state.client.request("sessions.reset", { key: state.sessionKey });
+                              state.chatMessages = [];
+                              state.chatStream = null;
+                              state.chatRunId = null;
+                              await loadResearchChatState(state as never);
+                            } catch (err) {
+                              state.lastError = String(err);
+                            }
+                          },
+                          agentsList: researchAgentList,
+                          currentAgentId: currentProject?.agentId ?? resolvedAgentId ?? "main",
+                          onAgentChange: (agentId: string) => {
+                            const project = state.researchProjects.find((entry) => entry.agentId === agentId);
+                            if (project) {
+                              const remembered = (state.settings.researchLastTabByProject ?? {})[project.id];
+                              void (async () => {
+                                await selectResearchProject(state as never, project.id);
+                                if (remembered && isResearchTab(remembered as Tab) && remembered !== state.tab) {
+                                  state.setTab(remembered as Tab);
+                                  return;
+                                }
+                                await loadResearchChatState(state as never);
+                              })();
+                            }
+                          },
+                          onNavigateToAgent: () => {
+                            state.agentsSelectedId = currentProject?.agentId ?? resolvedAgentId;
+                            state.setTab("agents");
+                          },
+                          onSessionSelect: (key: string) => {
+                            switchChatSession(state, key);
+                            void loadResearchChatState(state as never);
+                          },
+                          showNewMessages: state.chatNewMessagesBelow && !state.chatManualRefreshInFlight,
+                          onScrollToBottom: () => state.scrollToBottom(),
+                          sidebarOpen: state.sidebarOpen,
+                          sidebarContent: state.sidebarContent,
+                          sidebarError: state.sidebarError,
+                          splitRatio: state.splitRatio,
+                          onOpenSidebar: (content: string) => state.handleOpenSidebar(content),
+                          onCloseSidebar: () => state.handleCloseSidebar(),
+                          onSplitRatioChange: (ratio: number) => state.handleSplitRatioChange(ratio),
+                          assistantName: state.assistantName,
+                          assistantAvatar: state.assistantAvatar,
+                          basePath: state.basePath ?? "",
+                        }),
+                      })
+                    : state.tab === "runs"
+                      ? renderResearchRuns({
+                          state,
+                          currentProject,
+                          onRunSelect: (runId) => void loadResearchRunDetail(state as never, runId),
+                          onRunCancel: (runId) => void cancelResearchRunById(state as never, runId),
+                          onArtifactSelect: (artifactId) => {
+                            state.setTab("artifacts");
+                            void loadResearchArtifactDetail(state as never, artifactId);
+                          },
+                          requestUpdate: requestHostUpdate,
+                        })
+                      : state.tab === "artifacts"
+                        ? renderResearchArtifacts({
+                            state,
+                            currentProject,
+                            onArtifactSelect: (artifactId) =>
+                              void loadResearchArtifactDetail(state as never, artifactId),
+                            onRunSelect: (runId) => {
+                              state.setTab("runs");
+                              void loadResearchRunDetail(state as never, runId);
+                            },
+                            requestUpdate: requestHostUpdate,
+                          })
+                        : state.tab === "addons"
+                          ? renderResearchAddons({
+                              state,
+                              onAddonToggle: (addonId, enabled) =>
+                                void setResearchAddonEnabled(state as never, addonId, enabled),
+                            })
+                          : state.tab === "settings"
+                            ? renderResearchSettings({
+                                state,
+                                currentProject,
+                                onSave: (patch) => void saveResearchProjectSettings(state as never, patch),
+                              })
+                            : renderResearchAdvanced({
+                                onLegacyNavigate: (tab) => state.setTab(tab),
+                              }),
+            })
+          : nothing}
+        ${!isResearch && state.tab === "overview"
           ? renderOverview({
               connected: state.connected,
               hello: state.hello,
@@ -1543,7 +1769,7 @@ export function renderApp(state: AppViewState) {
               }),
             )
           : nothing}
-        ${state.tab === "chat"
+        ${!isResearch && state.tab === "chat"
           ? renderChat({
               sessionKey: state.sessionKey,
               onSessionKeyChange: (next) => {

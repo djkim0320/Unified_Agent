@@ -1,5 +1,4 @@
 import { roleScopesAllow } from "../../../src/shared/operator-scope-compat.js";
-import { refreshChat } from "./app-chat.ts";
 import {
   startLogsPolling,
   stopLogsPolling,
@@ -22,11 +21,13 @@ import { loadExecApprovals } from "./controllers/exec-approvals.ts";
 import { loadLogs } from "./controllers/logs.ts";
 import { loadNodes } from "./controllers/nodes.ts";
 import { loadPresence } from "./controllers/presence.ts";
+import { loadResearchTabData } from "./controllers/research.ts";
 import { loadSessions } from "./controllers/sessions.ts";
 import { loadSkills } from "./controllers/skills.ts";
 import { loadUsage } from "./controllers/usage.ts";
 import {
   inferBasePathFromPathname,
+  isResearchTab,
   normalizeBasePath,
   normalizePath,
   pathForTab,
@@ -49,6 +50,7 @@ type SettingsHost = {
   applySessionKey: string;
   sessionKey: string;
   tab: Tab;
+  researchProjectId?: string | null;
   connected: boolean;
   chatHasAutoScrolled: boolean;
   logsAtBottom: boolean;
@@ -74,6 +76,8 @@ type SettingsHost = {
 export function applySettings(host: SettingsHost, next: UiSettings) {
   const normalized = {
     ...next,
+    researchProjectId: next.researchProjectId ?? "",
+    researchLastTabByProject: next.researchLastTabByProject ?? {},
     lastActiveSessionKey:
       normalizeOptionalString(next.lastActiveSessionKey) ??
       normalizeOptionalString(next.sessionKey) ??
@@ -237,8 +241,15 @@ export function setThemeMode(
 }
 
 export async function refreshActiveTab(host: SettingsHost) {
-  if (host.tab === "overview") {
-    await loadOverview(host);
+  if (isResearchTab(host.tab)) {
+    await loadResearchTabData(host as unknown as OpenClawApp);
+    if (host.tab === "chat") {
+      scheduleChatScroll(
+        host as unknown as Parameters<typeof scheduleChatScroll>[0],
+        !host.chatHasAutoScrolled,
+      );
+    }
+    return;
   }
   if (host.tab === "channels") {
     await loadChannelsTab(host);
@@ -295,13 +306,6 @@ export async function refreshActiveTab(host: SettingsHost) {
       loadDreamingStatus(host as unknown as OpenClawApp),
       loadDreamDiary(host as unknown as OpenClawApp),
     ]);
-  }
-  if (host.tab === "chat") {
-    await refreshChat(host as unknown as Parameters<typeof refreshChat>[0]);
-    scheduleChatScroll(
-      host as unknown as Parameters<typeof scheduleChatScroll>[0],
-      !host.chatHasAutoScrolled,
-    );
   }
   if (
     host.tab === "config" ||
@@ -488,6 +492,19 @@ function applyTabSelection(
 
   if (options.syncUrl) {
     syncUrlWithTab(host, next, false);
+  }
+
+  if (isResearchTab(next) && host.researchProjectId) {
+    const current = (host.settings.researchLastTabByProject ?? {})[host.researchProjectId];
+    if (current !== next) {
+      applySettings(host, {
+        ...host.settings,
+        researchLastTabByProject: {
+          ...(host.settings.researchLastTabByProject ?? {}),
+          [host.researchProjectId]: next,
+        },
+      });
+    }
   }
 }
 

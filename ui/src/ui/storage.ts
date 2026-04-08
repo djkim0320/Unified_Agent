@@ -47,6 +47,8 @@ export type UiSettings = {
   token: string;
   sessionKey: string;
   lastActiveSessionKey: string;
+  researchProjectId?: string;
+  researchLastTabByProject?: Record<string, string>;
   theme: ThemeName;
   themeMode: ThemeMode;
   chatFocusMode: boolean;
@@ -185,6 +187,8 @@ export function loadSettings(): UiSettings {
     token: loadSessionToken(defaultUrl),
     sessionKey: "main",
     lastActiveSessionKey: "main",
+    researchProjectId: "",
+    researchLastTabByProject: {},
     theme: "claw",
     themeMode: "system",
     chatFocusMode: false,
@@ -221,6 +225,12 @@ export function loadSettings(): UiSettings {
       token: loadSessionToken(gatewayUrl),
       sessionKey: scopedSessionSelection.sessionKey,
       lastActiveSessionKey: scopedSessionSelection.lastActiveSessionKey,
+      researchProjectId: normalizeOptionalString((parsed as { researchProjectId?: unknown }).researchProjectId) ?? "",
+      researchLastTabByProject:
+        typeof (parsed as { researchLastTabByProject?: unknown }).researchLastTabByProject === "object" &&
+        (parsed as { researchLastTabByProject?: unknown }).researchLastTabByProject !== null
+          ? ((parsed as { researchLastTabByProject?: Record<string, string> }).researchLastTabByProject ?? {})
+          : {},
       theme,
       themeMode: mode,
       chatFocusMode:
@@ -317,6 +327,12 @@ function persistSettings(next: UiSettings) {
     borderRadius: next.borderRadius,
     sessionsByGateway,
     ...(next.locale ? { locale: next.locale } : {}),
+    ...((next.researchProjectId ?? "").trim()
+      ? { researchProjectId: next.researchProjectId ?? "" }
+      : {}),
+    ...(next.researchLastTabByProject && Object.keys(next.researchLastTabByProject).length > 0
+      ? { researchLastTabByProject: next.researchLastTabByProject }
+      : {}),
   };
   const serialized = JSON.stringify(persisted);
   try {

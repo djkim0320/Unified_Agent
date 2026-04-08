@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/mock-cad",
+  "version": "2026.4.9",
+  "private": true,
+  "description": "OpenClaw mock CAD research add-on",
+  "type": "module",
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -134,8 +134,8 @@ describe("tabFromPath", () => {
     expect(tabFromPath("/dreams")).toBe("dreams");
   });
 
-  it("returns chat for root path", () => {
-    expect(tabFromPath("/")).toBe("chat");
+  it("returns overview for root path", () => {
+    expect(tabFromPath("/")).toBe("overview");
   });
 
   it("handles base paths", () => {
@@ -179,10 +179,9 @@ describe("inferBasePathFromPathname", () => {
 describe("TAB_GROUPS", () => {
   it("contains all expected groups", () => {
     const labels = TAB_GROUPS.map((g) => g.label);
-    expect(labels).toContain("chat");
-    expect(labels).toContain("control");
-    expect(labels).toContain("agent");
-    expect(labels).toContain("settings");
+    expect(labels).toContain("workspace");
+    expect(labels).toContain("legacy");
+    expect(labels).toContain("system");
   });
 
   it("all tabs are unique", () => {

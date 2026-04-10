@@ -64,6 +64,7 @@ const ToolArgumentSchemas: Record<ToolName, z.ZodType<Record<string, unknown>>> 
   exec_command: z.object({
     program: z.string().min(1),
     args: z.array(z.string()).optional(),
+    cwd: z.string().min(1).optional(),
     timeoutMs: z.number().int().min(1).max(120_000).optional(),
   }),
   provider_web_search: z.object({
@@ -112,6 +113,19 @@ export class AgentRunError extends Error {
 
 function clipText(text: string, maxLength = 4000) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function localizedToolStatusLabel(toolName: ToolName) {
+  if (toolName.includes("search")) {
+    return "검색 중";
+  }
+  if (toolName.startsWith("browser_")) {
+    return "브라우저 조사 중";
+  }
+  if (toolName === "exec_command") {
+    return "명령 실행 중";
+  }
+  return "파일 작업 중";
 }
 
 function toolStatusLabel(toolName: ToolName) {
@@ -163,7 +177,7 @@ function buildToolInstructions() {
     '- {"type":"tool_call","tool":{"name":"make_dir","arguments":{"scope":"sandbox","path":"research"}}}',
     '- {"type":"tool_call","tool":{"name":"move_path","arguments":{"scope":"sandbox","from":"a.txt","to":"archive/a.txt"}}}',
     '- {"type":"tool_call","tool":{"name":"delete_path","arguments":{"scope":"sandbox","path":"tmp","recursive":true}}}',
-    '- {"type":"tool_call","tool":{"name":"exec_command","arguments":{"program":"node","args":["--version"],"timeoutMs":10000}}}',
+    '- {"type":"tool_call","tool":{"name":"exec_command","arguments":{"program":"node","args":["--version"],"cwd":".","timeoutMs":10000}}}',
     '- {"type":"tool_call","tool":{"name":"provider_web_search","arguments":{"query":"..."}}}',
     '- {"type":"tool_call","tool":{"name":"duckduckgo_search","arguments":{"query":"...","maxResults":5}}}',
     '- {"type":"tool_call","tool":{"name":"web_fetch","arguments":{"url":"https://example.com"}}}',
@@ -313,6 +327,7 @@ async function planStepWithRecovery<K extends ProviderKind>(params: {
   instructions: string;
   messages: ChatMessage[];
   signal: AbortSignal;
+  onRepair?: (error: Error) => void;
 }) {
   try {
     return await params.adapter.planToolStep({
@@ -327,6 +342,12 @@ async function planStepWithRecovery<K extends ProviderKind>(params: {
     if (params.signal.aborted || isAbortError(firstError)) {
       throw firstError;
     }
+
+    params.onRepair?.(
+      firstError instanceof Error
+        ? firstError
+        : new Error("Planner returned invalid JSON."),
+    );
 
     const repairedInstructions = `${params.instructions}
 
@@ -422,6 +443,7 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
   const toolHistory: Array<{ tool: string; result: string }> = [];
   const changedFiles = new Set<string>();
   let terminalState: Exclude<WorkspaceRunStatus, "running"> | null = null;
+  let failureEventRecorded = false;
 
   const emit = (eventType: WorkspaceRunEventRecord["eventType"], payload: Record<string, unknown>) => {
     params.store.appendWorkspaceRunEvent({
@@ -469,10 +491,23 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
           instructions,
           messages: params.messages,
           signal: runSignal.signal,
+          onRepair: (error) => {
+            const payload = {
+              message: "Planner response was invalid. Retrying with strict JSON.",
+              phase: "planning_repair",
+              reason: error.message,
+            };
+            emit("status", payload);
+            params.sendEvent("status", {
+              ...payload,
+              runId: run.id,
+            });
+          },
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : "Planner returned invalid JSON.";
         emit("error", { error: message, phase: "planning" });
+        failureEventRecorded = true;
         throw new AgentRunError(message, isAbortError(error) ? "cancelled" : "failed", run.id);
       }
 
@@ -481,7 +516,7 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
         break;
       }
 
-      const status = toolStatusLabel(step.tool.name);
+      const status = localizedToolStatusLabel(step.tool.name);
       emit("status", { message: status, tool: step.tool.name });
       params.sendEvent("status", { message: status, tool: step.tool.name, runId: run.id });
       emit("tool_call", {
@@ -511,6 +546,7 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       } catch (error) {
         const message = validationMessage(error);
         emit("error", { error: message, phase: "tool", tool: step.tool.name });
+        failureEventRecorded = true;
         throw new AgentRunError(message, isAbortError(error) ? "cancelled" : "failed", run.id);
       }
 
@@ -594,6 +630,14 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
           ? "Agent run was cancelled."
           : "Agent runtime failed.";
     const eventType = status === "cancelled" ? "run_cancelled" : "run_failed";
+    if (!failureEventRecorded) {
+      emit("error", {
+        error: message,
+        phase: "terminal",
+        status,
+      });
+      failureEventRecorded = true;
+    }
     finalize(status, eventType, { error: message });
     if (error instanceof AgentRunError) {
       throw error;
@@ -707,17 +751,22 @@ async function executeTool<K extends ProviderKind>(params: {
       };
     }
     case "exec_command": {
+      const cwd = params.workspace.resolveSandboxDirectory({
+        conversationId: params.conversationId,
+        relativePath: typeof args.cwd === "string" ? args.cwd : ".",
+      });
       const result = await runWorkspaceCommand({
         program: args.program as string,
         args: Array.isArray(args.args) ? (args.args as string[]) : [],
         timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : undefined,
-        cwd: params.workspace.createConversationWorkspace(params.conversationId),
+        cwd: cwd.absolutePath,
         signal: params.signal,
         allowUnsafeShell: params.unsafeShellEnabled,
       });
       return {
         program: args.program,
         args: args.args ?? [],
+        cwd: cwd.relativePath,
         exitCode: result.exitCode,
         stdout: clipText(result.stdout, 5000),
         stderr: clipText(result.stderr, 3000),

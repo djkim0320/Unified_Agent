@@ -65,6 +65,15 @@ Alternative with npm:
 - SQLite DB: `.data/chat.sqlite`
 - Encryption key: `.data/secret.key`
 
+## Safety flags
+
+- `ENABLE_UNSAFE_WORKSPACE_EXEC=true`
+  Allows unsafe shell-style workspace execution. Safe default is off.
+- `ENABLE_WORKSPACE_ROOT_SCOPE=true`
+  Enables `scope=root` for workspace APIs. Safe default is off.
+- `ENABLE_WORKSPACE_DEBUG_PATHS=true`
+  Adds absolute workspace debug paths to workspace API responses. Safe default is off.
+
 ## Codex auth import
 
 The app checks:

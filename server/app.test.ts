@@ -445,6 +445,51 @@ describe("createApp", () => {
     expect(rootResponse.body.error).toContain("Root workspace scope is disabled");
   });
 
+  it("exposes absolute workspace paths only when debug paths are enabled", async () => {
+    const previous = process.env.ENABLE_WORKSPACE_DEBUG_PATHS;
+    process.env.ENABLE_WORKSPACE_DEBUG_PATHS = "true";
+
+    try {
+      const { app, store, workspace } = createApp({ dataDir, projectRoot: dataDir });
+      openStores.push(store);
+
+      const createConversationResponse = await request(app)
+        .post("/api/conversations")
+        .send({
+          title: "Workspace",
+          providerKind: "openai",
+          model: "gpt-5.4",
+          reasoningLevel: "medium",
+        });
+      const conversationId = createConversationResponse.body.conversation.id as string;
+      workspace.writeFile({
+        conversationId,
+        scope: "sandbox",
+        relativePath: "notes.txt",
+        content: "hello",
+      });
+
+      const treeResponse = await request(app).get(
+        `/api/workspace/tree?conversationId=${conversationId}&scope=sandbox`,
+      );
+      expect(treeResponse.status).toBe(200);
+      expect(treeResponse.body.debug.workspaceRoot).toContain(path.join("workspace", "conversations"));
+      expect(treeResponse.body.debug.absolutePath).toContain(conversationId);
+
+      const fileResponse = await request(app).get(
+        `/api/workspace/file?conversationId=${conversationId}&scope=sandbox&path=notes.txt`,
+      );
+      expect(fileResponse.status).toBe(200);
+      expect(fileResponse.body.file.absolutePath).toContain(path.join("workspace", "conversations"));
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ENABLE_WORKSPACE_DEBUG_PATHS;
+      } else {
+        process.env.ENABLE_WORKSPACE_DEBUG_PATHS = previous;
+      }
+    }
+  });
+
   it("requires conversation ownership when reading run events", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);

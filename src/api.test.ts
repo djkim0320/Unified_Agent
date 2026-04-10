@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { listWorkspaceRunEvents, streamChat } from "./api";
+import { getWorkspaceFile, getWorkspaceTree, listWorkspaceRunEvents, streamChat } from "./api";
 
 function createSseResponse(body: string) {
   return new Response(body, {
@@ -85,6 +85,65 @@ describe("api helpers", () => {
 
     expect(fetch).toHaveBeenCalledWith(
       "/api/workspace/runs/run-123/events?conversationId=11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+  });
+
+  it("includes conversationId when fetching workspace tree and file payloads", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ scope: "sandbox", path: ".", tree: [] }), {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+    await getWorkspaceTree({
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      scope: "sandbox",
+      path: "docs",
+      maxDepth: 2,
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspace/tree?conversationId=11111111-1111-4111-8111-111111111111&scope=sandbox&path=docs&maxDepth=2",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          file: {
+            scope: "sandbox",
+            path: "docs/readme.md",
+            content: "# readme",
+            binary: false,
+            unsupportedEncoding: false,
+            encoding: "utf-8",
+          },
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+    await getWorkspaceFile({
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      scope: "sandbox",
+      path: "docs/readme.md",
+    });
+
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/workspace/file?conversationId=11111111-1111-4111-8111-111111111111&scope=sandbox&path=docs%2Freadme.md",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",

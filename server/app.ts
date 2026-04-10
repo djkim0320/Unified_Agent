@@ -152,6 +152,7 @@ export function createApp(options?: {
   const dataDir = options?.dataDir ?? path.join(projectRoot, ".data");
   const port = options?.port ?? 8787;
   const fetchImpl = options?.fetchImpl ?? fetch;
+  const exposeWorkspaceDebugPaths = process.env.ENABLE_WORKSPACE_DEBUG_PATHS === "true";
   const store = createStore(dataDir);
   const workspace = createWorkspaceManager(projectRoot, {
     conversationExists: (conversationId) => Boolean(store.getConversation(conversationId)),
@@ -580,11 +581,12 @@ export function createApp(options?: {
       model,
       body.reasoningLevel ?? existing?.reasoningLevel,
     );
+    const normalizedConversationTitle = body.title ?? existing?.title ?? "새 채팅";
     const title = body.title ?? existing?.title ?? "새 채팅";
     const normalizedTitle = body.title ?? existing?.title ?? "새 채팅";
     const conversation = store.saveConversation({
       id: body.conversationId,
-      title: normalizedTitle,
+      title: normalizedConversationTitle,
       providerKind,
       model,
       reasoningLevel,
@@ -637,10 +639,27 @@ export function createApp(options?: {
         relativePath: query.path,
         maxDepth: query.maxDepth,
       });
+      const resolved =
+        exposeWorkspaceDebugPaths
+          ? workspace.resolvePath({
+              conversationId: query.conversationId,
+              scope: query.scope,
+              relativePath: query.path ?? ".",
+              mode: "read",
+            })
+          : null;
       response.json({
         scope: query.scope,
         path: query.path ?? ".",
         tree,
+        ...(resolved
+          ? {
+              debug: {
+                workspaceRoot: resolved.root,
+                absolutePath: resolved.absolutePath,
+              },
+            }
+          : {}),
       });
     } catch (error) {
       response.status(workspaceErrorStatus(error)).json({
@@ -660,8 +679,20 @@ export function createApp(options?: {
         scope: query.scope,
         relativePath: query.path,
       });
+      const resolved =
+        exposeWorkspaceDebugPaths
+          ? workspace.resolvePath({
+              conversationId: query.conversationId,
+              scope: query.scope,
+              relativePath: query.path,
+              mode: "read",
+            })
+          : null;
       response.json({
-        file,
+        file: {
+          ...file,
+          ...(resolved ? { absolutePath: resolved.absolutePath } : {}),
+        },
       });
     } catch (error) {
       response.status(workspaceErrorStatus(error)).json({

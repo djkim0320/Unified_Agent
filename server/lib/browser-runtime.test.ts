@@ -1,7 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
 import { createBrowserRuntime } from "./browser-runtime.js";
 
-function createFakePage(longText = "content") {
+function neverSettles() {
+  return new Promise<never>(() => undefined);
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createFakePage(
+  longText = "content",
+  overrides?: {
+    goto?: (url: string) => Promise<unknown>;
+    click?: () => Promise<unknown>;
+    fill?: () => Promise<unknown>;
+    press?: () => Promise<unknown>;
+    goBack?: () => Promise<unknown>;
+  },
+) {
   let currentUrl = "about:blank";
 
   const locator = {
@@ -12,18 +29,34 @@ function createFakePage(longText = "content") {
       return longText;
     },
     async click() {
+      if (overrides?.click) {
+        await overrides.click();
+        return;
+      }
       return undefined;
     },
     async fill() {
+      if (overrides?.fill) {
+        await overrides.fill();
+        return;
+      }
       return undefined;
     },
     async press() {
+      if (overrides?.press) {
+        await overrides.press();
+        return;
+      }
       return undefined;
     },
   };
 
   return {
     async goto(url: string) {
+      if (overrides?.goto) {
+        await overrides.goto(url);
+        return;
+      }
       currentUrl = url;
     },
     async waitForTimeout() {
@@ -47,13 +80,17 @@ function createFakePage(longText = "content") {
       return locator;
     },
     async goBack() {
+      if (overrides?.goBack) {
+        await overrides.goBack();
+        return null;
+      }
       currentUrl = "about:blank";
       return null;
     },
   };
 }
 
-function createLaunchBrowserStub() {
+function createLaunchBrowserStub(pageFactory?: () => ReturnType<typeof createFakePage>) {
   const closedContexts: string[] = [];
   const closedBrowsers: string[] = [];
   let browserCount = 0;
@@ -61,7 +98,7 @@ function createLaunchBrowserStub() {
   const launchBrowser = vi.fn(async () => {
     browserCount += 1;
     const browserId = `browser-${browserCount}`;
-    const page = createFakePage("x".repeat(8_000));
+    const page = pageFactory?.() ?? createFakePage("x".repeat(8_000));
     const context = {
       async route() {
         return undefined;
@@ -148,5 +185,111 @@ describe("browser runtime", () => {
     });
 
     expect(extracted.text.length).toBeLessThanOrEqual(6_000);
+  });
+
+  it("aborts a hung navigation promptly and closes only that run session", async () => {
+    const stub = createLaunchBrowserStub(() =>
+      createFakePage("content", {
+        goto: async () => neverSettles(),
+      }),
+    );
+    const runtime = createBrowserRuntime({
+      launch: stub.launchBrowser as never,
+      idleTimeoutMs: 60_000,
+    });
+    const controller = new AbortController();
+
+    await runtime.ensureSession({ sessionId: "run-keep", conversationId: "conversation-a" });
+    await runtime.ensureSession({ sessionId: "run-abort", conversationId: "conversation-a" });
+    const pending = runtime.open({
+      sessionId: "run-abort",
+      conversationId: "conversation-a",
+      url: "https://example.com",
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(new Error("stop navigation")), 20);
+
+    const result = await Promise.race([
+      pending.then(() => "resolved").catch((error: Error) => error),
+      delay(1_000).then(() => "timeout"),
+    ]);
+
+    expect(result).toBeInstanceOf(Error);
+    expect(String((result as Error).message)).toContain("stop navigation");
+    expect(runtime.getSessionCount()).toBe(1);
+    expect(stub.closedContexts).toHaveLength(1);
+    expect(stub.closedBrowsers).toHaveLength(1);
+
+    await runtime.closeSession("run-keep");
+  });
+
+  it("aborts hung click, type, and back actions by closing the run session", async () => {
+    const cases = [
+      {
+        name: "click",
+        page: () =>
+          createFakePage("content", {
+            click: async () => neverSettles(),
+          }),
+        run: (runtime: ReturnType<typeof createBrowserRuntime>, signal: AbortSignal) =>
+          runtime.click({
+            sessionId: "run-click",
+            conversationId: "conversation-a",
+            selector: "button",
+            signal,
+          }),
+      },
+      {
+        name: "type",
+        page: () =>
+          createFakePage("content", {
+            fill: async () => neverSettles(),
+          }),
+        run: (runtime: ReturnType<typeof createBrowserRuntime>, signal: AbortSignal) =>
+          runtime.type({
+            sessionId: "run-type",
+            conversationId: "conversation-a",
+            selector: "input",
+            text: "hello",
+            signal,
+          }),
+      },
+      {
+        name: "back",
+        page: () =>
+          createFakePage("content", {
+            goBack: async () => neverSettles(),
+          }),
+        run: (runtime: ReturnType<typeof createBrowserRuntime>, signal: AbortSignal) =>
+          runtime.back({
+            sessionId: "run-back",
+            conversationId: "conversation-a",
+            signal,
+          }),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const stub = createLaunchBrowserStub(testCase.page);
+      const runtime = createBrowserRuntime({
+        launch: stub.launchBrowser as never,
+        idleTimeoutMs: 60_000,
+      });
+      const controller = new AbortController();
+
+      const pending = testCase.run(runtime, controller.signal);
+      setTimeout(() => controller.abort(new Error(`stop ${testCase.name}`)), 20);
+
+      const result = await Promise.race([
+        pending.then(() => "resolved").catch((error: Error) => error),
+        delay(1_000).then(() => "timeout"),
+      ]);
+
+      expect(result).toBeInstanceOf(Error);
+      expect(String((result as Error).message)).toContain(`stop ${testCase.name}`);
+      expect(runtime.getSessionCount()).toBe(0);
+      expect(stub.closedContexts).toHaveLength(1);
+      expect(stub.closedBrowsers).toHaveLength(1);
+    }
   });
 });

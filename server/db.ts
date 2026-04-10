@@ -519,6 +519,17 @@ export function createStore(dataDir: string) {
       if (!conversation) {
         return;
       }
+      if (conversation.title === "새 채팅") {
+        const nextTitle = fallbackText.trim().slice(0, 60) || "새 채팅";
+        store.saveConversation({
+          id: conversationId,
+          title: nextTitle,
+          providerKind: conversation.providerKind,
+          model: conversation.model,
+          reasoningLevel: conversation.reasoningLevel,
+        });
+        return;
+      }
       if (conversation.title === defaultConversationTitle) {
         const nextTitle = fallbackText.trim().slice(0, 60) || defaultConversationTitle;
         store.saveConversation({

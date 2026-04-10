@@ -1,5 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { assertSafeOutboundUrl } from "./network-guard.js";
+import { createAbortError } from "./process-control.js";
 
 type BrowserSession = {
   browser: Browser;
@@ -48,6 +49,38 @@ export function createBrowserRuntime(options?: {
       .filter(([, session]) => session.conversationId === conversationId)
       .map(([sessionId]) => sessionId);
     await Promise.all(ids.map((sessionId) => closeSession(sessionId)));
+  }
+
+  function getAbortReason(signal: AbortSignal | undefined) {
+    const reason = signal?.reason;
+    return reason instanceof Error ? reason : createAbortError("Browser operation was cancelled.");
+  }
+
+  async function runAbortableSessionOperation<T>(
+    params: SessionParams & { signal?: AbortSignal },
+    operation: () => Promise<T>,
+  ) {
+    if (params.signal?.aborted) {
+      await closeSession(params.sessionId);
+      throw getAbortReason(params.signal);
+    }
+
+    let abortListener: (() => void) | null = null;
+    const abortPromise = new Promise<T>((_, reject) => {
+      abortListener = () => {
+        void closeSession(params.sessionId);
+        reject(getAbortReason(params.signal));
+      };
+      params.signal?.addEventListener("abort", abortListener, { once: true });
+    });
+
+    try {
+      return await Promise.race([operation(), abortPromise]);
+    } finally {
+      if (abortListener) {
+        params.signal?.removeEventListener("abort", abortListener);
+      }
+    }
   }
 
   async function ensureSession(params: SessionParams) {
@@ -104,70 +137,72 @@ export function createBrowserRuntime(options?: {
   }
 
   async function search(params: SessionParams & { query: string; signal?: AbortSignal }) {
-    const session = await ensureSession(params);
     const url = `https://duckduckgo.com/?q=${encodeURIComponent(params.query)}`;
-    await assertSafeOutboundUrl(url);
-    await session.page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
+    await runAbortableSessionOperation(params, async () => {
+      await assertSafeOutboundUrl(url);
     });
-    if (params.signal?.aborted) {
-      throw params.signal.reason;
-    }
-    await session.page.waitForTimeout(1_000);
-    session.lastUsedAt = Date.now();
+    const session = await ensureSession(params);
+    return await runAbortableSessionOperation(params, async () => {
+      await session.page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
+      await session.page.waitForTimeout(1_000);
+      session.lastUsedAt = Date.now();
 
-    const results = await session.page.evaluate(() => {
-      const doc = (globalThis as unknown as {
-        document: {
-          querySelectorAll: (selector: string) => ArrayLike<{
-            textContent?: string | null;
-            getAttribute: (name: string) => string | null;
-          }>;
-        };
-      }).document;
-      const candidates = Array.from(
-        doc.querySelectorAll("article a, [data-testid='result'] a, a[data-testid='result-title-a']"),
-      );
-      return candidates
-        .map((link) => {
-          const title = link.textContent?.replace(/\s+/g, " ").trim() ?? "";
-          const urlValue = link.getAttribute("href") || "";
-          if (!title || !urlValue) {
-            return null;
-          }
-          return {
-            title,
-            url: urlValue,
+      const results = await session.page.evaluate(() => {
+        const doc = (globalThis as unknown as {
+          document: {
+            querySelectorAll: (selector: string) => ArrayLike<{
+              textContent?: string | null;
+              getAttribute: (name: string) => string | null;
+            }>;
           };
-        })
-        .filter(Boolean)
-        .slice(0, 5);
-    });
+        }).document;
+        const candidates = Array.from(
+          doc.querySelectorAll("article a, [data-testid='result'] a, a[data-testid='result-title-a']"),
+        );
+        return candidates
+          .map((link) => {
+            const title = link.textContent?.replace(/\s+/g, " ").trim() ?? "";
+            const urlValue = link.getAttribute("href") || "";
+            if (!title || !urlValue) {
+              return null;
+            }
+            return {
+              title,
+              url: urlValue,
+            };
+          })
+          .filter(Boolean)
+          .slice(0, 5);
+      });
 
-    return {
-      query: params.query,
-      url: session.page.url(),
-      results,
-    };
+      return {
+        query: params.query,
+        url: session.page.url(),
+        results,
+      };
+    });
   }
 
   async function open(params: SessionParams & { url: string; signal?: AbortSignal }) {
-    await assertSafeOutboundUrl(params.url);
-    const session = await ensureSession(params);
-    await session.page.goto(params.url, {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
+    await runAbortableSessionOperation(params, async () => {
+      await assertSafeOutboundUrl(params.url);
     });
-    if (params.signal?.aborted) {
-      throw params.signal.reason;
-    }
-    await assertSafeNavigationUrl(session.page.url());
-    session.lastUsedAt = Date.now();
-    return {
-      url: session.page.url(),
-      title: await session.page.title(),
-    };
+    const session = await ensureSession(params);
+    return await runAbortableSessionOperation(params, async () => {
+      await session.page.goto(params.url, {
+        waitUntil: "domcontentloaded",
+        timeout: 45_000,
+      });
+      await assertSafeNavigationUrl(session.page.url());
+      session.lastUsedAt = Date.now();
+      return {
+        url: session.page.url(),
+        title: await session.page.title(),
+      };
+    });
   }
 
   async function snapshot(params: SessionParams) {
@@ -193,47 +228,44 @@ export function createBrowserRuntime(options?: {
 
   async function click(params: SessionParams & { selector: string; signal?: AbortSignal }) {
     const session = await ensureSession(params);
-    await session.page.locator(params.selector).first().click();
-    if (params.signal?.aborted) {
-      throw params.signal.reason;
-    }
-    await assertSafeNavigationUrl(session.page.url());
-    session.lastUsedAt = Date.now();
-    return {
-      url: session.page.url(),
-      title: await session.page.title(),
-    };
+    return await runAbortableSessionOperation(params, async () => {
+      await session.page.locator(params.selector).first().click();
+      await assertSafeNavigationUrl(session.page.url());
+      session.lastUsedAt = Date.now();
+      return {
+        url: session.page.url(),
+        title: await session.page.title(),
+      };
+    });
   }
 
   async function type(params: SessionParams & { selector: string; text: string; submit?: boolean; signal?: AbortSignal }) {
     const session = await ensureSession(params);
-    await session.page.locator(params.selector).first().fill(params.text);
-    if (params.submit) {
-      await session.page.locator(params.selector).first().press("Enter");
-    }
-    if (params.signal?.aborted) {
-      throw params.signal.reason;
-    }
-    await assertSafeNavigationUrl(session.page.url());
-    session.lastUsedAt = Date.now();
-    return {
-      url: session.page.url(),
-      title: await session.page.title(),
-    };
+    return await runAbortableSessionOperation(params, async () => {
+      await session.page.locator(params.selector).first().fill(params.text);
+      if (params.submit) {
+        await session.page.locator(params.selector).first().press("Enter");
+      }
+      await assertSafeNavigationUrl(session.page.url());
+      session.lastUsedAt = Date.now();
+      return {
+        url: session.page.url(),
+        title: await session.page.title(),
+      };
+    });
   }
 
   async function back(params: SessionParams & { signal?: AbortSignal }) {
     const session = await ensureSession(params);
-    await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
-    if (params.signal?.aborted) {
-      throw params.signal.reason;
-    }
-    await assertSafeNavigationUrl(session.page.url());
-    session.lastUsedAt = Date.now();
-    return {
-      url: session.page.url(),
-      title: await session.page.title(),
-    };
+    return await runAbortableSessionOperation(params, async () => {
+      await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
+      await assertSafeNavigationUrl(session.page.url());
+      session.lastUsedAt = Date.now();
+      return {
+        url: session.page.url(),
+        title: await session.page.title(),
+      };
+    });
   }
 
   const interval = setInterval(collectGarbage, Math.min(idleTimeoutMs, 60_000));

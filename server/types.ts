@@ -68,6 +68,7 @@ export interface SearchBackendAvailability {
 export interface ExecToolArguments {
   program: string;
   args?: string[];
+  cwd?: string;
   timeoutMs?: number;
 }
 

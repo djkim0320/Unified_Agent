@@ -76,6 +76,59 @@ describe("workspace sandbox hardening", () => {
     ).toThrow(/unsafe link/i);
   });
 
+  it("rejects mutating operations through unsafe link components", () => {
+    const { workspace, addConversation, projectRoot } = createTestWorkspace();
+    const conversationId = "conv-link-mutations";
+    const sandboxDir = addConversation(conversationId);
+    const outsideDir = path.join(projectRoot, "outside-mutations");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, "secret.txt"), "do not touch", "utf8");
+    fs.symlinkSync(outsideDir, path.join(sandboxDir, "escape"), "junction");
+    workspace.writeFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "notes.txt",
+      content: "hello",
+    });
+
+    expect(() =>
+      workspace.makeDir({
+        conversationId,
+        scope: "sandbox",
+        relativePath: "escape/new-dir",
+      }),
+    ).toThrow(/unsafe link/i);
+
+    expect(() =>
+      workspace.deletePath({
+        conversationId,
+        scope: "sandbox",
+        relativePath: "escape/secret.txt",
+      }),
+    ).toThrow(/unsafe link/i);
+
+    expect(() =>
+      workspace.movePath({
+        conversationId,
+        scope: "sandbox",
+        from: "escape",
+        to: "moved-link",
+      }),
+    ).toThrow(/unsafe link/i);
+
+    expect(() =>
+      workspace.movePath({
+        conversationId,
+        scope: "sandbox",
+        from: "notes.txt",
+        to: "escape/notes.txt",
+      }),
+    ).toThrow(/unsafe link/i);
+
+    expect(fs.readFileSync(path.join(outsideDir, "secret.txt"), "utf8")).toBe("do not touch");
+    expect(fs.existsSync(path.join(outsideDir, "notes.txt"))).toBe(false);
+  });
+
   it("rejects move targets that try to escape the sandbox", () => {
     const { workspace, addConversation } = createTestWorkspace();
     const conversationId = "conv-move";
@@ -111,6 +164,19 @@ describe("workspace sandbox hardening", () => {
       }),
     ).toThrow(/conversation not found/i);
     expect(fs.existsSync(sandboxDir)).toBe(false);
+  });
+
+  it("keeps root scope disabled by default", () => {
+    const { workspace, addConversation } = createTestWorkspace();
+    const conversationId = "conv-root-disabled";
+    addConversation(conversationId);
+
+    expect(() =>
+      workspace.listTree({
+        conversationId,
+        scope: "root",
+      }),
+    ).toThrow(/root workspace scope is disabled/i);
   });
 
   it("cleans up only the deleted conversation sandbox", () => {

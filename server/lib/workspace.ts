@@ -57,6 +57,16 @@ function normalizeWorkspacePath(relativePath = ".") {
   };
 }
 
+function ensureDirectoryPathExists(root: string, target: string) {
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (!stat || !stat.isDirectory()) {
+    throw new Error("Workspace directory was not found.");
+  }
+  assertNoLink(stat, target);
+  ensureCanonicalInside(root, target);
+  return target;
+}
+
 function canonicalizeExistingPath(filePath: string) {
   return fs.realpathSync.native(filePath);
 }
@@ -576,6 +586,24 @@ export function createWorkspaceManager(
     return true;
   }
 
+  function resolveSandboxDirectory(params: {
+    conversationId: string;
+    relativePath?: string;
+  }) {
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: "sandbox",
+      relativePath: params.relativePath ?? ".",
+      mode: "read",
+    });
+
+    return {
+      root: resolved.root,
+      absolutePath: ensureDirectoryPathExists(resolved.root, resolved.absolutePath),
+      relativePath: resolved.relativePath,
+    };
+  }
+
   function readGuides() {
     return {
       agents: fs.readFileSync(path.join(rootDir, "AGENTS.md"), "utf8"),
@@ -604,6 +632,7 @@ export function createWorkspaceManager(
     makeDir,
     movePath,
     deletePath,
+    resolveSandboxDirectory,
     readGuides,
   };
 }

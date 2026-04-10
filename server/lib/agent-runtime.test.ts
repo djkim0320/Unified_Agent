@@ -405,4 +405,77 @@ describe("runAgentTurn", () => {
     expect(harness.finalizations).toHaveLength(1);
     expect(harness.finalizations[0]?.eventType).toBe("run_cancelled");
   });
+
+  it("records a planning repair status event before retrying malformed planner JSON", async () => {
+    const harness = createHarness();
+    const adapter = createAdapter([
+      {
+        kind: "error",
+        error: new Error("planner response was not valid JSON"),
+      },
+      {
+        kind: "step",
+        value: { type: "final_answer" },
+      },
+    ]);
+
+    await runAgentTurn({
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      ...harness.baseParams,
+    });
+
+    expect(harness.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "status",
+          payload: expect.objectContaining({
+            phase: "planning_repair",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("rejects exec_command cwd values that escape the sandbox", async () => {
+    const harness = createHarness();
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "exec_command",
+            arguments: {
+              program: process.execPath,
+              args: ["-e", 'process.stdout.write("ok")'],
+              cwd: "../outside",
+            },
+          },
+        },
+      },
+    ]);
+
+    await expect(
+      runAgentTurn({
+        adapter: adapter as never,
+        secret: { apiKey: "test" } as never,
+        ...harness.baseParams,
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+    } satisfies Partial<AgentRunError>);
+
+    expect(harness.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "error",
+          payload: expect.objectContaining({
+            phase: "tool",
+            tool: "exec_command",
+          }),
+        }),
+      ]),
+    );
+  });
 });

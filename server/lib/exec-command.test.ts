@@ -54,6 +54,27 @@ describe("runWorkspaceCommand", () => {
     expect(result.stderr).toBe("");
   });
 
+  it("runs commands with the provided workspace cwd for relative paths", async () => {
+    const cwd = createTempDir();
+    const markerName = `cwd-marker-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
+    const result = await runWorkspaceCommand({
+      program: process.execPath,
+      args: [
+        "-e",
+        [
+          'const fs = require("node:fs");',
+          `fs.writeFileSync(${JSON.stringify(markerName)}, "created", "utf8");`,
+          "process.stdout.write(process.cwd());",
+        ].join(" "),
+      ],
+      cwd,
+    });
+
+    expect(path.normalize(result.stdout)).toBe(path.normalize(cwd));
+    expect(fs.readFileSync(path.join(cwd, markerName), "utf8")).toBe("created");
+    expect(fs.existsSync(path.join(process.cwd(), markerName))).toBe(false);
+  });
+
   it("blocks shell execution by default", async () => {
     const cwd = createTempDir();
 

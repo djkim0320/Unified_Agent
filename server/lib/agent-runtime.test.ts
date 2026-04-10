@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runAgentTurn, AgentRunError } from "./agent-runtime.js";
+import { createMemoryManager } from "./memory-manager.js";
 import { createAbortError } from "./process-control.js";
+import { createToolRegistry } from "./tool-registry.js";
 import { createWorkspaceManager } from "./workspace.js";
+import { registerCoreTools } from "../plugins/core.js";
 import type {
+  AgentRecord,
   ChatMessage,
   ToolCall,
   WorkspaceRunEventRecord,
@@ -476,6 +480,59 @@ describe("runAgentTurn", () => {
           }),
         }),
       ]),
+    );
+  });
+
+  it("supports registry-backed memory tools and persists durable memory", async () => {
+    const harness = createHarness();
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "memory_write",
+            arguments: {
+              content: "User prefers concise Korean summaries.",
+              target: "durable",
+            },
+          },
+        },
+      },
+      {
+        kind: "step",
+        value: { type: "final_answer" },
+      },
+    ]);
+
+    const toolRegistry = createToolRegistry();
+    registerCoreTools(toolRegistry);
+    const memoryManager = createMemoryManager(harness.workspace);
+    const agent: AgentRecord = {
+      id: "agent-1",
+      name: "Memory Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    const result = await runAgentTurn({
+      agent,
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      toolRegistry,
+      memoryManager,
+      agentId: agent.id,
+      ...harness.baseParams,
+    });
+
+    expect(result.assistantText).toBe("완료");
+    const snapshot = memoryManager.getSnapshot(agent.id);
+    expect(snapshot.durableMemory).toContain("concise Korean summaries");
+    expect(harness.events.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining(["tool_call", "tool_result"]),
     );
   });
 });

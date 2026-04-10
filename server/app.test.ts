@@ -131,6 +131,106 @@ describe("createApp", () => {
     ]);
   });
 
+  it("creates agents, scopes sessions, and exposes explicit memory files", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const createAgentResponse = await request(app)
+      .post("/api/agents")
+      .send({
+        name: "Research Agent",
+        providerKind: "anthropic",
+        model: "claude-sonnet-4-6",
+        reasoningLevel: "medium",
+      });
+    expect(createAgentResponse.status).toBe(200);
+    const agentId = createAgentResponse.body.agent.id as string;
+
+    const createSessionResponse = await request(app)
+      .post("/api/conversations")
+      .send({
+        agentId,
+        title: "Research session",
+        providerKind: "anthropic",
+        model: "claude-sonnet-4-6",
+        reasoningLevel: "medium",
+      });
+    expect(createSessionResponse.status).toBe(200);
+    expect(createSessionResponse.body.conversation.agentId).toBe(agentId);
+
+    const defaultSessionsResponse = await request(app).get("/api/conversations?agentId=default-agent");
+    expect(defaultSessionsResponse.status).toBe(200);
+    expect(defaultSessionsResponse.body.conversations).toEqual([]);
+
+    const agentSessionsResponse = await request(app).get(`/api/conversations?agentId=${agentId}`);
+    expect(agentSessionsResponse.status).toBe(200);
+    expect(agentSessionsResponse.body.conversations).toHaveLength(1);
+
+    const writeMemoryResponse = await request(app)
+      .post(`/api/agents/${agentId}/memory`)
+      .send({ content: "User prefers research summaries in Korean.", target: "durable" });
+    expect(writeMemoryResponse.status).toBe(200);
+    expect(writeMemoryResponse.body.memory.durableMemory).toContain("Korean");
+
+    const memoryResponse = await request(app).get(`/api/agents/${agentId}/memory`);
+    expect(memoryResponse.status).toBe(200);
+    expect(memoryResponse.body.memory.durableMemoryPath).toBe("MEMORY.md");
+    expect(JSON.stringify(memoryResponse.body)).not.toContain(dataDir);
+  });
+
+  it("records detached task lifecycle and enforces task-event ownership", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const owner = store.saveAgent({
+      name: "Owner",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const other = store.saveAgent({
+      name: "Other",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const conversation = store.saveConversation({
+      agentId: owner.id,
+      title: "Task session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+
+    const createTaskResponse = await request(app)
+      .post(`/api/agents/${owner.id}/tasks`)
+      .send({
+        conversationId: conversation.id,
+        title: "Queued work",
+        prompt: "Summarize this later",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "high",
+        autoStart: false,
+      });
+    expect(createTaskResponse.status).toBe(200);
+    const taskId = createTaskResponse.body.task.id as string;
+    expect(createTaskResponse.body.task.status).toBe("queued");
+
+    const wrongEventsResponse = await request(app).get(`/api/agents/${other.id}/tasks/${taskId}/events`);
+    expect(wrongEventsResponse.status).toBe(404);
+
+    const cancelResponse = await request(app).post(`/api/agents/${owner.id}/tasks/${taskId}/cancel`);
+    expect(cancelResponse.status).toBe(200);
+    expect(cancelResponse.body.task.status).toBe("cancelled");
+
+    const eventsResponse = await request(app).get(`/api/agents/${owner.id}/tasks/${taskId}/events`);
+    expect(eventsResponse.status).toBe(200);
+    expect(eventsResponse.body.events.map((event: { eventType: string }) => event.eventType)).toEqual(
+      expect.arrayContaining(["queued", "cancelled"]),
+    );
+  });
+
   it("starts and completes the Codex OAuth callback flow", async () => {
     const accessToken = createFakeJwt({
       exp: Math.floor(Date.now() / 1000) + 3600,
@@ -473,14 +573,18 @@ describe("createApp", () => {
         `/api/workspace/tree?conversationId=${conversationId}&scope=sandbox`,
       );
       expect(treeResponse.status).toBe(200);
-      expect(treeResponse.body.debug.workspaceRoot).toContain(path.join("workspace", "conversations"));
+      expect(treeResponse.body.debug.workspaceRoot).toContain(
+        path.join("workspace", "agents", "default-agent", "sessions"),
+      );
       expect(treeResponse.body.debug.absolutePath).toContain(conversationId);
 
       const fileResponse = await request(app).get(
         `/api/workspace/file?conversationId=${conversationId}&scope=sandbox&path=notes.txt`,
       );
       expect(fileResponse.status).toBe(200);
-      expect(fileResponse.body.file.absolutePath).toContain(path.join("workspace", "conversations"));
+      expect(fileResponse.body.file.absolutePath).toContain(
+        path.join("workspace", "agents", "default-agent", "sessions"),
+      );
     } finally {
       if (previous === undefined) {
         delete process.env.ENABLE_WORKSPACE_DEBUG_PATHS;

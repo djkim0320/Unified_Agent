@@ -1,12 +1,16 @@
 import { ZodError, z } from "zod";
 import { searchDuckDuckGo } from "./duckduckgo.js";
 import { runWorkspaceCommand } from "./exec-command.js";
+import type { createMemoryManager } from "./memory-manager.js";
+import type { createPluginManager } from "./plugin-manager.js";
+import type { createToolRegistry } from "./tool-registry.js";
 import { fetchWebPage } from "./web-fetch.js";
 import { createAbortError, isAbortError } from "./process-control.js";
 import type { createBrowserRuntime } from "./browser-runtime.js";
 import type { createWorkspaceManager } from "./workspace.js";
 import type { ProviderAdapter } from "../providers/base.js";
 import type {
+  AgentRecord,
   AgentStep,
   ChatMessage,
   ProviderKind,
@@ -97,6 +101,15 @@ const ToolArgumentSchemas: Record<ToolName, z.ZodType<Record<string, unknown>>> 
   }),
   browser_back: z.object({}),
   browser_close: z.object({}),
+  memory_get: z.object({}),
+  memory_search: z.object({
+    query: z.string().min(1),
+    maxResults: z.number().int().min(1).max(20).optional(),
+  }),
+  memory_write: z.object({
+    content: z.string().min(1),
+    target: z.enum(["durable", "daily"]).optional(),
+  }),
 };
 
 export class AgentRunError extends Error {
@@ -116,35 +129,9 @@ function clipText(text: string, maxLength = 4000) {
 }
 
 function localizedToolStatusLabel(toolName: ToolName) {
-  if (toolName.includes("search")) {
-    return "검색 중";
+  if (toolName.startsWith("memory_")) {
+    return "메모리 작업 중";
   }
-  if (toolName.startsWith("browser_")) {
-    return "브라우저 조사 중";
-  }
-  if (toolName === "exec_command") {
-    return "명령 실행 중";
-  }
-  return "파일 작업 중";
-}
-
-function toolStatusLabel(toolName: ToolName) {
-  const labels = {
-    search: "검색 중",
-    browser: "브라우저 조사 중",
-    command: "명령 실행 중",
-    file: "파일 작업 중",
-  } as const;
-  if (toolName.includes("search")) {
-    return labels.search;
-  }
-  if (toolName.startsWith("browser_")) {
-    return labels.browser;
-  }
-  if (toolName === "exec_command") {
-    return labels.command;
-  }
-  return labels.file;
   if (toolName.includes("search")) {
     return "검색 중";
   }
@@ -189,10 +176,14 @@ function buildToolInstructions() {
     '- {"type":"tool_call","tool":{"name":"browser_type","arguments":{"selector":"input[name=q]","text":"query","submit":true}}}',
     '- {"type":"tool_call","tool":{"name":"browser_back","arguments":{}}}',
     '- {"type":"tool_call","tool":{"name":"browser_close","arguments":{}}}',
+    '- {"type":"tool_call","tool":{"name":"memory_get","arguments":{}}}',
+    '- {"type":"tool_call","tool":{"name":"memory_search","arguments":{"query":"preference","maxResults":5}}}',
+    '- {"type":"tool_call","tool":{"name":"memory_write","arguments":{"content":"User prefers concise Korean summaries.","target":"durable"}}}',
     '- {"type":"final_answer"}',
     "Use only one tool per step.",
     "Do not invent tool results.",
     "Use exec_command only with a direct program plus args. Shells such as PowerShell/cmd/bash are disabled unless the user explicitly enables unsafe mode.",
+    "Use memory_write only for durable preferences, decisions, and facts the user explicitly asks you to remember or that are clearly reusable later.",
     "Prefer provider_web_search or duckduckgo_search for ordinary search, web_fetch for a direct URL, and browser tools for pages that need rendering or interaction.",
   ].join("\n");
 }
@@ -203,6 +194,9 @@ function buildPlanningInstructions(params: {
   maxSteps: number;
   searchBackends: SearchBackendAvailability[];
   toolHistory: Array<{ tool: string; result: string }>;
+  memoryBlock?: string;
+  skillsBlock?: string;
+  toolGuide?: string;
   repairHint?: string;
 }) {
   const historyBlock = params.toolHistory.length
@@ -231,14 +225,20 @@ function buildPlanningInstructions(params: {
     "",
     params.guides.memory,
     "",
+    params.memoryBlock ? "Agent memory:" : "",
+    params.memoryBlock ?? "",
+    "",
     params.guides.user,
     "",
     params.guides.tools,
     "",
+    params.skillsBlock ? "Loaded skills:" : "",
+    params.skillsBlock ?? "",
+    "",
     "Previous tool results:",
     historyBlock,
     "",
-    buildToolInstructions(),
+    params.toolGuide ?? buildToolInstructions(),
   ]
     .filter(Boolean)
     .join("\n");
@@ -368,16 +368,32 @@ Return exactly one valid JSON object now. No markdown, no prose.`;
 }
 
 export async function runAgentTurn<K extends ProviderKind>(params: {
+  agent?: AgentRecord;
   adapter: ProviderAdapter<K>;
   secret: ProviderSecret<K>;
   providerKind: ProviderKind;
   model: string;
   reasoningLevel: ReasoningLevel;
   conversationId: string;
+  agentId?: string;
   userMessage: string;
   messages: ChatMessage[];
   workspace: ReturnType<typeof createWorkspaceManager>;
   browserRuntime: ReturnType<typeof createBrowserRuntime>;
+  memoryManager?: ReturnType<typeof createMemoryManager>;
+  pluginManager?: ReturnType<typeof createPluginManager>;
+  toolRegistry?: ReturnType<typeof createToolRegistry>;
+  taskManager?: {
+    enqueueDetachedTask: (input: {
+      agentId: string;
+      conversationId: string;
+      prompt: string;
+      title?: string;
+      providerKind: ProviderKind;
+      model: string;
+      reasoningLevel: ReasoningLevel;
+    }) => Promise<{ id: string }>;
+  };
   store: {
     createWorkspaceRun: (input: {
       conversationId: string;
@@ -402,6 +418,8 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
   maxSteps?: number;
   runTimeoutMs?: number;
   unsafeShellEnabled?: boolean;
+  isDetachedTask?: boolean;
+  conversationTitle?: string;
 }) {
   const run = params.store.createWorkspaceRun({
     conversationId: params.conversationId,
@@ -411,7 +429,17 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
   });
   const runSignal = combineRunSignal(params.signal, params.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS);
   const guides = params.workspace.readGuides();
+  const agentId = params.agentId ?? "default-agent";
+  params.workspace.createAgentWorkspace(agentId);
   params.workspace.createConversationWorkspace(params.conversationId);
+  const memoryContext = params.memoryManager?.getPlanningContext({
+    agentId,
+    userMessage: params.userMessage,
+    messages: params.messages,
+  });
+  const skillBlock = params.agent && params.pluginManager
+    ? params.pluginManager.getPlanningSkillBlock(params.agent)
+    : null;
   const searchBackends: SearchBackendAvailability[] = [
     {
       kind: "provider_web_search",
@@ -479,6 +507,9 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
         maxSteps,
         searchBackends,
         toolHistory,
+        memoryBlock: memoryContext?.promptBlock,
+        skillsBlock: skillBlock ?? undefined,
+        toolGuide: params.toolRegistry?.buildPlannerGuide(),
       });
 
       let step: AgentStep;
@@ -531,18 +562,58 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
 
       let result: Record<string, unknown>;
       try {
-        result = await executeTool({
-          toolCall: step.tool,
-          conversationId: params.conversationId,
-          runId: run.id,
-          workspace: params.workspace,
-          browserRuntime: params.browserRuntime,
-          adapter: params.adapter,
-          secret: params.secret,
-          model: params.model,
-          signal: runSignal.signal,
-          unsafeShellEnabled: params.unsafeShellEnabled,
-        });
+        result = params.toolRegistry
+          ? await params.toolRegistry.execute(step.tool, {
+              agentId,
+              conversationId: params.conversationId,
+              runId: run.id,
+              workspace: params.workspace,
+              browserRuntime: params.browserRuntime,
+              memoryManager: params.memoryManager ?? ({
+                getSnapshot() {
+                  throw new Error("Memory manager is unavailable.");
+                },
+                getPlanningContext() {
+                  return {
+                    snapshot: null,
+                    promptBlock: "",
+                  };
+                },
+                search() {
+                  return [];
+                },
+                write() {
+                  throw new Error("Memory manager is unavailable.");
+                },
+                flushSessionSummary() {
+                  return null;
+                },
+                captureRememberRequest() {
+                  return null;
+                },
+              } as unknown as ReturnType<typeof createMemoryManager>),
+              adapter: params.adapter as unknown as ProviderAdapter<ProviderKind>,
+              secret: params.secret as ProviderSecret<ProviderKind>,
+              model: params.model,
+              signal: runSignal.signal,
+              unsafeShellEnabled: params.unsafeShellEnabled,
+              taskManager: params.taskManager,
+              reasoningLevel: params.reasoningLevel,
+              isDetachedTask: params.isDetachedTask,
+            })
+          : await executeTool({
+              toolCall: step.tool,
+              conversationId: params.conversationId,
+              agentId,
+              runId: run.id,
+              workspace: params.workspace,
+              browserRuntime: params.browserRuntime,
+              adapter: params.adapter,
+              secret: params.secret,
+              model: params.model,
+              signal: runSignal.signal,
+              unsafeShellEnabled: params.unsafeShellEnabled,
+            });
       } catch (error) {
         const message = validationMessage(error);
         emit("error", { error: message, phase: "tool", tool: step.tool.name });
@@ -606,6 +677,22 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       },
     });
 
+    if (params.memoryManager) {
+      const usedMemoryWrite = toolHistory.some((entry) => entry.tool === "memory_write");
+      if (!usedMemoryWrite) {
+        params.memoryManager.captureRememberRequest({
+          agentId,
+          message: params.userMessage,
+        });
+      }
+      params.memoryManager.flushSessionSummary({
+        agentId,
+        conversationTitle: params.conversationTitle ?? "Session",
+        userMessage: params.userMessage,
+        assistantText,
+      });
+    }
+
     const completionPayload = {
       changedFiles: [...changedFiles].sort(),
     };
@@ -652,6 +739,7 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
 async function executeTool<K extends ProviderKind>(params: {
   toolCall: ToolCall;
   conversationId: string;
+  agentId: string;
   runId: string;
   workspace: ReturnType<typeof createWorkspaceManager>;
   browserRuntime: ReturnType<typeof createBrowserRuntime>;
@@ -855,5 +943,32 @@ async function executeTool<K extends ProviderKind>(params: {
       await params.browserRuntime.closeSession(params.runId);
       return { closed: true };
     }
+    case "memory_get": {
+      return params.workspace.readAgentMemory(params.agentId);
+    }
+    case "memory_search": {
+      return {
+        query: args.query,
+        results: params.workspace.searchAgentMemory({
+          agentId: params.agentId,
+          query: args.query as string,
+          maxResults: typeof args.maxResults === "number" ? args.maxResults : undefined,
+        }),
+      };
+    }
+    case "memory_write": {
+      const memory = params.workspace.appendAgentMemory({
+        agentId: params.agentId,
+        content: args.content as string,
+        target: args.target === "daily" ? "daily" : "durable",
+      });
+      return {
+        agentId: params.agentId,
+        target: args.target === "daily" ? "daily" : "durable",
+        memory,
+      };
+    }
+    default:
+      throw new Error(`Unknown tool: ${params.toolCall.name}`);
   }
 }

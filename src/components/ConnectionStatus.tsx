@@ -31,7 +31,9 @@ export function ConnectionStatus(props: ConnectionStatusProps) {
         <strong>{props.provider ? providerLabels[props.provider.kind] : "프로바이더 없음"}</strong>
         <span>{props.modelsLoading ? "모델 목록을 불러오는 중..." : `${props.modelCount}개 모델 후보`}</span>
         {props.modelsError ? <p className="connection-status__error">{props.modelsError}</p> : null}
-        {!props.provider ? <p className="connection-status__hint">프로바이더를 먼저 연결해주세요.</p> : null}
+        {!props.provider ? (
+          <p className="connection-status__hint">프로바이더를 먼저 연결해 주세요.</p>
+        ) : null}
       </div>
     </section>
   );

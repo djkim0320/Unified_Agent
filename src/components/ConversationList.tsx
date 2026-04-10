@@ -1,11 +1,15 @@
 import { getModelOption } from "../model-catalog";
-import { providerLabels, type ConversationRecord } from "../types";
+import { providerLabels, type AgentRecord, type ConversationRecord } from "../types";
 
 interface ConversationListProps {
+  agents: AgentRecord[];
+  activeAgentId: string | null;
   conversations: ConversationRecord[];
   activeConversationId: string | null;
+  onCreateAgent: () => void;
   onCreateConversation: () => void;
   onDeleteConversation: (conversationId: string) => void;
+  onSelectAgent: (agentId: string) => void;
   onSelectConversation: (conversationId: string) => void;
   onOpenSettings: () => void;
 }
@@ -17,9 +21,33 @@ export function ConversationList(props: ConversationListProps) {
         <div className="conversation-list__mark">M</div>
         <div>
           <p className="conversation-list__brand-title">마인드풀 워크스페이스</p>
-          <p className="conversation-list__brand-subtitle">디지털 생추어리</p>
+          <p className="conversation-list__brand-subtitle">로컬 에이전트 게이트웨이</p>
         </div>
       </div>
+
+      <section className="conversation-list__agents" aria-label="에이전트 선택">
+        <div className="conversation-list__section-label">에이전트</div>
+        <div className="conversation-list__agent-row">
+          <select
+            aria-label="활성 에이전트"
+            value={props.activeAgentId ?? ""}
+            onChange={(event) => props.onSelectAgent(event.target.value)}
+          >
+            {props.agents.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="conversation-list__agent-create"
+            onClick={props.onCreateAgent}
+            type="button"
+          >
+            + 에이전트
+          </button>
+        </div>
+      </section>
 
       <button
         className="primary-button conversation-list__new-chat"
@@ -29,7 +57,7 @@ export function ConversationList(props: ConversationListProps) {
         + 새 채팅
       </button>
 
-      <div className="conversation-list__section-label">최근 대화</div>
+      <div className="conversation-list__section-label">최근 세션</div>
 
       <div className="conversation-list__items">
         {props.conversations.map((conversation) => {
@@ -63,7 +91,7 @@ export function ConversationList(props: ConversationListProps) {
 
         {props.conversations.length === 0 ? (
           <div className="conversation-list__empty">
-            대화를 시작하면 선택한 프로바이더와 모델 정보가 여기에 표시됩니다.
+            아직 이 에이전트의 세션이 없습니다. 새 채팅을 만들어 바로 시작해 보세요.
           </div>
         ) : null}
       </div>

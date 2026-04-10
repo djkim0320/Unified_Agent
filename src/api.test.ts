@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getWorkspaceFile, getWorkspaceTree, listWorkspaceRunEvents, streamChat } from "./api";
+import {
+  cancelAgentTask,
+  createAgentTask,
+  getAgentMemory,
+  getWorkspaceFile,
+  getWorkspaceTree,
+  listAgentTasks,
+  listTaskEvents,
+  listWorkspaceRunEvents,
+  streamChat,
+  writeAgentMemory,
+} from "./api";
 
 function createSseResponse(body: string) {
   return new Response(body, {
@@ -148,6 +159,72 @@ describe("api helpers", () => {
         headers: expect.objectContaining({
           "Content-Type": "application/json",
         }),
+      }),
+    );
+  });
+
+  it("uses scoped agent task and memory endpoints", async () => {
+    vi.mocked(fetch).mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: true, task: {}, tasks: [], events: [], memory: {} }), {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
+    await listAgentTasks("agent-1");
+    await createAgentTask("agent-1", { prompt: "do work" });
+    await cancelAgentTask("agent-1", "task-1");
+    await listTaskEvents("agent-1", "task-1");
+    await getAgentMemory("agent-1");
+    await writeAgentMemory("agent-1", { content: "remember this", target: "durable" });
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/agents/agent-1/tasks",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/agent-1/tasks",
+      expect.objectContaining({
+        method: "POST",
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      "/api/agents/agent-1/tasks/task-1/cancel",
+      expect.objectContaining({
+        method: "POST",
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      4,
+      "/api/agents/agent-1/tasks/task-1/events",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      5,
+      "/api/agents/agent-1/memory",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      6,
+      "/api/agents/agent-1/memory",
+      expect.objectContaining({
+        method: "POST",
       }),
     );
   });

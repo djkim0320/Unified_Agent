@@ -11,11 +11,31 @@ export type ProviderKind = (typeof providerKinds)[number];
 export type ChatRole = "user" | "assistant";
 export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type WorkspaceScope = "sandbox" | "shared" | "root";
+export type ChannelKind = "webchat";
 export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
+export type TaskStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "timed_out"
+  | "cancelled";
+
+export interface AgentRecord {
+  id: string;
+  name: string;
+  providerKind: ProviderKind;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  createdAt: number;
+  updatedAt: number;
+}
 
 export interface ConversationRecord {
   id: string;
+  agentId?: string;
   title: string;
+  channelKind?: ChannelKind;
   providerKind: ProviderKind;
   model: string;
   reasoningLevel: ReasoningLevel;
@@ -67,6 +87,7 @@ export interface WorkspaceFileRecord {
 export interface WorkspaceRunRecord {
   id: string;
   conversationId: string;
+  taskId?: string | null;
   providerKind: ProviderKind;
   model: string;
   userMessage: string;
@@ -89,6 +110,51 @@ export interface WorkspaceRunEventRecord {
   payload: Record<string, unknown>;
   createdAt: number;
 }
+
+export interface TaskRecord {
+  id: string;
+  agentId: string;
+  conversationId: string;
+  runId: string | null;
+  title: string;
+  prompt: string;
+  providerKind: ProviderKind;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  status: TaskStatus;
+  resultText: string | null;
+  createdAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  scheduledFor: number | null;
+  updatedAt: number;
+}
+
+export interface TaskEventRecord {
+  id: string;
+  taskId: string;
+  eventType:
+    | "queued"
+    | "running"
+    | "status"
+    | "completed"
+    | "failed"
+    | "timed_out"
+    | "cancelled"
+    | "result_delivered";
+  payload: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface AgentMemorySnapshot {
+  agentId: string;
+  durableMemoryPath: string;
+  durableMemory: string;
+  dailyMemoryPath: string;
+  dailyMemory: string;
+}
+
+export type AgentMemoryRecord = AgentMemorySnapshot;
 
 export interface StreamEventPayloadMap {
   status: { message: string; tool?: string };

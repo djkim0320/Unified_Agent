@@ -40,8 +40,8 @@ export function ChatView(props: ChatViewProps) {
       {showEmpty ? (
         <div className="chat-view__empty">
           <p className="eyebrow">채팅</p>
-          <h2>대화를 시작하면 AI 작업 공간이 열립니다.</h2>
-          <p>메시지, 워크스페이스 파일, 에이전트 실행 로그를 같은 화면에서 확인할 수 있습니다.</p>
+          <h2>대화를 시작하면 AI 작업 공간이 바로 열립니다.</h2>
+          <p>메시지, 워크스페이스 파일, 에이전트 실행 로그를 같은 흐름 안에서 함께 확인할 수 있습니다.</p>
         </div>
       ) : (
         <div className="chat-view__messages">
@@ -64,7 +64,7 @@ export function ChatView(props: ChatViewProps) {
                   <div className="chat-bubble chat-bubble--user">
                     <p>{message.content}</p>
                   </div>
-                  <span className="chat-entry__meta">이 대화에 고정됨</span>
+                  <span className="chat-entry__meta">이 세션에 고정됨</span>
                 </>
               ) : (
                 <div className="chat-response">

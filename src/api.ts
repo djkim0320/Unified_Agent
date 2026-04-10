@@ -1,4 +1,6 @@
 import type {
+  AgentMemoryRecord,
+  AgentRecord,
   ConversationRecord,
   MessageRecord,
   ProviderKind,
@@ -10,6 +12,8 @@ import type {
   WorkspaceRunRecord,
   WorkspaceScope,
   WorkspaceTreeNode,
+  TaskEventRecord,
+  TaskRecord,
 } from "./types";
 
 async function readJsonOrThrow<T>(response: Response): Promise<T> {
@@ -51,6 +55,76 @@ async function apiRequest<T>(input: string, init?: RequestInit): Promise<T> {
 
 export async function listProviders() {
   return apiRequest<{ providers: ProviderSummary[] }>("/api/providers");
+}
+
+export async function listAgents() {
+  return apiRequest<{ agents: AgentRecord[] }>("/api/agents");
+}
+
+export async function saveAgent(payload: {
+  agentId?: string;
+  name: string;
+  providerKind?: ProviderKind;
+  model?: string;
+  reasoningLevel?: ReasoningLevel;
+}) {
+  return apiRequest<{ agent: AgentRecord }>("/api/agents", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getAgentMemory(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ memory: AgentMemoryRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/memory`,
+    { signal },
+  );
+}
+
+export async function writeAgentMemory(agentId: string, payload: { content: string; target?: "durable" | "daily" }) {
+  return apiRequest<{ memory: AgentMemoryRecord }>(`/api/agents/${encodeURIComponent(agentId)}/memory`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listAgentTasks(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ tasks: TaskRecord[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/tasks`,
+    { signal },
+  );
+}
+
+export async function createAgentTask(
+  agentId: string,
+  payload: {
+    conversationId?: string | null;
+    title?: string;
+    prompt: string;
+    providerKind?: ProviderKind;
+    model?: string;
+    reasoningLevel?: ReasoningLevel;
+    autoStart?: boolean;
+  },
+) {
+  return apiRequest<{ task: TaskRecord }>(`/api/agents/${encodeURIComponent(agentId)}/tasks`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function cancelAgentTask(agentId: string, taskId: string) {
+  return apiRequest<{ task: TaskRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export async function listTaskEvents(agentId: string, taskId: string, signal?: AbortSignal) {
+  return apiRequest<{ events: TaskEventRecord[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(taskId)}/events`,
+    { signal },
+  );
 }
 
 export async function saveProviderAccount(
@@ -95,8 +169,9 @@ export async function logoutCodex() {
   });
 }
 
-export async function listConversations(signal?: AbortSignal) {
-  return apiRequest<{ conversations: ConversationRecord[] }>("/api/conversations", { signal });
+export async function listConversations(signal?: AbortSignal, agentId?: string | null) {
+  const path = agentId ? `/api/conversations?agentId=${encodeURIComponent(agentId)}` : "/api/conversations";
+  return apiRequest<{ conversations: ConversationRecord[] }>(path, { signal });
 }
 
 export async function deleteConversation(conversationId: string) {
@@ -108,6 +183,7 @@ export async function deleteConversation(conversationId: string) {
 export async function saveConversation(payload: {
   conversationId?: string;
   title?: string;
+  agentId?: string;
   providerKind?: ProviderKind;
   model?: string;
   reasoningLevel?: ReasoningLevel;

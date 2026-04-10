@@ -1,5 +1,4 @@
-import type { ProviderDraft, ProviderKind, ProviderSummary } from "../types";
-import { providerKinds, providerLabels } from "../types";
+import { providerKinds, providerLabels, type ProviderDraft, type ProviderKind, type ProviderSummary } from "../types";
 
 interface ProviderSettingsDialogProps {
   drafts: Record<ProviderKind, ProviderDraft>;

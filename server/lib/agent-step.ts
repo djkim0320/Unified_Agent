@@ -4,27 +4,7 @@ import type { AgentStep } from "../types.js";
 const ToolStepSchema = z.object({
   type: z.literal("tool_call"),
   tool: z.object({
-    name: z.enum([
-      "list_tree",
-      "read_file",
-      "write_file",
-      "edit_file",
-      "make_dir",
-      "move_path",
-      "delete_path",
-      "exec_command",
-      "provider_web_search",
-      "duckduckgo_search",
-      "web_fetch",
-      "browser_search",
-      "browser_open",
-      "browser_snapshot",
-      "browser_extract",
-      "browser_click",
-      "browser_type",
-      "browser_back",
-      "browser_close",
-    ]),
+    name: z.string().min(1),
     arguments: z.record(z.unknown()).default({}),
   }),
 });

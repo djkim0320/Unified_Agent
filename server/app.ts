@@ -2,6 +2,7 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { createAgentGateway } from "./lib/agent-gateway.js";
 import { resolveCodexIdentity, importCodexCliAuth } from "./lib/codex-auth.js";
 import { createBrowserRuntime } from "./lib/browser-runtime.js";
 import { runCodexLogin, runCodexLoginStatus } from "./lib/codex-cli.js";
@@ -9,7 +10,7 @@ import { createDebugLog, redactOpaqueValue } from "./lib/debug-log.js";
 import { AgentRunError, runAgentTurn } from "./lib/agent-runtime.js";
 import { isAbortError } from "./lib/process-control.js";
 import { createWorkspaceManager } from "./lib/workspace.js";
-import { createStore } from "./db.js";
+import { createStore, DEFAULT_AGENT_ID, DEFAULT_CONVERSATION_TITLE } from "./db.js";
 import { getCuratedModelIds } from "./model-catalog.js";
 import { getProviderAdapter, providerKinds } from "./provider-registry.js";
 import { normalizeReasoningLevel } from "./reasoning-options.js";
@@ -33,10 +34,35 @@ const WorkspaceScopeSchema = z.enum(["sandbox", "shared", "root"]);
 
 const ConversationUpsertSchema = z.object({
   conversationId: z.string().uuid().optional(),
+  agentId: z.string().min(1).max(120).optional(),
   title: z.string().min(1).max(120).optional(),
   providerKind: ProviderKindSchema.optional(),
   model: z.string().min(1).max(120).optional(),
   reasoningLevel: ReasoningLevelSchema.optional(),
+});
+
+const AgentUpsertSchema = z.object({
+  agentId: z.string().min(1).max(120).optional(),
+  name: z.string().min(1).max(80),
+  providerKind: ProviderKindSchema.optional(),
+  model: z.string().min(1).max(120).optional(),
+  reasoningLevel: ReasoningLevelSchema.optional(),
+});
+
+const TaskCreateSchema = z.object({
+  agentId: z.string().min(1).max(120),
+  conversationId: z.string().uuid().optional().nullable(),
+  title: z.string().min(1).max(120).optional(),
+  prompt: z.string().min(1).max(20_000),
+  providerKind: ProviderKindSchema.optional(),
+  model: z.string().min(1).max(120).optional(),
+  reasoningLevel: ReasoningLevelSchema.optional(),
+  autoStart: z.boolean().optional().default(true),
+});
+
+const AgentMemoryWriteSchema = z.object({
+  content: z.string().min(1).max(10_000),
+  target: z.enum(["durable", "daily"]).optional().default("durable"),
 });
 
 const ApiProviderAccountSchema = z.object({
@@ -156,9 +182,20 @@ export function createApp(options?: {
   const store = createStore(dataDir);
   const workspace = createWorkspaceManager(projectRoot, {
     conversationExists: (conversationId) => Boolean(store.getConversation(conversationId)),
+    conversationAgentId: (conversationId) => store.getConversation(conversationId)?.agentId ?? null,
     enableRootScope: process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true",
   });
   const browserRuntime = createBrowserRuntime();
+  for (const agent of store.listAgents()) {
+    workspace.createAgentWorkspace(agent.id);
+  }
+  const gateway = createAgentGateway({
+    projectRoot,
+    workspace,
+    browserRuntime,
+    store,
+    resolveSecret: getSecret,
+  });
   const codexOAuthDebug = createDebugLog({
     dataDir,
     fileName: "codex-oauth-debug.log",
@@ -186,6 +223,15 @@ export function createApp(options?: {
     return conversation;
   }
 
+  function requireAgent(response: express.Response, agentId: string) {
+    const agent = store.getAgent(agentId);
+    if (!agent) {
+      response.status(404).json({ error: "Agent not found" });
+      return null;
+    }
+    return agent;
+  }
+
   function workspaceErrorStatus(error: unknown) {
     if (error instanceof Error && /conversation not found/i.test(error.message)) {
       return 404;
@@ -208,6 +254,195 @@ export function createApp(options?: {
       metadata: account?.metadata ?? {},
     });
   }
+
+  app.get("/api/plugins", (_request, response) => {
+    response.json({
+      plugins: gateway.pluginManager.listPlugins().map((plugin) => plugin.manifest),
+    });
+  });
+
+  app.get("/api/tools", (_request, response) => {
+    response.json({
+      tools: gateway.toolRegistry.list(),
+    });
+  });
+
+  app.get("/api/channels", (_request, response) => {
+    response.json({
+      channels: [
+        {
+          kind: "webchat",
+          label: "Web Chat",
+          enabled: true,
+          note: "Primary local UI channel.",
+        },
+      ],
+    });
+  });
+
+  app.get("/api/agents", (_request, response) => {
+    response.json({
+      agents: store.listAgents(),
+    });
+  });
+
+  app.post("/api/agents", (request, response) => {
+    const body = AgentUpsertSchema.parse(request.body);
+    const existing = body.agentId ? store.getAgent(body.agentId) : null;
+    const providerKind = body.providerKind ?? existing?.providerKind ?? "openai";
+    const agent = store.saveAgent({
+      id: body.agentId,
+      name: body.name,
+      providerKind,
+      model: body.model ?? existing?.model ?? getProviderAdapter(providerKind).defaultModel,
+      reasoningLevel: body.reasoningLevel ?? existing?.reasoningLevel ?? "high",
+    });
+    workspace.createAgentWorkspace(agent.id);
+    response.json({ agent });
+  });
+
+  app.delete("/api/agents/:agentId", async (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    if (agent.id === DEFAULT_AGENT_ID) {
+      response.status(400).json({ error: "The default agent cannot be deleted." });
+      return;
+    }
+    for (const conversation of store.listConversations(agent.id)) {
+      await browserRuntime.closeConversationSessions(conversation.id).catch(() => undefined);
+    }
+    const deleted = store.deleteAgent(agent.id);
+    if (!deleted) {
+      response.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    try {
+      workspace.deleteAgentWorkspace(agent.id);
+    } catch {
+      // Agent workspace cleanup is best-effort and anchored to workspace/agents/<agentId>.
+    }
+    response.json({ ok: true });
+  });
+
+  app.get("/api/agents/:agentId/memory", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      memory: gateway.memoryManager.getSnapshot(agent.id),
+    });
+  });
+
+  app.post("/api/agents/:agentId/memory", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = AgentMemoryWriteSchema.parse(request.body);
+    gateway.memoryManager.write({
+      agentId: agent.id,
+      content: body.content,
+      target: body.target,
+    });
+    response.json({
+      memory: gateway.memoryManager.getSnapshot(agent.id),
+    });
+  });
+
+  app.get("/api/agents/:agentId/tasks", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      tasks: store.listTasks(agent.id),
+    });
+  });
+
+  app.post("/api/agents/:agentId/tasks", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = TaskCreateSchema.parse({
+      ...request.body,
+      agentId: agent.id,
+    });
+    const providerKind = body.providerKind ?? agent.providerKind;
+    const model = body.model ?? agent.model;
+    const reasoningLevel = normalizeReasoningLevel(
+      providerKind,
+      model,
+      body.reasoningLevel ?? agent.reasoningLevel,
+    );
+    const conversation =
+      body.conversationId
+        ? store.getConversation(body.conversationId)
+        : store.saveConversation({
+            agentId: agent.id,
+            title: body.title ?? "백그라운드 작업",
+            providerKind,
+            model,
+            reasoningLevel,
+          });
+
+    if (!conversation || conversation.agentId !== agent.id) {
+      response.status(404).json({ error: "Session not found for agent." });
+      return;
+    }
+
+    void gateway.taskManager
+      .enqueueDetachedTask({
+        agentId: agent.id,
+        conversationId: conversation.id,
+        title: body.title ?? (body.prompt.trim().slice(0, 80) || "백그라운드 작업"),
+        prompt: body.prompt,
+        providerKind,
+        model,
+        reasoningLevel,
+        startImmediately: body.autoStart,
+      })
+      .then((task) => {
+        response.json({ task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to start background task.",
+        });
+      });
+  });
+
+  app.post("/api/agents/:agentId/tasks/:taskId/cancel", (request, response) => {
+    const task = store.getTaskForAgent(request.params.agentId, request.params.taskId);
+    if (!task) {
+      response.status(404).json({ error: "Task not found" });
+      return;
+    }
+    void gateway.taskManager
+      .cancelTask(task.id)
+      .then((updated) => {
+        response.json({ task: updated ?? task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to cancel task.",
+        });
+      });
+  });
+
+  app.get("/api/agents/:agentId/tasks/:taskId/events", (request, response) => {
+    const task = store.getTaskForAgent(request.params.agentId, request.params.taskId);
+    if (!task) {
+      response.status(404).json({ error: "Task not found" });
+      return;
+    }
+    response.json({
+      events: store.listTaskEvents(request.params.agentId, request.params.taskId),
+    });
+  });
 
   async function getSecret(kind: ProviderKind) {
     const secret = store.getProviderSecret(kind);
@@ -565,32 +800,48 @@ export function createApp(options?: {
     response.json({ ok: true });
   });
 
-  app.get("/api/conversations", (_request, response) => {
+  app.get("/api/conversations", (request, response) => {
+    const agentId = typeof request.query.agentId === "string" ? request.query.agentId : undefined;
+    if (agentId && !requireAgent(response, agentId)) {
+      return;
+    }
     response.json({
-      conversations: store.listConversations(),
+      conversations: store.listConversations(agentId),
     });
   });
 
   app.post("/api/conversations", (request, response) => {
     const body = ConversationUpsertSchema.parse(request.body);
     const existing = body.conversationId ? store.getConversation(body.conversationId) : null;
-    const providerKind = body.providerKind ?? existing?.providerKind ?? "openai";
-    const model = body.model ?? existing?.model ?? getProviderAdapter(providerKind).defaultModel;
+    const agentId = body.agentId ?? existing?.agentId ?? DEFAULT_AGENT_ID;
+    const agent = requireAgent(response, agentId);
+    if (!agent) {
+      return;
+    }
+    const providerKind = body.providerKind ?? existing?.providerKind ?? agent.providerKind;
+    const model = body.model ?? existing?.model ?? agent.model ?? getProviderAdapter(providerKind).defaultModel;
     const reasoningLevel = normalizeReasoningLevel(
       providerKind,
       model,
-      body.reasoningLevel ?? existing?.reasoningLevel,
+      body.reasoningLevel ?? existing?.reasoningLevel ?? agent.reasoningLevel,
     );
-    const normalizedConversationTitle = body.title ?? existing?.title ?? "새 채팅";
-    const title = body.title ?? existing?.title ?? "새 채팅";
-    const normalizedTitle = body.title ?? existing?.title ?? "새 채팅";
+    const normalizedConversationTitle = body.title ?? existing?.title ?? DEFAULT_CONVERSATION_TITLE;
     const conversation = store.saveConversation({
       id: body.conversationId,
+      agentId: agent.id,
       title: normalizedConversationTitle,
       providerKind,
       model,
       reasoningLevel,
     });
+    store.saveAgent({
+      id: agent.id,
+      name: agent.name,
+      providerKind,
+      model,
+      reasoningLevel,
+    });
+    workspace.createAgentWorkspace(agent.id);
     workspace.createConversationWorkspace(conversation.id);
     response.json({ conversation });
   });
@@ -614,15 +865,15 @@ export function createApp(options?: {
       return;
     }
     await browserRuntime.closeConversationSessions(conversation.id).catch(() => undefined);
-    const deleted = store.deleteConversation(conversation.id);
-    if (!deleted) {
-      response.status(404).json({ error: "Conversation not found" });
-      return;
-    }
     try {
       workspace.deleteConversationWorkspace(conversation.id);
     } catch {
       // Workspace cleanup is best-effort, but deleteConversationWorkspace is scoped to this sandbox only.
+    }
+    const deleted = store.deleteConversation(conversation.id);
+    if (!deleted) {
+      response.status(404).json({ error: "Conversation not found" });
+      return;
     }
     response.json({ ok: true });
   });
@@ -747,17 +998,30 @@ export function createApp(options?: {
 
     store.saveConversation({
       id: conversation.id,
+      agentId: conversation.agentId,
+      channelKind: conversation.channelKind,
       title: conversation.title,
       providerKind: body.providerKind,
       model: body.model,
       reasoningLevel: normalizedReasoningLevel,
     });
+    const agent = store.getAgent(conversation.agentId);
+    if (agent) {
+      store.saveAgent({
+        id: agent.id,
+        name: agent.name,
+        providerKind: body.providerKind,
+        model: body.model,
+        reasoningLevel: normalizedReasoningLevel,
+      });
+    }
     store.appendMessage({
       conversationId: conversation.id,
       role: "user",
       content: body.message,
     });
     store.ensureConversationTitle(conversation.id, body.message);
+    workspace.createAgentWorkspace(conversation.agentId);
     workspace.createConversationWorkspace(conversation.id);
 
     response.status(200);
@@ -786,12 +1050,14 @@ export function createApp(options?: {
 
     try {
       const runtimeResult = await runAgentTurn({
+        agent: store.getAgent(conversation.agentId) ?? undefined,
         adapter: adapter as never,
         secret: secret as never,
         providerKind: body.providerKind,
         model: body.model,
         reasoningLevel: normalizedReasoningLevel,
         conversationId: conversation.id,
+        agentId: conversation.agentId,
         userMessage: body.message,
         messages: store.listMessages(conversation.id).map((message) => ({
           role: message.role,
@@ -799,10 +1065,15 @@ export function createApp(options?: {
         })),
         workspace,
         browserRuntime,
+        memoryManager: gateway.memoryManager,
+        pluginManager: gateway.pluginManager,
+        toolRegistry: gateway.toolRegistry,
+        taskManager: gateway.taskManager,
         store,
         sendEvent,
         signal: abortController.signal,
         unsafeShellEnabled: process.env.ENABLE_UNSAFE_WORKSPACE_EXEC === "true",
+        conversationTitle: conversation.title,
       });
 
       if (abortController.signal.aborted) {
@@ -862,5 +1133,6 @@ export function createApp(options?: {
     store,
     workspace,
     browserRuntime,
+    gateway,
   };
 }

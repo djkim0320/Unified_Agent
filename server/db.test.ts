@@ -98,4 +98,81 @@ describe("workspace run persistence consistency", () => {
       .get() as { count: number };
     expect(orphanEvents.count).toBe(0);
   });
+
+  it("creates a default agent and scopes conversations by agent", () => {
+    const defaultAgent = store.getAgent("default-agent");
+    expect(defaultAgent).toEqual(
+      expect.objectContaining({
+        id: "default-agent",
+        name: "기본 에이전트",
+      }),
+    );
+
+    const secondAgent = store.saveAgent({
+      name: "Research Agent",
+      providerKind: "anthropic",
+      model: "claude-sonnet-4-6",
+      reasoningLevel: "medium",
+    });
+    const firstConversation = createConversation("default session");
+    const secondConversation = store.saveConversation({
+      agentId: secondAgent.id,
+      title: "research session",
+      providerKind: "anthropic",
+      model: "claude-sonnet-4-6",
+      reasoningLevel: "medium",
+    });
+
+    expect(firstConversation.agentId).toBe("default-agent");
+    expect(secondConversation.agentId).toBe(secondAgent.id);
+    expect(store.listConversations("default-agent").map((conversation) => conversation.id)).toEqual([
+      firstConversation.id,
+    ]);
+    expect(store.listConversations(secondAgent.id).map((conversation) => conversation.id)).toEqual([
+      secondConversation.id,
+    ]);
+  });
+
+  it("keeps task events scoped to the owning agent", () => {
+    const owner = store.saveAgent({
+      name: "Owner Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const other = store.saveAgent({
+      name: "Other Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const conversation = store.saveConversation({
+      agentId: owner.id,
+      title: "task session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+
+    const task = store.createTask({
+      agentId: owner.id,
+      conversationId: conversation.id,
+      title: "Follow-up",
+      prompt: "Do background work",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const transition = store.transitionTask({
+      taskId: task.id,
+      status: "running",
+      eventType: "running",
+      payload: { ok: true },
+    });
+
+    expect(transition.changed).toBe(true);
+    expect(store.listTaskEvents(owner.id, task.id).length).toBeGreaterThan(1);
+    expect(store.listTaskEvents(other.id, task.id)).toEqual([]);
+    expect(store.getTaskForAgent(other.id, task.id)).toBeNull();
+  });
 });

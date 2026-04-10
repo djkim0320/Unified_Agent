@@ -1,16 +1,23 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  cancelAgentTask,
   deleteConversation,
+  createAgentTask,
+  getAgentMemory,
   getConversationMessages,
   getWorkspaceFile,
   getWorkspaceTree,
   importCodexCliAuth,
+  listAgentTasks,
+  listAgents,
   listConversations,
   listModels,
   listProviders,
+  listTaskEvents,
   listWorkspaceRunEvents,
   listWorkspaceRuns,
   logoutCodex,
+  saveAgent,
   saveConversation,
   saveProviderAccount,
   startCodexOAuth,
@@ -30,12 +37,16 @@ import {
   defaultReasoningLevels,
   providerKinds,
   providerLabels,
+  type AgentMemoryRecord,
+  type AgentRecord,
   type ConversationRecord,
   type DisplayMessage,
   type ProviderDraft,
   type ProviderKind,
   type ProviderSummary,
   type StreamEventPayloadMap,
+  type TaskEventRecord,
+  type TaskRecord,
   type WorkspaceFileRecord,
   type WorkspaceRunEventRecord,
   type WorkspaceRunRecord,
@@ -170,6 +181,9 @@ function beginRequest(
 
 export default function App() {
   const [activeSection, setActiveSection] = useState<"chat" | "workspace">("chat");
+  const [agents, setAgents] = useState<AgentRecord[]>([]);
+  const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
+  const [activeAgent, setActiveAgent] = useState<AgentRecord | null>(null);
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
@@ -196,8 +210,12 @@ export default function App() {
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode[]>([]);
   const [workspaceFile, setWorkspaceFile] = useState<WorkspaceFileRecord | null>(null);
   const [workspaceRuns, setWorkspaceRuns] = useState<WorkspaceRunRecord[]>([]);
+  const [tasks, setTasks] = useState<TaskRecord[]>([]);
+  const [agentMemory, setAgentMemory] = useState<AgentMemoryRecord | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
+  const [taskEvents, setTaskEvents] = useState<TaskEventRecord[]>([]);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
   const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
@@ -205,15 +223,25 @@ export default function App() {
   const [workspaceFileLoading, setWorkspaceFileLoading] = useState(false);
 
   const activeConversationIdRef = useRef<string | null>(null);
+  const activeAgentIdRef = useRef<string | null>(null);
   const selectedRunIdRef = useRef<string | null>(null);
+  const selectedTaskIdRef = useRef<string | null>(null);
   const manualRunSelectionRef = useRef(false);
   const lastConversationIdRef = useRef<string | null>(null);
+  const conversationListSeqRef = useRef(0);
+  const conversationListControllerRef = useRef<AbortController | null>(null);
   const conversationLoadSeqRef = useRef(0);
   const conversationLoadControllerRef = useRef<AbortController | null>(null);
   const workspaceTreeSeqRef = useRef(0);
   const workspaceTreeControllerRef = useRef<AbortController | null>(null);
   const workspaceRunsSeqRef = useRef(0);
   const workspaceRunsControllerRef = useRef<AbortController | null>(null);
+  const tasksSeqRef = useRef(0);
+  const tasksControllerRef = useRef<AbortController | null>(null);
+  const taskEventsSeqRef = useRef(0);
+  const taskEventsControllerRef = useRef<AbortController | null>(null);
+  const memorySeqRef = useRef(0);
+  const memoryControllerRef = useRef<AbortController | null>(null);
   const workspaceEventsSeqRef = useRef(0);
   const workspaceEventsControllerRef = useRef<AbortController | null>(null);
   const workspaceFileSeqRef = useRef(0);
@@ -226,8 +254,17 @@ export default function App() {
   }, [activeConversationId]);
 
   useEffect(() => {
+    activeAgentIdRef.current = activeAgentId;
+    setActiveAgent(agents.find((agent) => agent.id === activeAgentId) ?? null);
+  }, [activeAgentId, agents]);
+
+  useEffect(() => {
     selectedRunIdRef.current = selectedRunId;
   }, [selectedRunId]);
+
+  useEffect(() => {
+    selectedTaskIdRef.current = selectedTaskId;
+  }, [selectedTaskId]);
 
   const providersByKind = useMemo(
     () =>
@@ -239,6 +276,14 @@ export default function App() {
   );
 
   function abortAllPendingRequests() {
+    abortRef(conversationListControllerRef);
+    abortConversationScopedRequests();
+    abortRef(tasksControllerRef);
+    abortRef(taskEventsControllerRef);
+    abortRef(memoryControllerRef);
+  }
+
+  function abortConversationScopedRequests() {
     abortRef(conversationLoadControllerRef);
     abortRef(workspaceTreeControllerRef);
     abortRef(workspaceRunsControllerRef);
@@ -247,7 +292,7 @@ export default function App() {
     abortRef(streamControllerRef);
   }
 
-  function resetWorkspaceState() {
+  function resetConversationWorkspaceState() {
     setWorkspaceTree([]);
     setWorkspaceFile(null);
     setWorkspaceRuns([]);
@@ -260,35 +305,78 @@ export default function App() {
     setWorkspaceFileLoading(false);
   }
 
+  function resetWorkspaceState() {
+    resetConversationWorkspaceState();
+    setTasks([]);
+    setAgentMemory(null);
+    setSelectedTaskId(null);
+    setTaskEvents([]);
+  }
+
   async function refreshProviders() {
     const response = await listProviders();
     setProviders(response.providers);
     setProviderDrafts((currentDrafts) => mergeProviderDrafts(response.providers, currentDrafts));
   }
 
-  async function refreshConversationList(preferredConversationId?: string | null) {
-    const response = await listConversations();
-    setConversations(response.conversations);
-
-    const nextId =
-      preferredConversationId &&
-      response.conversations.some((item) => item.id === preferredConversationId)
-        ? preferredConversationId
-        : response.conversations[0]?.id ?? null;
-
-    setActiveConversationId(nextId);
-    return response.conversations;
+  async function refreshAgents(preferredAgentId?: string | null) {
+    const response = await listAgents();
+    setAgents(response.agents);
+    const nextAgentId =
+      preferredAgentId && response.agents.some((agent) => agent.id === preferredAgentId)
+        ? preferredAgentId
+        : response.agents[0]?.id ?? null;
+    setActiveAgentId(nextAgentId);
+    setActiveAgent(response.agents.find((agent) => agent.id === nextAgentId) ?? null);
+    return response.agents;
   }
 
-  async function createConversationThread(preferredProviderKind?: ProviderKind) {
-    const providerKind = pickConversationProvider(providers, preferredProviderKind);
-    const model = defaultModels[providerKind];
+  async function refreshConversationList(
+    preferredConversationId?: string | null,
+    agentId = activeAgentIdRef.current,
+  ) {
+    const request = beginRequest(conversationListSeqRef, conversationListControllerRef);
+
+    try {
+      const response = await listConversations(request.controller.signal, agentId);
+      if (
+        request.controller.signal.aborted ||
+        conversationListSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return [];
+      }
+
+      setConversations(response.conversations);
+
+      const nextId =
+        preferredConversationId &&
+        response.conversations.some((item) => item.id === preferredConversationId)
+          ? preferredConversationId
+          : response.conversations[0]?.id ?? null;
+
+      setActiveConversationId(nextId);
+      return response.conversations;
+    } finally {
+      if (conversationListSeqRef.current === request.seq) {
+        abortRef(conversationListControllerRef);
+      }
+    }
+  }
+
+  async function createConversationThread(preferredProviderKind?: ProviderKind, preferredAgentId = activeAgentIdRef.current) {
+    const agent = agents.find((item) => item.id === preferredAgentId) ?? activeAgent;
+    const providerKind = preferredProviderKind ?? agent?.providerKind ?? pickConversationProvider(providers);
+    const model = agent?.providerKind === providerKind ? agent.model : defaultModels[providerKind];
     const reasoningLevel = normalizeReasoningLevel(
       providerKind,
       model,
-      defaultReasoningLevels[providerKind],
+      agent?.providerKind === providerKind
+        ? agent.reasoningLevel
+        : defaultReasoningLevels[providerKind],
     );
     const response = await saveConversation({
+      agentId: agent?.id ?? preferredAgentId ?? undefined,
       providerKind,
       model,
       reasoningLevel,
@@ -414,6 +502,92 @@ export default function App() {
     }
   }
 
+  async function refreshAgentTasks(agentId: string) {
+    const request = beginRequest(tasksSeqRef, tasksControllerRef);
+
+    try {
+      const response = await listAgentTasks(agentId, request.controller.signal);
+      if (request.controller.signal.aborted || tasksSeqRef.current !== request.seq || activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setTasks(response.tasks);
+
+      const currentSelectedTaskId = selectedTaskIdRef.current;
+      const nextSelectedTaskId =
+        currentSelectedTaskId && response.tasks.some((task) => task.id === currentSelectedTaskId)
+          ? currentSelectedTaskId
+          : response.tasks[0]?.id ?? null;
+
+      if (nextSelectedTaskId !== currentSelectedTaskId) {
+        setSelectedTaskId(nextSelectedTaskId);
+      }
+    } catch (error) {
+      if (request.controller.signal.aborted || tasksSeqRef.current !== request.seq) {
+        return;
+      }
+      setAppNotice(error instanceof Error ? error.message : "태스크 목록을 불러오지 못했습니다.");
+    } finally {
+      if (tasksSeqRef.current === request.seq) {
+        abortRef(tasksControllerRef);
+      }
+    }
+  }
+
+  async function refreshTaskEvents(agentId: string, taskId: string | null) {
+    const request = beginRequest(taskEventsSeqRef, taskEventsControllerRef);
+
+    if (!taskId) {
+      setTaskEvents([]);
+      abortRef(taskEventsControllerRef);
+      return;
+    }
+
+    try {
+      const response = await listTaskEvents(agentId, taskId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        taskEventsSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId ||
+        selectedTaskIdRef.current !== taskId
+      ) {
+        return;
+      }
+
+      setTaskEvents(response.events);
+    } catch (error) {
+      if (request.controller.signal.aborted || taskEventsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "태스크 이벤트를 불러오지 못했습니다.");
+    } finally {
+      if (taskEventsSeqRef.current === request.seq) {
+        abortRef(taskEventsControllerRef);
+      }
+    }
+  }
+
+  async function refreshAgentMemory(agentId: string) {
+    const request = beginRequest(memorySeqRef, memoryControllerRef);
+
+    try {
+      const response = await getAgentMemory(agentId, request.controller.signal);
+      if (request.controller.signal.aborted || memorySeqRef.current !== request.seq || activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setAgentMemory(response.memory);
+    } catch (error) {
+      if (request.controller.signal.aborted || memorySeqRef.current !== request.seq) {
+        return;
+      }
+      setAppNotice(error instanceof Error ? error.message : "메모리를 불러오지 못했습니다.");
+    } finally {
+      if (memorySeqRef.current === request.seq) {
+        abortRef(memoryControllerRef);
+      }
+    }
+  }
+
   async function refreshWorkspaceRunEvents(conversationId: string, runId: string | null) {
     const request = beginRequest(workspaceEventsSeqRef, workspaceEventsControllerRef);
 
@@ -506,6 +680,7 @@ export default function App() {
     try {
       const response = await saveConversation({
         conversationId: activeConversation.id,
+        agentId: activeConversation.agentId,
         title: optimisticConversation.title,
         providerKind,
         model,
@@ -524,10 +699,7 @@ export default function App() {
     void (async () => {
       try {
         await refreshProviders();
-        const loadedConversations = await refreshConversationList();
-        if (!cancelled && loadedConversations.length === 0) {
-          await createConversationThread();
-        }
+        await refreshAgents();
       } catch (error) {
         if (!cancelled) {
           setAppNotice(error instanceof Error ? error.message : "초기 데이터를 불러오지 못했습니다.");
@@ -578,13 +750,39 @@ export default function App() {
       cancelled = true;
     };
   }, [providers]);
+
+  useEffect(() => {
+    if (!activeAgentId) {
+      return;
+    }
+
+    abortAllPendingRequests();
+    resetWorkspaceState();
+    setActiveConversation(null);
+    setActiveConversationId(null);
+    setConversations([]);
+    setMessages([]);
+    setPendingAssistantText("");
+    setChatError(null);
+    manualRunSelectionRef.current = false;
+
+    void (async () => {
+      const loadedConversations = await refreshConversationList(null, activeAgentId);
+      void refreshAgentTasks(activeAgentId);
+      void refreshAgentMemory(activeAgentId);
+      if (loadedConversations.length === 0) {
+        await createConversationThread(undefined, activeAgentId);
+      }
+    })();
+  }, [activeAgentId]);
+
   useEffect(() => {
     const conversationChanged = lastConversationIdRef.current !== activeConversationId;
     lastConversationIdRef.current = activeConversationId;
 
     if (conversationChanged) {
-      abortAllPendingRequests();
-      resetWorkspaceState();
+      abortConversationScopedRequests();
+      resetConversationWorkspaceState();
       setActiveConversation(null);
       setMessages([]);
       setPendingAssistantText("");
@@ -620,6 +818,31 @@ export default function App() {
 
     void refreshWorkspaceRunEvents(activeConversationId, selectedRunId);
   }, [activeConversationId, selectedRunId]);
+
+  useEffect(() => {
+    if (!activeAgentId) {
+      setTaskEvents([]);
+      return;
+    }
+
+    void refreshTaskEvents(activeAgentId, selectedTaskId);
+  }, [activeAgentId, selectedTaskId]);
+
+  useEffect(() => {
+    if (!activeAgentId || !tasks.some((task) => task.status === "queued" || task.status === "running")) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshAgentTasks(activeAgentId);
+      void refreshTaskEvents(activeAgentId, selectedTaskIdRef.current);
+      if (activeConversationId) {
+        void refreshWorkspaceRuns(activeConversationId, selectedRunIdRef.current);
+      }
+    }, 1500);
+
+    return () => window.clearInterval(timer);
+  }, [activeAgentId, activeConversationId, tasks]);
 
   useEffect(() => {
     const handleOAuthMessage = (event: MessageEvent) => {
@@ -699,6 +922,74 @@ export default function App() {
       setAppNotice(error instanceof Error ? error.message : "프로바이더 설정 저장에 실패했습니다.");
     } finally {
       setSavingKind(null);
+    }
+  }
+
+  async function handleCreateAgent() {
+    const index = agents.length + 1;
+    try {
+      const providerKind = activeConversation?.providerKind ?? pickConversationProvider(providers);
+      const response = await saveAgent({
+        name: `로컬 에이전트 ${index}`,
+        providerKind,
+        model: activeConversation?.model ?? defaultModels[providerKind],
+        reasoningLevel: activeConversation?.reasoningLevel ?? defaultReasoningLevels[providerKind],
+      });
+      await refreshAgents(response.agent.id);
+      setAppNotice(`${response.agent.name}를 만들었습니다.`);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "에이전트를 만들지 못했습니다.");
+    }
+  }
+
+  async function handleSelectAgent(agentId: string) {
+    if (!agentId || agentId === activeAgentId) {
+      return;
+    }
+    setActiveAgentId(agentId);
+  }
+
+  async function handleStartBackgroundTask() {
+    if (!activeAgentId || !activeConversation || !composerText.trim()) {
+      setAppNotice("백그라운드 태스크로 실행할 내용을 입력하세요.");
+      return;
+    }
+
+    const prompt = composerText.trim();
+    setComposerText("");
+    try {
+      const response = await createAgentTask(activeAgentId, {
+        conversationId: activeConversation.id,
+        title: prompt.slice(0, 80),
+        prompt,
+        providerKind: activeConversation.providerKind,
+        model: activeConversation.model,
+        reasoningLevel: activeConversation.reasoningLevel,
+      });
+      setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+      setSelectedTaskId(response.task.id);
+      setAppNotice("백그라운드 태스크를 시작했습니다.");
+      void refreshAgentTasks(activeAgentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "백그라운드 태스크를 시작하지 못했습니다.");
+    }
+  }
+
+  async function handleCancelTask(taskId: string) {
+    if (!activeAgentId) {
+      return;
+    }
+
+    try {
+      const response = await cancelAgentTask(activeAgentId, taskId);
+      setTasks((current) =>
+        current.map((task) => (task.id === response.task.id ? response.task : task)),
+      );
+      setAppNotice("백그라운드 작업을 취소했습니다.");
+      void refreshAgentTasks(activeAgentId);
+      void refreshTaskEvents(activeAgentId, taskId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "백그라운드 작업을 취소하지 못했습니다.");
     }
   }
 
@@ -867,8 +1158,8 @@ export default function App() {
 
       if (activeConversationId === conversationId) {
         const nextConversationId = remaining[0]?.id ?? null;
-        abortAllPendingRequests();
-        resetWorkspaceState();
+        abortConversationScopedRequests();
+        resetConversationWorkspaceState();
         setActiveConversation(null);
         setMessages([]);
         setPendingAssistantText("");
@@ -895,15 +1186,23 @@ export default function App() {
       <div className="app-shell__orb app-shell__orb--bottom" />
 
       <ConversationList
+        activeAgentId={activeAgentId}
+        agents={agents}
         activeConversationId={activeConversationId}
         conversations={conversations}
+        onCreateAgent={() => {
+          void handleCreateAgent();
+        }}
         onCreateConversation={() => {
-          void createConversationThread(activeConversation?.providerKind);
+          void createConversationThread(activeConversation?.providerKind, activeAgentId);
         }}
         onDeleteConversation={(conversationId) => {
           void handleDeleteConversation(conversationId);
         }}
         onOpenSettings={() => setSettingsOpen(true)}
+        onSelectAgent={(agentId) => {
+          void handleSelectAgent(agentId);
+        }}
         onSelectConversation={(conversationId) => {
           setActiveConversationId(conversationId);
           setChatError(null);
@@ -961,7 +1260,8 @@ export default function App() {
             </p>
             {activeConversation ? (
               <p className="chat-panel__intro-copy">
-                현재 선택: {providersByKind[activeConversation.providerKind]?.label ?? activeConversation.providerKind} /{" "}
+                현재 에이전트: {activeAgent?.name ?? "기본 에이전트"} /{" "}
+                {providersByKind[activeConversation.providerKind]?.label ?? activeConversation.providerKind} /{" "}
                 {activeModelOption?.label ?? activeConversation.model} /{" "}
                 {getReasoningLabel(
                   activeConversation.providerKind,
@@ -987,6 +1287,10 @@ export default function App() {
             <WorkspaceView
               file={workspaceFile}
               loading={workspaceLoading}
+              memory={agentMemory}
+              onCancelTask={(taskId) => {
+                void handleCancelTask(taskId);
+              }}
               onScopeChange={(scope) => {
                 setWorkspaceScope(scope);
                 setWorkspaceFile(null);
@@ -998,10 +1302,19 @@ export default function App() {
                 manualRunSelectionRef.current = true;
                 setSelectedRunId(runId);
               }}
+              onSelectTask={(taskId) => {
+                setSelectedTaskId(taskId);
+              }}
+              onStartTask={() => {
+                void handleStartBackgroundTask();
+              }}
               runEvents={workspaceRunEvents}
               runs={workspaceRuns}
               scope={workspaceScope}
               selectedRunId={selectedRunId}
+              selectedTaskId={selectedTaskId}
+              taskEvents={taskEvents}
+              tasks={tasks}
               tree={workspaceTree}
             />
           )}

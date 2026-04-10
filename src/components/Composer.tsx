@@ -103,7 +103,7 @@ export function Composer(props: ComposerProps) {
               props.onSend();
             }
           }}
-          placeholder="후속 변경 사항을 입력하세요"
+          placeholder="후속 변경 사항을 부탁해보세요"
         />
 
         <div className="composer__footer composer__footer--prompt">

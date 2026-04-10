@@ -214,18 +214,21 @@ export function createWorkspaceManager(
   projectRoot: string,
   options?: {
     conversationExists?: (conversationId: string) => boolean;
+    conversationAgentId?: (conversationId: string) => string | null;
     enableRootScope?: boolean;
   },
 ) {
   const rootDir = path.join(projectRoot, "workspace");
   const sharedDir = path.join(rootDir, "shared");
   const conversationsDir = path.join(rootDir, "conversations");
+  const agentsDir = path.join(rootDir, "agents");
   const enableRootScope = options?.enableRootScope ?? process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true";
 
   function bootstrap() {
     fs.mkdirSync(rootDir, { recursive: true });
     fs.mkdirSync(sharedDir, { recursive: true });
     fs.mkdirSync(conversationsDir, { recursive: true });
+    fs.mkdirSync(agentsDir, { recursive: true });
 
     readBootstrapFile(
       rootDir,
@@ -267,8 +270,120 @@ export function createWorkspaceManager(
     }
   }
 
+  function assertSafeEntityId(id: string, label: string) {
+    if (!id || id.includes("\0") || id.includes("/") || id.includes("\\") || id.includes("..") || path.isAbsolute(id)) {
+      throw new Error(`${label} id is invalid.`);
+    }
+  }
+
+  function getAgentDir(agentId: string) {
+    assertSafeEntityId(agentId, "Agent");
+    return path.join(agentsDir, agentId);
+  }
+
+  function createAgentWorkspace(agentId: string) {
+    const agentDir = getAgentDir(agentId);
+    fs.mkdirSync(path.join(agentDir, "memory"), { recursive: true });
+    readBootstrapFile(
+      agentDir,
+      "MEMORY.md",
+      ["# MEMORY", "", "Durable facts, preferences, and decisions for this agent."].join("\n"),
+    );
+    readBootstrapFile(
+      agentDir,
+      "AGENTS.md",
+      ["# AGENT", "", "- Keep this agent's workspace, memory, and task history isolated."].join("\n"),
+    );
+    return agentDir;
+  }
+
+  function deleteAgentWorkspace(agentId: string) {
+    const agentDir = getAgentDir(agentId);
+    const parent = canonicalizeExistingPath(agentsDir);
+    const relative = path.relative(parent, path.resolve(agentDir));
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error("Refusing to delete workspace outside the agents directory.");
+    }
+    const stat = fs.lstatSync(agentDir, { throwIfNoEntry: false });
+    if (!stat) {
+      return false;
+    }
+    fs.rmSync(agentDir, {
+      recursive: !stat.isSymbolicLink(),
+      force: true,
+    });
+    return true;
+  }
+
+  function todayMemoryFileName(date = new Date()) {
+    return `${date.toISOString().slice(0, 10)}.md`;
+  }
+
+  function readAgentMemory(agentId: string) {
+    const agentDir = createAgentWorkspace(agentId);
+    const dailyPath = path.join(agentDir, "memory", todayMemoryFileName());
+    if (!fs.existsSync(dailyPath)) {
+      fs.writeFileSync(dailyPath, `# ${todayMemoryFileName().replace(".md", "")}\n\n`, "utf8");
+    }
+    return {
+      agentId,
+      memory: fs.readFileSync(path.join(agentDir, "MEMORY.md"), "utf8"),
+      dailyNote: fs.readFileSync(dailyPath, "utf8"),
+      date: todayMemoryFileName().replace(".md", ""),
+    };
+  }
+
+  function appendAgentMemory(params: {
+    agentId: string;
+    content: string;
+    target?: "durable" | "daily";
+  }) {
+    const agentDir = createAgentWorkspace(params.agentId);
+    const targetPath =
+      params.target === "daily"
+        ? path.join(agentDir, "memory", todayMemoryFileName())
+        : path.join(agentDir, "MEMORY.md");
+    const prefix = fs.existsSync(targetPath) && fs.readFileSync(targetPath, "utf8").trim() ? "\n\n" : "";
+    fs.appendFileSync(targetPath, `${prefix}- ${params.content.trim()}\n`, "utf8");
+    return readAgentMemory(params.agentId);
+  }
+
+  function searchAgentMemory(params: {
+    agentId: string;
+    query: string;
+    maxResults?: number;
+  }) {
+    const agentDir = createAgentWorkspace(params.agentId);
+    const query = params.query.trim().toLowerCase();
+    const maxResults = params.maxResults ?? 8;
+    const files = [
+      path.join(agentDir, "MEMORY.md"),
+      ...fs
+        .readdirSync(path.join(agentDir, "memory"), { withFileTypes: true })
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
+        .map((entry) => path.join(agentDir, "memory", entry.name)),
+    ];
+
+    const results: Array<{ path: string; line: number; text: string }> = [];
+    for (const filePath of files) {
+      const relative = path.relative(agentDir, filePath).replace(/\\/g, "/");
+      const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+      lines.forEach((line, index) => {
+        if (line.toLowerCase().includes(query) && results.length < maxResults) {
+          results.push({ path: relative, line: index + 1, text: line });
+        }
+      });
+    }
+    return results;
+  }
+
   function getSandboxDir(conversationId: string) {
     assertConversationExists(conversationId);
+    const agentId = options?.conversationAgentId?.(conversationId);
+    if (agentId) {
+      assertSafeEntityId(agentId, "Agent");
+      return path.join(agentsDir, agentId, "sessions", conversationId);
+    }
     return path.join(conversationsDir, conversationId);
   }
 
@@ -569,11 +684,11 @@ export function createWorkspaceManager(
   }
 
   function deleteConversationWorkspace(conversationId: string) {
-    const sandboxDir = path.join(conversationsDir, conversationId);
-    const parent = canonicalizeExistingPath(conversationsDir);
+    const sandboxDir = getSandboxDir(conversationId);
+    const parent = canonicalizeExistingPath(path.dirname(sandboxDir));
     const relative = path.relative(parent, path.resolve(sandboxDir));
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error("Refusing to delete workspace outside the conversations directory.");
+      throw new Error("Refusing to delete workspace outside the session directory.");
     }
     const stat = fs.lstatSync(sandboxDir, { throwIfNoEntry: false });
     if (!stat) {
@@ -619,9 +734,12 @@ export function createWorkspaceManager(
     rootDir,
     sharedDir,
     conversationsDir,
+    agentsDir,
     bootstrap,
     createConversationWorkspace,
     deleteConversationWorkspace,
+    createAgentWorkspace,
+    deleteAgentWorkspace,
     getSandboxDir,
     getScopeRoot,
     resolvePath,
@@ -633,6 +751,9 @@ export function createWorkspaceManager(
     movePath,
     deletePath,
     resolveSandboxDirectory,
+    readAgentMemory,
+    appendAgentMemory,
+    searchAgentMemory,
     readGuides,
   };
 }

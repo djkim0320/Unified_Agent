@@ -91,6 +91,7 @@ async function generateText(params: {
   reasoningLevel: ReasoningLevel;
   instructions: string;
   messages: ChatMessage[];
+  signal?: AbortSignal;
 }) {
   const response = await ensureOk(
     await fetch("https://api.anthropic.com/v1/messages", {
@@ -100,6 +101,7 @@ async function generateText(params: {
         "x-api-key": params.secret.apiKey,
         "anthropic-version": "2023-06-01",
       },
+      signal: params.signal,
       body: JSON.stringify(
         buildRequestBody({
           model: params.model,
@@ -156,18 +158,19 @@ export const anthropicAdapter: ProviderAdapter<"anthropic"> = {
     }
   },
 
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages }) {
+  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
     const text = await generateText({
       secret,
       model,
       reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     return parseAgentStep(text);
   },
 
-  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText }) {
+  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText, signal }) {
     const response = await ensureOk(
       await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -176,6 +179,7 @@ export const anthropicAdapter: ProviderAdapter<"anthropic"> = {
           "x-api-key": secret.apiKey,
           "anthropic-version": "2023-06-01",
         },
+        signal,
         body: JSON.stringify(
           buildRequestBody({
             model,
@@ -208,6 +212,6 @@ export const anthropicAdapter: ProviderAdapter<"anthropic"> = {
       ) {
         onText(payload.delta.text);
       }
-    });
+    }, signal);
   },
 };

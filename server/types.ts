@@ -11,6 +11,7 @@ export type ProviderKind = (typeof providerKinds)[number];
 export type ChatRole = "user" | "assistant";
 export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type WorkspaceScope = "sandbox" | "shared" | "root";
+export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface ConversationRecord {
   id: string;
@@ -64,6 +65,12 @@ export interface SearchBackendAvailability {
   note: string | null;
 }
 
+export interface ExecToolArguments {
+  program: string;
+  args?: string[];
+  timeoutMs?: number;
+}
+
 export type ToolName =
   | "list_tree"
   | "read_file"
@@ -112,9 +119,10 @@ export interface WorkspaceTreeNode {
 export interface WorkspaceFileRecord {
   scope: WorkspaceScope;
   path: string;
-  absolutePath: string;
   content: string;
   binary: boolean;
+  unsupportedEncoding: boolean;
+  encoding: string | null;
 }
 
 export interface WorkspaceRunRecord {
@@ -123,7 +131,7 @@ export interface WorkspaceRunRecord {
   providerKind: ProviderKind;
   model: string;
   userMessage: string;
-  status: "running" | "completed" | "failed";
+  status: WorkspaceRunStatus;
   createdAt: number;
   updatedAt: number;
 }
@@ -136,7 +144,9 @@ export interface WorkspaceRunEventRecord {
     | "tool_call"
     | "tool_result"
     | "error"
-    | "run_complete";
+    | "run_complete"
+    | "run_failed"
+    | "run_cancelled";
   payload: Record<string, unknown>;
   createdAt: number;
 }

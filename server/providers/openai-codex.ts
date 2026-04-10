@@ -172,6 +172,7 @@ async function generateCodexText(params: {
   reasoningLevel: ReasoningLevel;
   instructions: string;
   messages: ChatMessage[];
+  signal?: AbortSignal;
 }) {
   const result = await runCodexExec({
     cwd: process.cwd(),
@@ -182,6 +183,7 @@ async function generateCodexText(params: {
       params.reasoningLevel,
     ),
     prompt: buildCodexPromptWithInstructions(params.instructions, params.messages),
+    signal: params.signal,
   });
   return result.finalAgentMessage.trim();
 }
@@ -223,24 +225,26 @@ export const openAICodexAdapter: ProviderAdapter<"openai-codex"> = {
     }
   },
 
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages }) {
+  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
     assertConfigured(secret);
     const text = await generateCodexText({
       model,
       reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     return parseAgentStep(text);
   },
 
-  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText }) {
+  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText, signal }) {
     assertConfigured(secret);
     const text = await generateCodexText({
       model,
       reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     if (text) {
       onText(text);

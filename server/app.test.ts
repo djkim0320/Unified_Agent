@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
@@ -16,6 +17,28 @@ function jsonResponse(body: unknown, init?: ResponseInit) {
 
 function textResponse(body: string, init?: ResponseInit) {
   return new Response(body, init);
+}
+
+function sseStreamResponse(chunks: string[]) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream",
+      },
+    },
+  );
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createFakeJwt(payload: Record<string, unknown>) {
@@ -54,7 +77,7 @@ describe("createApp", () => {
   });
 
   it("stores API-key providers encrypted at rest", async () => {
-    const { app, store } = createApp({ dataDir });
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     const saveResponse = await request(app)
@@ -84,7 +107,7 @@ describe("createApp", () => {
   });
 
   it("returns curated model picks even before providers are configured", async () => {
-    const { app, store } = createApp({ dataDir });
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     const openaiResponse = await request(app).get("/api/providers/openai/models");
@@ -129,6 +152,7 @@ describe("createApp", () => {
 
     const { app, store } = createApp({
       dataDir,
+      projectRoot: dataDir,
       port: 8878,
       fetchImpl: tokenFetch as typeof fetch,
     });
@@ -215,7 +239,7 @@ describe("createApp", () => {
       }),
     );
 
-    const { app, store } = createApp({ dataDir });
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     const importResponse = await request(app).post("/api/providers/openai-codex/import-cli-auth");
@@ -278,7 +302,7 @@ describe("createApp", () => {
 
     vi.stubGlobal("fetch", fetchMock);
 
-    const { app, store } = createApp({ dataDir });
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     await request(app).put("/api/providers/openai/account").send({ apiKey: "sk-stream" });
@@ -329,7 +353,7 @@ describe("createApp", () => {
   });
 
   it("deletes a conversation and cascades its messages", async () => {
-    const { app, store } = createApp({ dataDir });
+    const { app, store, workspace } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     const createConversationResponse = await request(app)
@@ -348,11 +372,185 @@ describe("createApp", () => {
       role: "user",
       content: "hello",
     });
+    const run = store.createWorkspaceRun({
+      conversationId,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "hello",
+    });
+    store.appendWorkspaceRunEvent({
+      runId: run.id,
+      eventType: "tool_call",
+      payload: { tool: "list_tree" },
+    });
+    workspace.writeFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "notes.txt",
+      content: "hello",
+    });
 
     const deleteResponse = await request(app).delete(`/api/conversations/${conversationId}`);
     expect(deleteResponse.status).toBe(200);
     expect(deleteResponse.body).toEqual({ ok: true });
     expect(store.getConversation(conversationId)).toBeNull();
     expect(store.listMessages(conversationId)).toEqual([]);
+    expect(store.listWorkspaceRuns(conversationId)).toEqual([]);
+    expect(
+      store.rawDb
+        .prepare("SELECT COUNT(*) as count FROM workspace_run_events WHERE run_id = ?")
+        .get(run.id),
+    ).toEqual({ count: 0 });
+    expect(fs.existsSync(path.join(workspace.conversationsDir, conversationId))).toBe(false);
+  });
+
+  it("does not expose absolute workspace paths and disables root scope by default", async () => {
+    const { app, store, workspace } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const createConversationResponse = await request(app)
+      .post("/api/conversations")
+      .send({
+        title: "Workspace",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+    const conversationId = createConversationResponse.body.conversation.id as string;
+    workspace.writeFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "메모.txt",
+      content: "한글",
+    });
+
+    const treeResponse = await request(app).get(
+      `/api/workspace/tree?conversationId=${conversationId}&scope=sandbox`,
+    );
+    expect(treeResponse.status).toBe(200);
+    expect(JSON.stringify(treeResponse.body)).not.toContain(dataDir);
+    expect(treeResponse.body.workspaceRoot).toBeUndefined();
+
+    const fileResponse = await request(app).get(
+      `/api/workspace/file?conversationId=${conversationId}&scope=sandbox&path=${encodeURIComponent("메모.txt")}`,
+    );
+    expect(fileResponse.status).toBe(200);
+    expect(fileResponse.body.file.absolutePath).toBeUndefined();
+    expect(fileResponse.body.file.content).toBe("한글");
+
+    const rootResponse = await request(app).get(
+      `/api/workspace/tree?conversationId=${conversationId}&scope=root`,
+    );
+    expect(rootResponse.status).toBe(400);
+    expect(rootResponse.body.error).toContain("Root workspace scope is disabled");
+  });
+
+  it("requires conversation ownership when reading run events", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const first = store.saveConversation({
+      title: "first",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const second = store.saveConversation({
+      title: "second",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const run = store.createWorkspaceRun({
+      conversationId: first.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "hello",
+    });
+
+    const wrongResponse = await request(app).get(
+      `/api/workspace/runs/${run.id}/events?conversationId=${second.id}`,
+    );
+    expect(wrongResponse.status).toBe(404);
+
+    const rightResponse = await request(app).get(
+      `/api/workspace/runs/${run.id}/events?conversationId=${first.id}`,
+    );
+    expect(rightResponse.status).toBe(200);
+    expect(rightResponse.body.events.length).toBeGreaterThan(0);
+  });
+
+  it("marks a streamed run cancelled when the client disconnects", async () => {
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url !== "https://api.openai.com/v1/responses") {
+        throw new Error(`Unhandled fetch ${url}`);
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as { stream?: boolean };
+      if (!body.stream) {
+        return jsonResponse({
+          output_text: JSON.stringify({ type: "final_answer" }),
+        });
+      }
+
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          { once: true },
+        );
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    await request(app).put("/api/providers/openai/account").send({ apiKey: "sk-stream" });
+    const createConversationResponse = await request(app)
+      .post("/api/conversations")
+      .send({
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+    const conversationId = createConversationResponse.body.conversation.id as string;
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Test server did not bind to a TCP port.");
+    }
+
+    const clientRequest = http.request({
+      hostname: "127.0.0.1",
+      port: address.port,
+      path: "/api/chat/stream",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+    });
+    clientRequest.on("error", () => undefined);
+    clientRequest.end(
+      JSON.stringify({
+        conversationId,
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+        message: "hang",
+      }),
+    );
+
+    setTimeout(() => clientRequest.destroy(), 100);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    const runs = store.listWorkspaceRuns(conversationId);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].status).toBe("cancelled");
+    const events = store.listWorkspaceRunEvents(conversationId, runs[0].id);
+    expect(events.filter((event) => event.eventType === "run_cancelled")).toHaveLength(1);
   });
 });

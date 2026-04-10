@@ -6,7 +6,8 @@ import { resolveCodexIdentity, importCodexCliAuth } from "./lib/codex-auth.js";
 import { createBrowserRuntime } from "./lib/browser-runtime.js";
 import { runCodexLogin, runCodexLoginStatus } from "./lib/codex-cli.js";
 import { createDebugLog, redactOpaqueValue } from "./lib/debug-log.js";
-import { runAgentTurn } from "./lib/agent-runtime.js";
+import { AgentRunError, runAgentTurn } from "./lib/agent-runtime.js";
+import { isAbortError } from "./lib/process-control.js";
 import { createWorkspaceManager } from "./lib/workspace.js";
 import { createStore } from "./db.js";
 import { getCuratedModelIds } from "./model-catalog.js";
@@ -17,7 +18,7 @@ import {
   exchangeCodexAuthorizationCode,
   refreshCodexSecret,
 } from "./providers/openai-codex.js";
-import type { ProviderKind, ProviderSecret, ProviderSummary, WorkspaceScope } from "./types.js";
+import type { ProviderKind, ProviderSecret, ProviderSummary } from "./types.js";
 
 const ProviderKindSchema = z.enum([
   "openai",
@@ -142,16 +143,20 @@ const CODEX_CALLBACK_PATH = "/auth/callback";
 
 export function createApp(options?: {
   dataDir?: string;
+  projectRoot?: string;
   port?: number;
   fetchImpl?: typeof fetch;
 }) {
   const app = express();
-  const projectRoot = process.cwd();
+  const projectRoot = options?.projectRoot ?? process.cwd();
   const dataDir = options?.dataDir ?? path.join(projectRoot, ".data");
   const port = options?.port ?? 8787;
   const fetchImpl = options?.fetchImpl ?? fetch;
   const store = createStore(dataDir);
-  const workspace = createWorkspaceManager(projectRoot);
+  const workspace = createWorkspaceManager(projectRoot, {
+    conversationExists: (conversationId) => Boolean(store.getConversation(conversationId)),
+    enableRootScope: process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true",
+  });
   const browserRuntime = createBrowserRuntime();
   const codexOAuthDebug = createDebugLog({
     dataDir,
@@ -167,6 +172,25 @@ export function createApp(options?: {
   >();
 
   app.use(express.json({ limit: "2mb" }));
+
+  function requireConversation(
+    response: express.Response,
+    conversationId: string,
+  ) {
+    const conversation = store.getConversation(conversationId);
+    if (!conversation) {
+      response.status(404).json({ error: "Conversation not found" });
+      return null;
+    }
+    return conversation;
+  }
+
+  function workspaceErrorStatus(error: unknown) {
+    if (error instanceof Error && /conversation not found/i.test(error.message)) {
+      return 404;
+    }
+    return 400;
+  }
 
   function getProviderSummary(kind: ProviderKind): ProviderSummary {
     const adapter = getProviderAdapter(kind);
@@ -337,7 +361,6 @@ export function createApp(options?: {
             accountId: imported.accountId ?? identity.accountId,
             metadata: {
               importedFromCli: true,
-              sourcePath: imported.path,
               loginManagedBy: "official-cli",
             },
           });
@@ -394,7 +417,7 @@ export function createApp(options?: {
   app.get("/api/providers/openai-codex/debug/logs", (_request, response) => {
     response.json({
       entries: codexOAuthDebug.list(),
-      logPath: codexOAuthDebug.logPath,
+      hasLogFile: true,
     });
   });
 
@@ -524,7 +547,6 @@ export function createApp(options?: {
         accountId: identity.accountId ?? imported.accountId,
         metadata: {
           importedFromCli: true,
-          sourcePath: imported.path,
         },
       });
       response.json({
@@ -559,14 +581,15 @@ export function createApp(options?: {
       body.reasoningLevel ?? existing?.reasoningLevel,
     );
     const title = body.title ?? existing?.title ?? "새 채팅";
+    const normalizedTitle = body.title ?? existing?.title ?? "새 채팅";
     const conversation = store.saveConversation({
       id: body.conversationId,
-      title,
+      title: normalizedTitle,
       providerKind,
       model,
       reasoningLevel,
     });
-    workspace.getSandboxDir(conversation.id);
+    workspace.createConversationWorkspace(conversation.id);
     response.json({ conversation });
   });
 
@@ -583,61 +606,98 @@ export function createApp(options?: {
   });
 
   app.delete("/api/conversations/:id", async (request, response) => {
-    const deleted = store.deleteConversation(request.params.id);
+    const conversation = store.getConversation(request.params.id);
+    if (!conversation) {
+      response.status(404).json({ error: "Conversation not found" });
+      return;
+    }
+    await browserRuntime.closeConversationSessions(conversation.id).catch(() => undefined);
+    const deleted = store.deleteConversation(conversation.id);
     if (!deleted) {
       response.status(404).json({ error: "Conversation not found" });
       return;
     }
-    await browserRuntime.closeSession(request.params.id).catch(() => undefined);
+    try {
+      workspace.deleteConversationWorkspace(conversation.id);
+    } catch {
+      // Workspace cleanup is best-effort, but deleteConversationWorkspace is scoped to this sandbox only.
+    }
     response.json({ ok: true });
   });
 
   app.get("/api/workspace/tree", (request, response) => {
-    const query = WorkspaceTreeQuerySchema.parse(request.query);
-    const tree = workspace.listTree({
-      conversationId: query.conversationId,
-      scope: query.scope,
-      relativePath: query.path,
-      maxDepth: query.maxDepth,
-    });
-    response.json({
-      scope: query.scope,
-      path: query.path ?? ".",
-      tree,
-      workspaceRoot: workspace.rootDir,
-    });
+    try {
+      const query = WorkspaceTreeQuerySchema.parse(request.query);
+      if (!requireConversation(response, query.conversationId)) {
+        return;
+      }
+      const tree = workspace.listTree({
+        conversationId: query.conversationId,
+        scope: query.scope,
+        relativePath: query.path,
+        maxDepth: query.maxDepth,
+      });
+      response.json({
+        scope: query.scope,
+        path: query.path ?? ".",
+        tree,
+      });
+    } catch (error) {
+      response.status(workspaceErrorStatus(error)).json({
+        error: error instanceof Error ? error.message : "Failed to read workspace tree",
+      });
+    }
   });
 
   app.get("/api/workspace/file", (request, response) => {
-    const query = WorkspaceFileQuerySchema.parse(request.query);
-    const file = workspace.readFile({
-      conversationId: query.conversationId,
-      scope: query.scope,
-      relativePath: query.path,
-    });
-    response.json({
-      file,
-    });
+    try {
+      const query = WorkspaceFileQuerySchema.parse(request.query);
+      if (!requireConversation(response, query.conversationId)) {
+        return;
+      }
+      const file = workspace.readFile({
+        conversationId: query.conversationId,
+        scope: query.scope,
+        relativePath: query.path,
+      });
+      response.json({
+        file,
+      });
+    } catch (error) {
+      response.status(workspaceErrorStatus(error)).json({
+        error: error instanceof Error ? error.message : "Failed to read workspace file",
+      });
+    }
   });
 
   app.get("/api/workspace/runs", (request, response) => {
     const conversationId = z.string().uuid().parse(request.query.conversationId);
+    if (!requireConversation(response, conversationId)) {
+      return;
+    }
     response.json({
       runs: store.listWorkspaceRuns(conversationId),
     });
   });
 
   app.get("/api/workspace/runs/:runId/events", (request, response) => {
+    const conversationId = z.string().uuid().parse(request.query.conversationId);
+    if (!requireConversation(response, conversationId)) {
+      return;
+    }
+    if (!store.getWorkspaceRunForConversation(conversationId, request.params.runId)) {
+      response.status(404).json({ error: "Workspace run not found" });
+      return;
+    }
     response.json({
-      events: store.listWorkspaceRunEvents(request.params.runId),
+      events: store.listWorkspaceRunEvents(conversationId, request.params.runId),
     });
   });
 
   app.post("/api/chat/stream", async (request, response) => {
     const body = ChatRequestSchema.parse(request.body);
-    const conversation = store.getConversation(body.conversationId);
+    const conversation = requireConversation(response, body.conversationId);
     if (!conversation) {
-      response.status(404).json({ error: "Conversation not found" });
       return;
     }
 
@@ -667,14 +727,28 @@ export function createApp(options?: {
       content: body.message,
     });
     store.ensureConversationTitle(conversation.id, body.message);
-    workspace.getSandboxDir(conversation.id);
+    workspace.createConversationWorkspace(conversation.id);
 
     response.status(200);
     response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     response.setHeader("Cache-Control", "no-cache, no-transform");
     response.setHeader("Connection", "keep-alive");
+    response.flushHeaders?.();
+
+    const abortController = new AbortController();
+    let streamFinished = false;
+    const closeHandler = () => {
+      if (!streamFinished) {
+        abortController.abort(new AgentRunError("Client disconnected.", "cancelled"));
+      }
+    };
+    request.on("close", closeHandler);
+    response.on("close", closeHandler);
 
     const sendEvent = (eventName: string, payload: Record<string, unknown>) => {
+      if (response.destroyed || response.writableEnded) {
+        return;
+      }
       response.write(`event: ${eventName}\n`);
       response.write(`data: ${JSON.stringify(payload)}\n\n`);
     };
@@ -696,7 +770,13 @@ export function createApp(options?: {
         browserRuntime,
         store,
         sendEvent,
+        signal: abortController.signal,
+        unsafeShellEnabled: process.env.ENABLE_UNSAFE_WORKSPACE_EXEC === "true",
       });
+
+      if (abortController.signal.aborted) {
+        return;
+      }
 
       if (runtimeResult.assistantText.trim()) {
         const saved = store.appendMessage({
@@ -717,11 +797,24 @@ export function createApp(options?: {
         });
       }
     } catch (error) {
+      const status =
+        error instanceof AgentRunError
+          ? error.status
+          : isAbortError(error)
+            ? "cancelled"
+            : "failed";
       sendEvent("error", {
         error: error instanceof Error ? error.message : "Streaming failed",
+        runId: error instanceof AgentRunError ? error.runId : undefined,
+        status,
       });
     } finally {
-      response.end();
+      streamFinished = true;
+      request.off("close", closeHandler);
+      response.off("close", closeHandler);
+      if (!response.destroyed && !response.writableEnded) {
+        response.end();
+      }
     }
   });
 
@@ -737,5 +830,6 @@ export function createApp(options?: {
     app,
     store,
     workspace,
+    browserRuntime,
   };
 }

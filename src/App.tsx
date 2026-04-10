@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteConversation,
   getConversationMessages,
@@ -35,6 +35,7 @@ import {
   type ProviderDraft,
   type ProviderKind,
   type ProviderSummary,
+  type StreamEventPayloadMap,
   type WorkspaceFileRecord,
   type WorkspaceRunEventRecord,
   type WorkspaceRunRecord,
@@ -72,7 +73,7 @@ function createLoadingMap(initialValue: boolean) {
   } satisfies Record<ProviderKind, boolean>;
 }
 
-function createErrorMap() {
+function createErrorMap(): Record<ProviderKind, string | null> {
   return {
     openai: null,
     anthropic: null,
@@ -148,6 +149,25 @@ function createLiveEvent(
   } satisfies WorkspaceRunEventRecord;
 }
 
+function abortRef(controllerRef: { current: AbortController | null }) {
+  controllerRef.current?.abort();
+  controllerRef.current = null;
+}
+
+function beginRequest(
+  seqRef: { current: number },
+  controllerRef: { current: AbortController | null },
+) {
+  abortRef(controllerRef);
+  const controller = new AbortController();
+  controllerRef.current = controller;
+  seqRef.current += 1;
+  return {
+    controller,
+    seq: seqRef.current,
+  };
+}
+
 export default function App() {
   const [activeSection, setActiveSection] = useState<"chat" | "workspace">("chat");
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
@@ -176,11 +196,69 @@ export default function App() {
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode[]>([]);
   const [workspaceFile, setWorkspaceFile] = useState<WorkspaceFileRecord | null>(null);
   const [workspaceRuns, setWorkspaceRuns] = useState<WorkspaceRunRecord[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
-  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
+  const [workspaceRunsLoading, setWorkspaceRunsLoading] = useState(false);
+  const [workspaceFileLoading, setWorkspaceFileLoading] = useState(false);
+
+  const activeConversationIdRef = useRef<string | null>(null);
+  const selectedRunIdRef = useRef<string | null>(null);
+  const manualRunSelectionRef = useRef(false);
+  const lastConversationIdRef = useRef<string | null>(null);
+  const conversationLoadSeqRef = useRef(0);
+  const conversationLoadControllerRef = useRef<AbortController | null>(null);
+  const workspaceTreeSeqRef = useRef(0);
+  const workspaceTreeControllerRef = useRef<AbortController | null>(null);
+  const workspaceRunsSeqRef = useRef(0);
+  const workspaceRunsControllerRef = useRef<AbortController | null>(null);
+  const workspaceEventsSeqRef = useRef(0);
+  const workspaceEventsControllerRef = useRef<AbortController | null>(null);
+  const workspaceFileSeqRef = useRef(0);
+  const workspaceFileControllerRef = useRef<AbortController | null>(null);
+  const streamSeqRef = useRef(0);
+  const streamControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    selectedRunIdRef.current = selectedRunId;
+  }, [selectedRunId]);
+
+  const providersByKind = useMemo(
+    () =>
+      Object.fromEntries(providers.map((provider) => [provider.kind, provider])) as Record<
+        ProviderKind,
+        ProviderSummary
+      >,
+    [providers],
+  );
+
+  function abortAllPendingRequests() {
+    abortRef(conversationLoadControllerRef);
+    abortRef(workspaceTreeControllerRef);
+    abortRef(workspaceRunsControllerRef);
+    abortRef(workspaceEventsControllerRef);
+    abortRef(workspaceFileControllerRef);
+    abortRef(streamControllerRef);
+  }
+
+  function resetWorkspaceState() {
+    setWorkspaceTree([]);
+    setWorkspaceFile(null);
+    setWorkspaceRuns([]);
+    setSelectedRunId(null);
+    setWorkspaceRunEvents([]);
+    setLiveEvents([]);
+    setChangedFiles([]);
+    setWorkspaceTreeLoading(false);
+    setWorkspaceRunsLoading(false);
+    setWorkspaceFileLoading(false);
+  }
 
   async function refreshProviders() {
     const response = await listProviders();
@@ -228,64 +306,175 @@ export default function App() {
   }
 
   async function loadConversation(conversationId: string) {
-    const response = await getConversationMessages(conversationId);
-    setActiveConversation(response.conversation);
-    setMessages(
-      response.messages.map((message) => ({
-        id: message.id,
-        role: message.role,
-        content: message.content,
-      })),
-    );
-    setConversations((current) => mergeConversationList(current, response.conversation));
-  }
+    const request = beginRequest(conversationLoadSeqRef, conversationLoadControllerRef);
 
+    try {
+      const response = await getConversationMessages(conversationId, request.controller.signal);
+      if (request.controller.signal.aborted || conversationLoadSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setActiveConversation(response.conversation);
+      setMessages(
+        response.messages.map((message) => ({
+          id: message.id,
+          role: message.role,
+          content: message.content,
+        })),
+      );
+      setConversations((current) => mergeConversationList(current, response.conversation));
+    } catch (error) {
+      if (request.controller.signal.aborted || conversationLoadSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setChatError(error instanceof Error ? error.message : "대화 내용을 불러오지 못했습니다.");
+    } finally {
+      if (conversationLoadSeqRef.current === request.seq) {
+        abortRef(conversationLoadControllerRef);
+      }
+    }
+  }
   async function refreshWorkspaceTree(conversationId: string, scope: WorkspaceScope) {
-    setWorkspaceLoading(true);
+    const request = beginRequest(workspaceTreeSeqRef, workspaceTreeControllerRef);
+    setWorkspaceTreeLoading(true);
+
     try {
       const response = await getWorkspaceTree({
         conversationId,
         scope,
         maxDepth: 4,
+        signal: request.controller.signal,
       });
+
+      if (request.controller.signal.aborted || workspaceTreeSeqRef.current !== request.seq) {
+        return;
+      }
+
       setWorkspaceTree(response.tree);
+    } catch (error) {
+      if (request.controller.signal.aborted || workspaceTreeSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "워크스페이스 트리를 불러오지 못했습니다.");
     } finally {
-      setWorkspaceLoading(false);
+      if (workspaceTreeSeqRef.current === request.seq) {
+        setWorkspaceTreeLoading(false);
+        abortRef(workspaceTreeControllerRef);
+      }
     }
   }
 
   async function refreshWorkspaceRuns(conversationId: string, preferredRunId?: string | null) {
-    const response = await listWorkspaceRuns(conversationId);
-    setWorkspaceRuns(response.runs);
-    const nextRunId =
-      preferredRunId && response.runs.some((run) => run.id === preferredRunId)
-        ? preferredRunId
-        : response.runs[0]?.id ?? null;
-    setActiveRunId(nextRunId);
+    const request = beginRequest(workspaceRunsSeqRef, workspaceRunsControllerRef);
+    setWorkspaceRunsLoading(true);
+
+    try {
+      const response = await listWorkspaceRuns(conversationId, request.controller.signal);
+      if (request.controller.signal.aborted || workspaceRunsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setWorkspaceRuns(response.runs);
+
+      const currentSelectedRunId = selectedRunIdRef.current;
+      const hasCurrentSelection =
+        currentSelectedRunId !== null && response.runs.some((run) => run.id === currentSelectedRunId);
+      const hasPreferredRun =
+        preferredRunId !== undefined &&
+        preferredRunId !== null &&
+        response.runs.some((run) => run.id === preferredRunId);
+
+      const nextRunId = hasCurrentSelection
+        ? currentSelectedRunId
+        : hasPreferredRun
+          ? preferredRunId
+          : response.runs[0]?.id ?? null;
+
+      if (nextRunId !== currentSelectedRunId) {
+        setSelectedRunId(nextRunId);
+        manualRunSelectionRef.current = false;
+      }
+
+      if (nextRunId === null) {
+        setWorkspaceRunEvents([]);
+      }
+    } catch (error) {
+      if (request.controller.signal.aborted || workspaceRunsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "실행 로그를 불러오지 못했습니다.");
+    } finally {
+      if (workspaceRunsSeqRef.current === request.seq) {
+        setWorkspaceRunsLoading(false);
+        abortRef(workspaceRunsControllerRef);
+      }
+    }
   }
 
-  async function refreshWorkspaceRunEvents(runId: string | null) {
+  async function refreshWorkspaceRunEvents(conversationId: string, runId: string | null) {
+    const request = beginRequest(workspaceEventsSeqRef, workspaceEventsControllerRef);
+
     if (!runId) {
       setWorkspaceRunEvents([]);
+      abortRef(workspaceEventsControllerRef);
       return;
     }
-    const response = await listWorkspaceRunEvents(runId);
-    setWorkspaceRunEvents(response.events);
+
+    try {
+      const response = await listWorkspaceRunEvents(conversationId, runId, request.controller.signal);
+      if (request.controller.signal.aborted || workspaceEventsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setWorkspaceRunEvents(response.events);
+    } catch (error) {
+      if (request.controller.signal.aborted || workspaceEventsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "실행 이벤트를 불러오지 못했습니다.");
+    } finally {
+      if (workspaceEventsSeqRef.current === request.seq) {
+        abortRef(workspaceEventsControllerRef);
+      }
+    }
   }
 
   async function openWorkspaceFile(path: string) {
     if (!activeConversationId) {
       return;
     }
+
+    const request = beginRequest(workspaceFileSeqRef, workspaceFileControllerRef);
+    setWorkspaceFileLoading(true);
+
     try {
       const response = await getWorkspaceFile({
         conversationId: activeConversationId,
         scope: workspaceScope,
         path,
+        signal: request.controller.signal,
       });
+
+      if (request.controller.signal.aborted || workspaceFileSeqRef.current !== request.seq) {
+        return;
+      }
+
       setWorkspaceFile(response.file);
     } catch (error) {
+      if (request.controller.signal.aborted || workspaceFileSeqRef.current !== request.seq) {
+        return;
+      }
+
       setAppNotice(error instanceof Error ? error.message : "파일을 불러오지 못했습니다.");
+    } finally {
+      if (workspaceFileSeqRef.current === request.seq) {
+        setWorkspaceFileLoading(false);
+        abortRef(workspaceFileControllerRef);
+      }
     }
   }
 
@@ -325,7 +514,7 @@ export default function App() {
       setActiveConversation(response.conversation);
       setConversations((current) => mergeConversationList(current, response.conversation));
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "대화 설정을 업데이트하지 못했습니다.");
+      setAppNotice(error instanceof Error ? error.message : "설정을 저장하지 못했습니다.");
     }
   }
 
@@ -389,87 +578,80 @@ export default function App() {
       cancelled = true;
     };
   }, [providers]);
-
   useEffect(() => {
+    const conversationChanged = lastConversationIdRef.current !== activeConversationId;
+    lastConversationIdRef.current = activeConversationId;
+
+    if (conversationChanged) {
+      abortAllPendingRequests();
+      resetWorkspaceState();
+      setActiveConversation(null);
+      setMessages([]);
+      setPendingAssistantText("");
+      setChatError(null);
+      setLiveEvents([]);
+      setChangedFiles([]);
+      setStreaming(false);
+      manualRunSelectionRef.current = false;
+    }
+
     if (!activeConversationId) {
       return;
     }
 
-    let cancelled = false;
-
-    void (async () => {
-      try {
-        const response = await getConversationMessages(activeConversationId);
-        if (cancelled) {
-          return;
-        }
-        setActiveConversation(response.conversation);
-        setMessages(
-          response.messages.map((message) => ({
-            id: message.id,
-            role: message.role,
-            content: message.content,
-          })),
-        );
-      } catch (error) {
-        if (!cancelled) {
-          setChatError(error instanceof Error ? error.message : "대화를 불러오지 못했습니다.");
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
+    void loadConversation(activeConversationId);
   }, [activeConversationId]);
 
   useEffect(() => {
     if (!activeConversationId) {
       return;
     }
+
     void refreshWorkspaceTree(activeConversationId, workspaceScope);
-    void refreshWorkspaceRuns(activeConversationId, activeRunId);
+    void refreshWorkspaceRuns(activeConversationId, selectedRunIdRef.current);
     setWorkspaceFile(null);
   }, [activeConversationId, workspaceScope]);
 
   useEffect(() => {
-    void refreshWorkspaceRunEvents(activeRunId);
-  }, [activeRunId]);
+    if (!activeConversationId) {
+      setWorkspaceRunEvents([]);
+      return;
+    }
+
+    void refreshWorkspaceRunEvents(activeConversationId, selectedRunId);
+  }, [activeConversationId, selectedRunId]);
 
   useEffect(() => {
     const handleOAuthMessage = (event: MessageEvent) => {
-      let payload: {
-        type?: string;
-        message?: string;
-      } | null = null;
+      let payload: { type?: string; message?: string } | null = null;
 
       if (typeof event.data === "string") {
         try {
-          payload = JSON.parse(event.data) as {
-            type?: string;
-            message?: string;
-          };
+          payload = JSON.parse(event.data) as { type?: string; message?: string };
         } catch {
           return;
         }
       } else if (typeof event.data === "object" && event.data !== null) {
-        payload = event.data as {
-          type?: string;
-          message?: string;
-        };
+        payload = event.data as { type?: string; message?: string };
       }
 
       if (!payload || payload.type !== "openai-codex-oauth") {
         return;
       }
 
-      setAppNotice(payload.message ?? "Codex 연결 상태가 업데이트되었습니다.");
+      setAppNotice(payload.message ?? "Codex 연결 상태를 갱신했습니다.");
       void refreshProviders();
     };
 
     window.addEventListener("message", handleOAuthMessage);
     return () => {
       window.removeEventListener("message", handleOAuthMessage);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      abortAllPendingRequests();
     };
   }, []);
 
@@ -487,11 +669,7 @@ export default function App() {
   const activeModelsError = activeConversation
     ? modelErrorsByProvider[activeConversation.providerKind]
     : null;
-
-  const providersByKind = useMemo(
-    () => Object.fromEntries(providers.map((provider) => [provider.kind, provider])) as Record<ProviderKind, ProviderSummary>,
-    [providers],
-  );
+  const workspaceLoading = workspaceTreeLoading || workspaceRunsLoading || workspaceFileLoading;
 
   async function handleSaveProvider(kind: Exclude<ProviderKind, "openai-codex">) {
     const draft = providerDrafts[kind];
@@ -518,9 +696,7 @@ export default function App() {
       await refreshProviders();
       setAppNotice(`${providerLabels[kind]} 설정을 저장했습니다.`);
     } catch (error) {
-      setAppNotice(
-        error instanceof Error ? error.message : "프로바이더 설정 저장에 실패했습니다.",
-      );
+      setAppNotice(error instanceof Error ? error.message : "프로바이더 설정 저장에 실패했습니다.");
     } finally {
       setSavingKind(null);
     }
@@ -541,7 +717,7 @@ export default function App() {
 
   async function handleConnectCodex() {
     try {
-      setAppNotice("공식 Codex CLI 로그인 흐름을 시작합니다...");
+      setAppNotice("공식 Codex OAuth 흐름을 시작합니다...");
       const response = await startCodexOAuth(window.location.origin);
       await refreshProviders();
       setAppNotice(response.message);
@@ -556,7 +732,7 @@ export default function App() {
       await refreshProviders();
       setAppNotice("Codex CLI 인증 정보를 가져왔습니다.");
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Codex 인증 가져오기에 실패했습니다.");
+      setAppNotice(error instanceof Error ? error.message : "Codex CLI 인증 가져오기에 실패했습니다.");
     }
   }
 
@@ -577,6 +753,7 @@ export default function App() {
 
     const conversation = activeConversation;
     const prompt = composerText.trim();
+    const request = beginRequest(streamSeqRef, streamControllerRef);
 
     setComposerText("");
     setChatError(null);
@@ -604,8 +781,13 @@ export default function App() {
           message: prompt,
         },
         (eventName, payload) => {
+          if (request.controller.signal.aborted || activeConversationIdRef.current !== conversation.id) {
+            return;
+          }
+
           if (eventName === "delta") {
-            setPendingAssistantText((current) => current + payload.delta);
+            const deltaPayload = payload as StreamEventPayloadMap["delta"];
+            setPendingAssistantText((current) => current + deltaPayload.delta);
             return;
           }
 
@@ -625,37 +807,54 @@ export default function App() {
           }
 
           if (eventName === "run_complete") {
-            setChangedFiles(payload.changedFiles ?? []);
-            setActiveRunId(payload.runId);
-            void refreshWorkspaceRuns(conversation.id, payload.runId);
+            const completePayload = payload as StreamEventPayloadMap["run_complete"];
+            setChangedFiles(completePayload.changedFiles ?? []);
+            if (!manualRunSelectionRef.current && completePayload.runId) {
+              setSelectedRunId(completePayload.runId);
+            }
+            void refreshWorkspaceRuns(conversation.id, completePayload.runId);
             void refreshWorkspaceTree(conversation.id, workspaceScope);
             return;
           }
 
           if (eventName === "done") {
-            if (payload.changedFiles) {
-              setChangedFiles(payload.changedFiles);
+            const donePayload = payload as StreamEventPayloadMap["done"];
+            if (donePayload.changedFiles) {
+              setChangedFiles(donePayload.changedFiles);
             }
-            if (payload.runId) {
-              setActiveRunId(payload.runId);
+            if (donePayload.runId && !manualRunSelectionRef.current) {
+              setSelectedRunId(donePayload.runId);
             }
             return;
           }
 
           if (eventName === "error") {
-            setChatError(payload.error);
-            setLiveEvents((current) => [...current, createLiveEvent("error", payload)]);
+            const errorPayload = payload as StreamEventPayloadMap["error"];
+            setChatError(errorPayload.error);
+            setLiveEvents((current) => [...current, createLiveEvent("error", errorPayload)]);
+            if (errorPayload.runId && !manualRunSelectionRef.current) {
+              setSelectedRunId(errorPayload.runId);
+            }
           }
         },
+        request.controller.signal,
       );
-      await loadConversation(conversation.id);
-      await refreshConversationList(conversation.id);
-      await refreshWorkspaceRuns(conversation.id, activeRunId);
+
+      if (!request.controller.signal.aborted && activeConversationIdRef.current === conversation.id) {
+        await loadConversation(conversation.id);
+        await refreshConversationList(conversation.id);
+        await refreshWorkspaceRuns(conversation.id, selectedRunIdRef.current);
+      }
     } catch (error) {
-      setChatError(error instanceof Error ? error.message : "메시지 전송에 실패했습니다.");
+      if (!request.controller.signal.aborted) {
+        setChatError(error instanceof Error ? error.message : "메시지 전송에 실패했습니다.");
+      }
     } finally {
-      setStreaming(false);
-      setPendingAssistantText("");
+      if (streamSeqRef.current === request.seq) {
+        setStreaming(false);
+        setPendingAssistantText("");
+        abortRef(streamControllerRef);
+      }
     }
   }
 
@@ -668,17 +867,18 @@ export default function App() {
 
       if (activeConversationId === conversationId) {
         const nextConversationId = remaining[0]?.id ?? null;
-        setActiveConversationId(nextConversationId);
-        setActiveConversation(
-          nextConversationId
-            ? remaining.find((conversation) => conversation.id === nextConversationId) ?? null
-            : null,
-        );
+        abortAllPendingRequests();
+        resetWorkspaceState();
+        setActiveConversation(null);
         setMessages([]);
         setPendingAssistantText("");
         setChatError(null);
+        setStreaming(false);
+        manualRunSelectionRef.current = false;
 
-        if (!nextConversationId) {
+        if (nextConversationId) {
+          setActiveConversationId(nextConversationId);
+        } else {
           await createConversationThread(activeConversation?.providerKind);
         }
       }
@@ -717,9 +917,9 @@ export default function App() {
         <header className="chat-panel__topbar">
           <div className="chat-panel__model-switcher">
             <span className="chat-panel__current-model">
-              {activeModelOption?.label ?? "불러오는 중..."}
+              {activeModelOption?.label ?? "모델을 불러오는 중..."}
             </span>
-            <nav className="chat-panel__tabs" aria-label="워크스페이스 섹션">
+            <nav className="chat-panel__tabs" aria-label="워크스페이스 탭">
               <button
                 className={`chat-panel__tab ${activeSection === "chat" ? "is-active" : ""}`}
                 onClick={() => setActiveSection("chat")}
@@ -753,11 +953,11 @@ export default function App() {
         <section className="chat-panel__canvas">
           <div className="chat-panel__intro">
             <p className="eyebrow">{activeSection === "chat" ? "대화" : "워크스페이스"}</p>
-            <h1>{activeConversation?.title ?? "불러오는 중..."}</h1>
+            <h1>{activeConversation?.title ?? "새 채팅"}</h1>
             <p className="chat-panel__intro-copy">
               {activeSection === "chat"
-                ? "채팅은 공통 에이전트 런타임을 통해 파일 작업, 명령 실행, 웹 연구 도구를 호출할 수 있습니다."
-                : "현재 대화 샌드박스의 파일, 연구 산출물, 실행 로그를 여기서 직접 확인할 수 있습니다."}
+                ? "대화와 공통 에이전트 런타임을 통해 파일 작업, 명령 실행, 연구 흐름을 함께 다룰 수 있습니다."
+                : "현재 대화의 샌드박스와 실행 로그를 바로 확인할 수 있습니다."}
             </p>
             {activeConversation ? (
               <p className="chat-panel__intro-copy">
@@ -794,9 +994,14 @@ export default function App() {
               onSelectFile={(path) => {
                 void openWorkspaceFile(path);
               }}
+              onSelectRun={(runId) => {
+                manualRunSelectionRef.current = true;
+                setSelectedRunId(runId);
+              }}
               runEvents={workspaceRunEvents}
               runs={workspaceRuns}
               scope={workspaceScope}
+              selectedRunId={selectedRunId}
               tree={workspaceTree}
             />
           )}
@@ -858,7 +1063,7 @@ export default function App() {
           void handleLogoutCodex();
         }}
         onSave={(kind) => {
-          void handleSaveProvider(kind);
+          void handleSaveProvider(kind as Exclude<ProviderKind, "openai-codex">);
         }}
         onTest={(kind) => {
           void handleTestProvider(kind);

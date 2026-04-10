@@ -56,6 +56,7 @@ async function generateText(params: {
   reasoningLevel: ReasoningLevel;
   instructions: string;
   messages: ChatMessage[];
+  signal?: AbortSignal;
 }) {
   const normalizedReasoning = normalizeReasoningLevel(
     "gemini",
@@ -70,6 +71,7 @@ async function generateText(params: {
         headers: {
           "Content-Type": "application/json",
         },
+        signal: params.signal,
         body: JSON.stringify({
           systemInstruction: {
             parts: [{ text: params.instructions }],
@@ -131,18 +133,19 @@ export const geminiAdapter: ProviderAdapter<"gemini"> = {
     }
   },
 
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages }) {
+  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
     const text = await generateText({
       secret,
       model,
       reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     return parseAgentStep(text);
   },
 
-  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText }) {
+  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText, signal }) {
     const normalizedReasoning = normalizeReasoningLevel("gemini", model, reasoningLevel);
     const response = await ensureOk(
       await fetch(
@@ -152,6 +155,7 @@ export const geminiAdapter: ProviderAdapter<"gemini"> = {
           headers: {
             "Content-Type": "application/json",
           },
+          signal,
           body: JSON.stringify({
             systemInstruction: {
               parts: [{ text: instructions }],
@@ -186,6 +190,6 @@ export const geminiAdapter: ProviderAdapter<"gemini"> = {
       }
       assembled += delta;
       onText(delta);
-    });
+    }, signal);
   },
 };

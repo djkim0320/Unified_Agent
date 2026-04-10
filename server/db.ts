@@ -11,6 +11,7 @@ import type {
   ProviderSecret,
   WorkspaceRunEventRecord,
   WorkspaceRunRecord,
+  WorkspaceRunStatus,
 } from "./types.js";
 
 type SecretRow = {
@@ -53,7 +54,7 @@ type WorkspaceRunRow = {
   provider_kind: ProviderKind;
   model: string;
   user_message: string;
-  status: WorkspaceRunRecord["status"];
+  status: WorkspaceRunStatus;
   created_at: number;
   updated_at: number;
 };
@@ -65,6 +66,99 @@ type WorkspaceRunEventRow = {
   payload_json: string;
   created_at: number;
 };
+
+const WORKSPACE_RUN_EVENT_TYPES = [
+  "status",
+  "tool_call",
+  "tool_result",
+  "error",
+  "run_complete",
+  "run_failed",
+  "run_cancelled",
+];
+
+function now() {
+  return Date.now();
+}
+
+function createWorkspaceRunsSql(tableName: string) {
+  return `
+    CREATE TABLE ${tableName} (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      provider_kind TEXT NOT NULL,
+      model TEXT NOT NULL,
+      user_message TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+function createWorkspaceRunEventsSql(tableName: string) {
+  return `
+    CREATE TABLE ${tableName} (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES workspace_runs(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL CHECK(
+        event_type IN ('${WORKSPACE_RUN_EVENT_TYPES.join("', '")}')
+      ),
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `;
+}
+
+function tableSql(db: Database.Database, tableName: string) {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(tableName) as { sql: string } | undefined;
+  return row?.sql ?? "";
+}
+
+function migrateWorkspaceTables(db: Database.Database) {
+  const runsSql = tableSql(db, "workspace_runs");
+  const eventsSql = tableSql(db, "workspace_run_events");
+  const needsMigration =
+    (runsSql && !runsSql.includes("cancelled")) ||
+    (eventsSql && (!eventsSql.includes("run_failed") || !eventsSql.includes("run_cancelled")));
+
+  if (!needsMigration) {
+    return;
+  }
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    db.exec(createWorkspaceRunsSql("workspace_runs_next"));
+    db.exec(`
+      INSERT INTO workspace_runs_next (
+        id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+      )
+      SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+      FROM workspace_runs;
+    `);
+
+    db.exec(createWorkspaceRunEventsSql("workspace_run_events_next"));
+    db.exec(`
+      INSERT INTO workspace_run_events_next (id, run_id, event_type, payload_json, created_at)
+      SELECT id, run_id, event_type, payload_json, created_at
+      FROM workspace_run_events;
+    `);
+
+    db.exec("DROP TABLE workspace_run_events");
+    db.exec("DROP TABLE workspace_runs");
+    db.exec("ALTER TABLE workspace_runs_next RENAME TO workspace_runs");
+    db.exec("ALTER TABLE workspace_run_events_next RENAME TO workspace_run_events");
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+}
 
 export function createStore(dataDir: string) {
   fs.mkdirSync(dataDir, { recursive: true });
@@ -117,7 +211,7 @@ export function createStore(dataDir: string) {
       provider_kind TEXT NOT NULL,
       model TEXT NOT NULL,
       user_message TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -126,41 +220,27 @@ export function createStore(dataDir: string) {
       id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL REFERENCES workspace_runs(id) ON DELETE CASCADE,
       event_type TEXT NOT NULL CHECK(
-        event_type IN ('status', 'tool_call', 'tool_result', 'error', 'run_complete')
+        event_type IN ('status', 'tool_call', 'tool_result', 'error', 'run_complete', 'run_failed', 'run_cancelled')
       ),
       payload_json TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
   `);
 
+  migrateWorkspaceTables(db);
+
   const conversationColumns = db
     .prepare(`PRAGMA table_info(conversations)`)
     .all() as Array<{ name: string }>;
   if (!conversationColumns.some((column) => column.name === "reasoning_level")) {
-    db.exec(
-      `ALTER TABLE conversations ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`,
-    );
+    db.exec(`ALTER TABLE conversations ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`);
   }
 
   const upsertProviderAccount = db.prepare(`
     INSERT INTO provider_accounts (
-      provider_kind,
-      display_name,
-      email,
-      account_id,
-      status,
-      metadata_json,
-      created_at,
-      updated_at
+      provider_kind, display_name, email, account_id, status, metadata_json, created_at, updated_at
     ) VALUES (
-      @provider_kind,
-      @display_name,
-      @email,
-      @account_id,
-      @status,
-      @metadata_json,
-      @created_at,
-      @updated_at
+      @provider_kind, @display_name, @email, @account_id, @status, @metadata_json, @created_at, @updated_at
     )
     ON CONFLICT(provider_kind) DO UPDATE SET
       display_name = excluded.display_name,
@@ -173,15 +253,9 @@ export function createStore(dataDir: string) {
 
   const upsertProviderSecret = db.prepare(`
     INSERT INTO provider_secrets (
-      provider_kind,
-      encrypted_blob,
-      created_at,
-      updated_at
+      provider_kind, encrypted_blob, created_at, updated_at
     ) VALUES (
-      @provider_kind,
-      @encrypted_blob,
-      @created_at,
-      @updated_at
+      @provider_kind, @encrypted_blob, @created_at, @updated_at
     )
     ON CONFLICT(provider_kind) DO UPDATE SET
       encrypted_blob = excluded.encrypted_blob,
@@ -190,21 +264,9 @@ export function createStore(dataDir: string) {
 
   const saveConversationStmt = db.prepare(`
     INSERT INTO conversations (
-      id,
-      title,
-      provider_kind,
-      model,
-      reasoning_level,
-      created_at,
-      updated_at
+      id, title, provider_kind, model, reasoning_level, created_at, updated_at
     ) VALUES (
-      @id,
-      @title,
-      @provider_kind,
-      @model,
-      @reasoning_level,
-      @created_at,
-      @updated_at
+      @id, @title, @provider_kind, @model, @reasoning_level, @created_at, @updated_at
     )
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
@@ -219,25 +281,15 @@ export function createStore(dataDir: string) {
     VALUES (@id, @conversation_id, @role, @content, @created_at);
   `);
 
+  const touchConversationStmt = db.prepare(`
+    UPDATE conversations SET updated_at = ? WHERE id = ?;
+  `);
+
   const insertWorkspaceRunStmt = db.prepare(`
     INSERT INTO workspace_runs (
-      id,
-      conversation_id,
-      provider_kind,
-      model,
-      user_message,
-      status,
-      created_at,
-      updated_at
+      id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
     ) VALUES (
-      @id,
-      @conversation_id,
-      @provider_kind,
-      @model,
-      @user_message,
-      @status,
-      @created_at,
-      @updated_at
+      @id, @conversation_id, @provider_kind, @model, @user_message, @status, @created_at, @updated_at
     );
   `);
 
@@ -245,28 +297,76 @@ export function createStore(dataDir: string) {
     UPDATE workspace_runs
     SET status = @status,
         updated_at = @updated_at
-    WHERE id = @id;
+    WHERE id = @id AND status = 'running';
   `);
 
   const insertWorkspaceRunEventStmt = db.prepare(`
     INSERT INTO workspace_run_events (
-      id,
-      run_id,
-      event_type,
-      payload_json,
-      created_at
+      id, run_id, event_type, payload_json, created_at
     ) VALUES (
-      @id,
-      @run_id,
-      @event_type,
-      @payload_json,
-      @created_at
+      @id, @run_id, @event_type, @payload_json, @created_at
     );
   `);
 
-  function now() {
-    return Date.now();
-  }
+  const appendMessageTx = db.transaction((input: {
+    id: string;
+    conversationId: string;
+    role: MessageRecord["role"];
+    content: string;
+    createdAt: number;
+  }) => {
+    insertMessageStmt.run({
+      id: input.id,
+      conversation_id: input.conversationId,
+      role: input.role,
+      content: input.content,
+      created_at: input.createdAt,
+    });
+    touchConversationStmt.run(input.createdAt, input.conversationId);
+  });
+
+  const appendRunEventTx = db.transaction((input: {
+    id: string;
+    runId: string;
+    eventType: WorkspaceRunEventRecord["eventType"];
+    payload: Record<string, unknown>;
+    createdAt: number;
+  }) => {
+    insertWorkspaceRunEventStmt.run({
+      id: input.id,
+      run_id: input.runId,
+      event_type: input.eventType,
+      payload_json: JSON.stringify(input.payload),
+      created_at: input.createdAt,
+    });
+    db.prepare(`UPDATE workspace_runs SET updated_at = ? WHERE id = ?`).run(input.createdAt, input.runId);
+  });
+
+  const finalizeRunTx = db.transaction((input: {
+    runId: string;
+    status: Exclude<WorkspaceRunStatus, "running">;
+    eventType: WorkspaceRunEventRecord["eventType"];
+    payload: Record<string, unknown>;
+    timestamp: number;
+  }) => {
+    const result = updateWorkspaceRunStatusStmt.run({
+      id: input.runId,
+      status: input.status,
+      updated_at: input.timestamp,
+    });
+
+    if (result.changes > 0) {
+      insertWorkspaceRunEventStmt.run({
+        id: crypto.randomUUID(),
+        run_id: input.runId,
+        event_type: input.eventType,
+        payload_json: JSON.stringify(input.payload),
+        created_at: input.timestamp,
+      });
+    }
+
+    return result.changes > 0;
+  });
 
   function mapConversation(row: ConversationRow): ConversationRecord {
     return {
@@ -326,7 +426,7 @@ export function createStore(dataDir: string) {
     };
   }
 
-  return {
+  const store = {
     dbPath,
     rawDb: db,
 
@@ -370,7 +470,7 @@ export function createStore(dataDir: string) {
         created_at: timestamp,
         updated_at: timestamp,
       });
-      return this.getConversation(id)!;
+      return store.getConversation(id)!;
     },
 
     deleteConversation(id: string) {
@@ -397,17 +497,13 @@ export function createStore(dataDir: string) {
     }): MessageRecord {
       const id = crypto.randomUUID();
       const createdAt = now();
-      insertMessageStmt.run({
+      appendMessageTx({
         id,
-        conversation_id: input.conversationId,
+        conversationId: input.conversationId,
         role: input.role,
         content: input.content,
-        created_at: createdAt,
-      });
-      db.prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`).run(
         createdAt,
-        input.conversationId,
-      );
+      });
       return {
         id,
         conversationId: input.conversationId,
@@ -418,12 +514,27 @@ export function createStore(dataDir: string) {
     },
 
     ensureConversationTitle(conversationId: string, fallbackText: string) {
-      const conversation = this.getConversation(conversationId);
+      const conversation = store.getConversation(conversationId);
+      const defaultConversationTitle = "새 채팅";
+      if (!conversation) {
+        return;
+      }
+      if (conversation.title === defaultConversationTitle) {
+        const nextTitle = fallbackText.trim().slice(0, 60) || defaultConversationTitle;
+        store.saveConversation({
+          id: conversationId,
+          title: nextTitle,
+          providerKind: conversation.providerKind,
+          model: conversation.model,
+          reasoningLevel: conversation.reasoningLevel,
+        });
+        return;
+      }
       if (!conversation || conversation.title !== "새 채팅") {
         return;
       }
       const title = fallbackText.trim().slice(0, 60) || "새 채팅";
-      this.saveConversation({
+      store.saveConversation({
         id: conversationId,
         title,
         providerKind: conversation.providerKind,
@@ -440,17 +551,26 @@ export function createStore(dataDir: string) {
     }) {
       const id = crypto.randomUUID();
       const timestamp = now();
-      insertWorkspaceRunStmt.run({
-        id,
-        conversation_id: input.conversationId,
-        provider_kind: input.providerKind,
-        model: input.model,
-        user_message: input.userMessage,
-        status: "running",
-        created_at: timestamp,
-        updated_at: timestamp,
-      });
-      return this.getWorkspaceRun(id)!;
+      db.transaction(() => {
+        insertWorkspaceRunStmt.run({
+          id,
+          conversation_id: input.conversationId,
+          provider_kind: input.providerKind,
+          model: input.model,
+          user_message: input.userMessage,
+          status: "running",
+          created_at: timestamp,
+          updated_at: timestamp,
+        });
+        insertWorkspaceRunEventStmt.run({
+          id: crypto.randomUUID(),
+          run_id: id,
+          event_type: "status",
+          payload_json: JSON.stringify({ message: "작업을 시작했습니다." }),
+          created_at: timestamp,
+        });
+      })();
+      return store.getWorkspaceRun(id)!;
     },
 
     getWorkspaceRun(id: string): WorkspaceRunRecord | null {
@@ -461,6 +581,17 @@ export function createStore(dataDir: string) {
            WHERE id = ?`,
         )
         .get(id) as WorkspaceRunRow | undefined;
+      return row ? mapWorkspaceRun(row) : null;
+    },
+
+    getWorkspaceRunForConversation(conversationId: string, runId: string): WorkspaceRunRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+           FROM workspace_runs
+           WHERE conversation_id = ? AND id = ?`,
+        )
+        .get(conversationId, runId) as WorkspaceRunRow | undefined;
       return row ? mapWorkspaceRun(row) : null;
     },
 
@@ -476,13 +607,37 @@ export function createStore(dataDir: string) {
       return rows.map(mapWorkspaceRun);
     },
 
-    completeWorkspaceRun(id: string, status: WorkspaceRunRecord["status"]) {
-      updateWorkspaceRunStatusStmt.run({
-        id,
+    completeWorkspaceRun(id: string, status: WorkspaceRunStatus) {
+      if (status === "running") {
+        throw new Error("Cannot finalize a workspace run with running status.");
+      }
+      const eventType =
+        status === "completed"
+          ? "run_complete"
+          : status === "cancelled"
+            ? "run_cancelled"
+            : "run_failed";
+      store.finalizeWorkspaceRun(id, status, eventType, {});
+      return store.getWorkspaceRun(id);
+    },
+
+    finalizeWorkspaceRun(
+      id: string,
+      status: Exclude<WorkspaceRunStatus, "running">,
+      eventType: WorkspaceRunEventRecord["eventType"],
+      payload: Record<string, unknown>,
+    ) {
+      const finalized = finalizeRunTx({
+        runId: id,
         status,
-        updated_at: now(),
+        eventType,
+        payload,
+        timestamp: now(),
       });
-      return this.getWorkspaceRun(id);
+      return {
+        finalized,
+        run: store.getWorkspaceRun(id),
+      };
     },
 
     appendWorkspaceRunEvent(input: {
@@ -492,17 +647,13 @@ export function createStore(dataDir: string) {
     }) {
       const id = crypto.randomUUID();
       const createdAt = now();
-      insertWorkspaceRunEventStmt.run({
+      appendRunEventTx({
         id,
-        run_id: input.runId,
-        event_type: input.eventType,
-        payload_json: JSON.stringify(input.payload),
-        created_at: createdAt,
-      });
-      db.prepare(`UPDATE workspace_runs SET updated_at = ? WHERE id = ?`).run(
+        runId: input.runId,
+        eventType: input.eventType,
+        payload: input.payload,
         createdAt,
-        input.runId,
-      );
+      });
       return {
         id,
         runId: input.runId,
@@ -512,15 +663,16 @@ export function createStore(dataDir: string) {
       } satisfies WorkspaceRunEventRecord;
     },
 
-    listWorkspaceRunEvents(runId: string) {
+    listWorkspaceRunEvents(conversationId: string, runId: string) {
       const rows = db
         .prepare(
-          `SELECT id, run_id, event_type, payload_json, created_at
-           FROM workspace_run_events
-           WHERE run_id = ?
-           ORDER BY created_at ASC`,
+          `SELECT events.id, events.run_id, events.event_type, events.payload_json, events.created_at
+           FROM workspace_run_events events
+           JOIN workspace_runs runs ON runs.id = events.run_id
+           WHERE runs.conversation_id = ? AND events.run_id = ?
+           ORDER BY events.created_at ASC`,
         )
-        .all(runId) as WorkspaceRunEventRow[];
+        .all(conversationId, runId) as WorkspaceRunEventRow[];
       return rows.map(mapWorkspaceRunEvent);
     },
 
@@ -582,4 +734,6 @@ export function createStore(dataDir: string) {
       db.prepare(`DELETE FROM provider_secrets WHERE provider_kind = ?`).run(kind);
     },
   };
+
+  return store;
 }

@@ -11,6 +11,7 @@ export type ProviderKind = (typeof providerKinds)[number];
 export type ChatRole = "user" | "assistant";
 export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type WorkspaceScope = "sandbox" | "shared" | "root";
+export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
 
 export interface ConversationRecord {
   id: string;
@@ -57,9 +58,10 @@ export interface WorkspaceTreeNode {
 export interface WorkspaceFileRecord {
   scope: WorkspaceScope;
   path: string;
-  absolutePath: string;
   content: string;
   binary: boolean;
+  unsupportedEncoding: boolean;
+  encoding: string | null;
 }
 
 export interface WorkspaceRunRecord {
@@ -68,7 +70,7 @@ export interface WorkspaceRunRecord {
   providerKind: ProviderKind;
   model: string;
   userMessage: string;
-  status: "running" | "completed" | "failed";
+  status: WorkspaceRunStatus;
   createdAt: number;
   updatedAt: number;
 }
@@ -76,7 +78,14 @@ export interface WorkspaceRunRecord {
 export interface WorkspaceRunEventRecord {
   id: string;
   runId: string;
-  eventType: "status" | "tool_call" | "tool_result" | "error" | "run_complete";
+  eventType:
+    | "status"
+    | "tool_call"
+    | "tool_result"
+    | "error"
+    | "run_complete"
+    | "run_failed"
+    | "run_cancelled";
   payload: Record<string, unknown>;
   createdAt: number;
 }
@@ -88,7 +97,7 @@ export interface StreamEventPayloadMap {
   run_complete: { runId: string; changedFiles: string[] };
   delta: { delta: string };
   done: { messageId: string | null; runId?: string; changedFiles?: string[] };
-  error: { error: string };
+  error: { error: string; runId?: string; status?: WorkspaceRunStatus };
 }
 
 export interface DisplayMessage {

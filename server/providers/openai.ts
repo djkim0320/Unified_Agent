@@ -73,6 +73,7 @@ async function generateText(params: {
   reasoningLevel: ReasoningLevel;
   instructions: string;
   messages: ChatMessage[];
+  signal?: AbortSignal;
 }) {
   const normalizedReasoning = normalizeReasoningLevel(
     "openai",
@@ -86,6 +87,7 @@ async function generateText(params: {
         Authorization: `Bearer ${params.secret.apiKey}`,
         "Content-Type": "application/json",
       },
+      signal: params.signal,
       body: JSON.stringify({
         model: params.model,
         instructions: params.instructions,
@@ -140,18 +142,19 @@ export const openAIAdapter: ProviderAdapter<"openai"> = {
     }
   },
 
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages }) {
+  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
     const text = await generateText({
       secret,
       model,
       reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     return parseAgentStep(text);
   },
 
-  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText }) {
+  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText, signal }) {
     const normalizedReasoning = normalizeReasoningLevel("openai", model, reasoningLevel);
     const response = await ensureOk(
       await fetch("https://api.openai.com/v1/responses", {
@@ -160,6 +163,7 @@ export const openAIAdapter: ProviderAdapter<"openai"> = {
           Authorization: `Bearer ${secret.apiKey}`,
           "Content-Type": "application/json",
         },
+        signal,
         body: JSON.stringify({
           model,
           instructions,
@@ -184,10 +188,10 @@ export const openAIAdapter: ProviderAdapter<"openai"> = {
       ) {
         onText(payload.delta);
       }
-    });
+    }, signal);
   },
 
-  async searchWeb({ secret, model, query }) {
+  async searchWeb({ secret, model, query, signal }) {
     const response = await ensureOk(
       await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
@@ -195,6 +199,7 @@ export const openAIAdapter: ProviderAdapter<"openai"> = {
           Authorization: `Bearer ${secret.apiKey}`,
           "Content-Type": "application/json",
         },
+        signal,
         body: JSON.stringify({
           model,
           input: query,

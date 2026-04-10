@@ -25,19 +25,7 @@ const TEXT_EXTENSIONS = new Set([
   ".env",
 ]);
 
-function ensureInside(root: string, target: string) {
-  const normalizedRoot = path.resolve(root);
-  const normalizedTarget = path.resolve(target);
-  const relative = path.relative(normalizedRoot, normalizedTarget);
-  if (
-    relative.startsWith("..") ||
-    path.isAbsolute(relative) ||
-    normalizedTarget === path.parse(normalizedTarget).root
-  ) {
-    throw new Error("Path escapes the workspace boundary.");
-  }
-  return normalizedTarget;
-}
+type ResolveMode = "read" | "write" | "delete";
 
 function readBootstrapFile(root: string, fileName: string, defaultContent: string) {
   const filePath = path.join(root, fileName);
@@ -46,10 +34,183 @@ function readBootstrapFile(root: string, fileName: string, defaultContent: strin
   }
 }
 
-export function createWorkspaceManager(projectRoot: string) {
+function normalizeWorkspacePath(relativePath = ".") {
+  if (relativePath.includes("\0")) {
+    throw new Error("Workspace path cannot contain null bytes.");
+  }
+  if (path.isAbsolute(relativePath) || /^[A-Za-z]:/.test(relativePath)) {
+    throw new Error("Absolute paths are not allowed in the workspace.");
+  }
+
+  const parts = relativePath
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part.length > 0 && part !== ".");
+
+  if (parts.some((part) => part === "..")) {
+    throw new Error("Path traversal is not allowed in the workspace.");
+  }
+
+  return {
+    parts,
+    normalized: parts.join("/") || ".",
+  };
+}
+
+function canonicalizeExistingPath(filePath: string) {
+  return fs.realpathSync.native(filePath);
+}
+
+function ensureCanonicalInside(root: string, target: string) {
+  const canonicalRoot = canonicalizeExistingPath(root);
+  const canonicalTarget = canonicalizeExistingPath(target);
+  const relative = path.relative(canonicalRoot, canonicalTarget);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Path escapes the workspace boundary.");
+  }
+  return canonicalTarget;
+}
+
+function isUnsafeLink(stat: fs.Stats) {
+  return stat.isSymbolicLink();
+}
+
+function assertNoLink(stat: fs.Stats, filePath: string) {
+  if (isUnsafeLink(stat)) {
+    throw new Error(`Workspace path uses an unsafe link: ${path.basename(filePath)}`);
+  }
+}
+
+function walkExistingComponents(root: string, parts: string[], options: { allowMissingLeaf: boolean }) {
+  let current = root;
+  ensureCanonicalInside(root, root);
+
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    const isLeaf = index === parts.length - 1;
+
+    if (!stat) {
+      if (options.allowMissingLeaf || isLeaf) {
+        break;
+      }
+      break;
+    }
+
+    assertNoLink(stat, current);
+    ensureCanonicalInside(root, current);
+  }
+
+  return current;
+}
+
+function resolveExistingParent(root: string, parts: string[]) {
+  const parentParts = parts.slice(0, -1);
+  let current = root;
+  ensureCanonicalInside(root, root);
+
+  for (const part of parentParts) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (!stat) {
+      break;
+    }
+    assertNoLink(stat, current);
+    if (!stat.isDirectory()) {
+      throw new Error("Workspace parent path is not a directory.");
+    }
+    ensureCanonicalInside(root, current);
+  }
+
+  return path.join(root, ...parentParts);
+}
+
+function decodeTextBuffer(filePath: string, buffer: Buffer): Omit<WorkspaceFileRecord, "scope" | "path"> {
+  const extension = path.extname(filePath).toLowerCase();
+  if (!TEXT_EXTENSIONS.has(extension) && extension !== "") {
+    return {
+      content: "",
+      binary: true,
+      unsupportedEncoding: true,
+      encoding: null,
+    };
+  }
+
+  if (buffer.includes(0)) {
+    return {
+      content: "",
+      binary: true,
+      unsupportedEncoding: true,
+      encoding: null,
+    };
+  }
+
+  if (buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return {
+      content: buffer.subarray(3).toString("utf8"),
+      binary: false,
+      unsupportedEncoding: false,
+      encoding: "utf-8-bom",
+    };
+  }
+
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return {
+      content: buffer.subarray(2).toString("utf16le"),
+      binary: false,
+      unsupportedEncoding: false,
+      encoding: "utf-16le",
+    };
+  }
+
+  if (buffer.length >= 2 && buffer[0] === 0xfe && buffer[1] === 0xff) {
+    const swapped = Buffer.alloc(buffer.length - 2);
+    for (let index = 2; index < buffer.length; index += 2) {
+      swapped[index - 2] = buffer[index + 1] ?? 0;
+      swapped[index - 1] = buffer[index] ?? 0;
+    }
+    return {
+      content: swapped.toString("utf16le"),
+      binary: false,
+      unsupportedEncoding: false,
+      encoding: "utf-16be",
+    };
+  }
+
+  try {
+    return {
+      content: new TextDecoder("utf-8", { fatal: true }).decode(buffer),
+      binary: false,
+      unsupportedEncoding: false,
+      encoding: "utf-8",
+    };
+  } catch {
+    return {
+      content: "",
+      binary: true,
+      unsupportedEncoding: true,
+      encoding: null,
+    };
+  }
+}
+
+function assertNotScopeRoot(relativePath: string, action: string) {
+  if (relativePath === ".") {
+    throw new Error(`Cannot ${action} the workspace scope root.`);
+  }
+}
+
+export function createWorkspaceManager(
+  projectRoot: string,
+  options?: {
+    conversationExists?: (conversationId: string) => boolean;
+    enableRootScope?: boolean;
+  },
+) {
   const rootDir = path.join(projectRoot, "workspace");
   const sharedDir = path.join(rootDir, "shared");
   const conversationsDir = path.join(rootDir, "conversations");
+  const enableRootScope = options?.enableRootScope ?? process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true";
 
   function bootstrap() {
     fs.mkdirSync(rootDir, { recursive: true });
@@ -70,20 +231,12 @@ export function createWorkspaceManager(projectRoot: string) {
     readBootstrapFile(
       rootDir,
       "MEMORY.md",
-      [
-        "# MEMORY",
-        "",
-        "Store durable decisions, project notes, and repeated preferences here.",
-      ].join("\n"),
+      ["# MEMORY", "", "Store durable decisions, project notes, and repeated preferences here."].join("\n"),
     );
     readBootstrapFile(
       rootDir,
       "USER.md",
-      [
-        "# USER",
-        "",
-        "This workspace belongs to the local user of the app.",
-      ].join("\n"),
+      ["# USER", "", "This workspace belongs to the local user of the app."].join("\n"),
     );
     readBootstrapFile(
       rootDir,
@@ -98,73 +251,136 @@ export function createWorkspaceManager(projectRoot: string) {
     );
   }
 
+  function assertConversationExists(conversationId: string) {
+    if (options?.conversationExists && !options.conversationExists(conversationId)) {
+      throw new Error("Conversation not found.");
+    }
+  }
+
   function getSandboxDir(conversationId: string) {
-    const sandboxDir = path.join(conversationsDir, conversationId);
-    fs.mkdirSync(sandboxDir, { recursive: true });
+    assertConversationExists(conversationId);
+    return path.join(conversationsDir, conversationId);
+  }
+
+  function createConversationWorkspace(conversationId: string) {
+    const sandboxDir = getSandboxDir(conversationId);
     fs.mkdirSync(path.join(sandboxDir, "research"), { recursive: true });
     return sandboxDir;
   }
 
-  function getScopeRoot(conversationId: string, scope: WorkspaceScope) {
+  function getScopeRoot(conversationId: string, scope: WorkspaceScope, createSandbox = false) {
     if (scope === "shared") {
-      fs.mkdirSync(sharedDir, { recursive: true });
       return sharedDir;
     }
     if (scope === "root") {
+      if (!enableRootScope) {
+        throw new Error("Root workspace scope is disabled.");
+      }
       return rootDir;
     }
-    return getSandboxDir(conversationId);
+
+    const sandboxDir = getSandboxDir(conversationId);
+    if (createSandbox) {
+      fs.mkdirSync(path.join(sandboxDir, "research"), { recursive: true });
+    }
+    return sandboxDir;
   }
 
-  function resolvePath(conversationId: string, scope: WorkspaceScope, relativePath = ".") {
-    const scopeRoot = getScopeRoot(conversationId, scope);
-    return ensureInside(scopeRoot, path.join(scopeRoot, relativePath));
-  }
+  function resolvePath(params: {
+    conversationId: string;
+    scope: WorkspaceScope;
+    relativePath?: string;
+    mode?: ResolveMode;
+  }) {
+    const mode = params.mode ?? "read";
+    const createSandbox = mode !== "read";
+    const root = getScopeRoot(params.conversationId, params.scope, createSandbox);
+    const { parts, normalized } = normalizeWorkspacePath(params.relativePath ?? ".");
 
-  function readTextFile(filePath: string) {
-    const extension = path.extname(filePath).toLowerCase();
-    if (!TEXT_EXTENSIONS.has(extension) && extension !== "") {
+    if (!fs.existsSync(root)) {
+      if (mode === "read") {
+        return {
+          root,
+          absolutePath: path.join(root, ...parts),
+          relativePath: normalized,
+        };
+      }
+      fs.mkdirSync(root, { recursive: true });
+    }
+
+    if (mode === "write") {
+      const parent = resolveExistingParent(root, parts);
+      if (parent !== root) {
+        fs.mkdirSync(parent, { recursive: true });
+        ensureCanonicalInside(root, parent);
+      }
+      const target = walkExistingComponents(root, parts, { allowMissingLeaf: true });
       return {
-        content: "",
-        binary: true,
+        root,
+        absolutePath: target,
+        relativePath: normalized,
       };
     }
+
+    const target = walkExistingComponents(root, parts, { allowMissingLeaf: false });
+    if (fs.existsSync(target)) {
+      ensureCanonicalInside(root, target);
+    }
     return {
-      content: fs.readFileSync(filePath, "utf8"),
-      binary: false,
+      root,
+      absolutePath: target,
+      relativePath: normalized,
     };
   }
 
-  function listTreeRecursive(rootPath: string, relativePath: string, maxDepth: number): WorkspaceTreeNode[] {
+  function listTreeRecursive(root: string, rootPath: string, relativePath: string, maxDepth: number): WorkspaceTreeNode[] {
     if (maxDepth < 0) {
       return [];
     }
+
+    const stat = fs.lstatSync(rootPath, { throwIfNoEntry: false });
+    if (!stat || !stat.isDirectory()) {
+      return [];
+    }
+    assertNoLink(stat, rootPath);
+    ensureCanonicalInside(root, rootPath);
 
     const entries = fs
       .readdirSync(rootPath, { withFileTypes: true })
       .filter((entry) => !entry.name.startsWith(".git"))
       .sort((left, right) => left.name.localeCompare(right.name));
 
-    return entries.map((entry) => {
+    const nodes: WorkspaceTreeNode[] = [];
+    for (const entry of entries) {
       const entryPath = path.join(rootPath, entry.name);
+      const entryStat = fs.lstatSync(entryPath, { throwIfNoEntry: false });
+      if (!entryStat || isUnsafeLink(entryStat)) {
+        continue;
+      }
+      ensureCanonicalInside(root, entryPath);
+
       const childRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        return {
+      if (entryStat.isDirectory()) {
+        nodes.push({
           name: entry.name,
           path: childRelativePath,
           kind: "directory",
           size: null,
-          children: listTreeRecursive(entryPath, childRelativePath, maxDepth - 1),
-        } satisfies WorkspaceTreeNode;
+          children: listTreeRecursive(root, entryPath, childRelativePath, maxDepth - 1),
+        });
+        continue;
       }
 
-      return {
-        name: entry.name,
-        path: childRelativePath,
-        kind: "file",
-        size: fs.statSync(entryPath).size,
-      } satisfies WorkspaceTreeNode;
-    });
+      if (entryStat.isFile()) {
+        nodes.push({
+          name: entry.name,
+          path: childRelativePath,
+          kind: "file",
+          size: entryStat.size,
+        });
+      }
+    }
+    return nodes;
   }
 
   function listTree(params: {
@@ -173,14 +389,16 @@ export function createWorkspaceManager(projectRoot: string) {
     relativePath?: string;
     maxDepth?: number;
   }) {
-    const absolutePath = resolvePath(
-      params.conversationId,
-      params.scope,
-      params.relativePath ?? ".",
-    );
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.relativePath ?? ".",
+      mode: "read",
+    });
     return listTreeRecursive(
-      absolutePath,
-      params.relativePath?.replace(/\\/g, "/").replace(/^\.$/, "") ?? "",
+      resolved.root,
+      resolved.absolutePath,
+      resolved.relativePath === "." ? "" : resolved.relativePath,
       params.maxDepth ?? 4,
     );
   }
@@ -190,19 +408,24 @@ export function createWorkspaceManager(projectRoot: string) {
     scope: WorkspaceScope;
     relativePath: string;
   }): WorkspaceFileRecord {
-    const absolutePath = resolvePath(params.conversationId, params.scope, params.relativePath);
-    const stat = fs.statSync(absolutePath, { throwIfNoEntry: false });
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.relativePath,
+      mode: "read",
+    });
+    const stat = fs.lstatSync(resolved.absolutePath, { throwIfNoEntry: false });
     if (!stat || !stat.isFile()) {
       throw new Error("Workspace file was not found.");
     }
+    assertNoLink(stat, resolved.absolutePath);
+    ensureCanonicalInside(resolved.root, resolved.absolutePath);
 
-    const payload = readTextFile(absolutePath);
+    const payload = decodeTextBuffer(resolved.absolutePath, fs.readFileSync(resolved.absolutePath));
     return {
       scope: params.scope,
-      path: params.relativePath.replace(/\\/g, "/"),
-      absolutePath,
-      content: payload.content,
-      binary: payload.binary,
+      path: resolved.relativePath,
+      ...payload,
     };
   }
 
@@ -212,10 +435,20 @@ export function createWorkspaceManager(projectRoot: string) {
     relativePath: string;
     content: string;
   }) {
-    const absolutePath = resolvePath(params.conversationId, params.scope, params.relativePath);
-    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-    fs.writeFileSync(absolutePath, params.content, "utf8");
-    return absolutePath;
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.relativePath,
+      mode: "write",
+    });
+    assertNotScopeRoot(resolved.relativePath, "write to");
+    const stat = fs.lstatSync(resolved.absolutePath, { throwIfNoEntry: false });
+    if (stat) {
+      assertNoLink(stat, resolved.absolutePath);
+    }
+    fs.writeFileSync(resolved.absolutePath, params.content, "utf8");
+    ensureCanonicalInside(resolved.root, resolved.absolutePath);
+    return resolved.relativePath;
   }
 
   function editFile(params: {
@@ -226,13 +459,9 @@ export function createWorkspaceManager(projectRoot: string) {
     replace: string;
     replaceAll?: boolean;
   }) {
-    const current = readFile({
-      conversationId: params.conversationId,
-      scope: params.scope,
-      relativePath: params.relativePath,
-    });
-    if (current.binary) {
-      throw new Error("Binary files cannot be edited with edit_file.");
+    const current = readFile(params);
+    if (current.binary || current.unsupportedEncoding) {
+      throw new Error("Unsupported or binary files cannot be edited with edit_file.");
     }
     if (!params.find) {
       throw new Error("edit_file requires a non-empty find string.");
@@ -244,7 +473,7 @@ export function createWorkspaceManager(projectRoot: string) {
     const nextContent = params.replaceAll
       ? current.content.split(params.find).join(params.replace)
       : current.content.replace(params.find, params.replace);
-    writeFile({
+    return writeFile({
       conversationId: params.conversationId,
       scope: params.scope,
       relativePath: params.relativePath,
@@ -257,9 +486,16 @@ export function createWorkspaceManager(projectRoot: string) {
     scope: WorkspaceScope;
     relativePath: string;
   }) {
-    const absolutePath = resolvePath(params.conversationId, params.scope, params.relativePath);
-    fs.mkdirSync(absolutePath, { recursive: true });
-    return absolutePath;
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.relativePath,
+      mode: "write",
+    });
+    assertNotScopeRoot(resolved.relativePath, "create");
+    fs.mkdirSync(resolved.absolutePath, { recursive: true });
+    ensureCanonicalInside(resolved.root, resolved.absolutePath);
+    return resolved.relativePath;
   }
 
   function movePath(params: {
@@ -268,11 +504,34 @@ export function createWorkspaceManager(projectRoot: string) {
     from: string;
     to: string;
   }) {
-    const fromPath = resolvePath(params.conversationId, params.scope, params.from);
-    const toPath = resolvePath(params.conversationId, params.scope, params.to);
-    fs.mkdirSync(path.dirname(toPath), { recursive: true });
-    fs.renameSync(fromPath, toPath);
-    return toPath;
+    const from = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.from,
+      mode: "delete",
+    });
+    const to = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.to,
+      mode: "write",
+    });
+    assertNotScopeRoot(from.relativePath, "move");
+    assertNotScopeRoot(to.relativePath, "move to");
+
+    const fromStat = fs.lstatSync(from.absolutePath, { throwIfNoEntry: false });
+    if (!fromStat) {
+      throw new Error("Workspace source path was not found.");
+    }
+    assertNoLink(fromStat, from.absolutePath);
+
+    const toStat = fs.lstatSync(to.absolutePath, { throwIfNoEntry: false });
+    if (toStat) {
+      assertNoLink(toStat, to.absolutePath);
+    }
+    fs.renameSync(from.absolutePath, to.absolutePath);
+    ensureCanonicalInside(to.root, to.absolutePath);
+    return to.relativePath;
   }
 
   function deletePath(params: {
@@ -281,11 +540,40 @@ export function createWorkspaceManager(projectRoot: string) {
     relativePath: string;
     recursive?: boolean;
   }) {
-    const absolutePath = resolvePath(params.conversationId, params.scope, params.relativePath);
-    fs.rmSync(absolutePath, {
+    const resolved = resolvePath({
+      conversationId: params.conversationId,
+      scope: params.scope,
+      relativePath: params.relativePath,
+      mode: "delete",
+    });
+    assertNotScopeRoot(resolved.relativePath, "delete");
+    const stat = fs.lstatSync(resolved.absolutePath, { throwIfNoEntry: false });
+    if (!stat) {
+      return;
+    }
+    assertNoLink(stat, resolved.absolutePath);
+    fs.rmSync(resolved.absolutePath, {
       recursive: Boolean(params.recursive),
       force: true,
     });
+  }
+
+  function deleteConversationWorkspace(conversationId: string) {
+    const sandboxDir = path.join(conversationsDir, conversationId);
+    const parent = canonicalizeExistingPath(conversationsDir);
+    const relative = path.relative(parent, path.resolve(sandboxDir));
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error("Refusing to delete workspace outside the conversations directory.");
+    }
+    const stat = fs.lstatSync(sandboxDir, { throwIfNoEntry: false });
+    if (!stat) {
+      return false;
+    }
+    fs.rmSync(sandboxDir, {
+      recursive: !stat.isSymbolicLink(),
+      force: true,
+    });
+    return true;
   }
 
   function readGuides() {
@@ -304,6 +592,8 @@ export function createWorkspaceManager(projectRoot: string) {
     sharedDir,
     conversationsDir,
     bootstrap,
+    createConversationWorkspace,
+    deleteConversationWorkspace,
     getSandboxDir,
     getScopeRoot,
     resolvePath,
@@ -317,4 +607,3 @@ export function createWorkspaceManager(projectRoot: string) {
     readGuides,
   };
 }
-

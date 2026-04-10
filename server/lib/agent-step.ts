@@ -35,7 +35,7 @@ const FinalStepSchema = z.object({
 
 const AgentStepSchema = z.union([ToolStepSchema, FinalStepSchema]);
 
-function extractJsonObject(text: string) {
+export function extractJsonObject(text: string) {
   const trimmed = text.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]+?)\s*```/i);
   if (fenced?.[1]) {
@@ -58,9 +58,13 @@ export function parseAgentStep(text: string): AgentStep {
   try {
     payload = JSON.parse(payloadText);
   } catch {
-    throw new Error("Agent step was not valid JSON");
+    throw new Error("The planner response was not valid JSON.");
   }
 
-  return AgentStepSchema.parse(payload);
-}
+  const parsed = AgentStepSchema.safeParse(payload);
+  if (!parsed.success) {
+    throw new Error(`The planner response did not match the tool schema: ${parsed.error.message}`);
+  }
 
+  return parsed.data;
+}

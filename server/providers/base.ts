@@ -20,6 +20,7 @@ export interface ProviderAdapter<K extends ProviderKind> {
     reasoningLevel: ReasoningLevel;
     instructions: string;
     messages: ChatMessage[];
+    signal?: AbortSignal;
   }) => Promise<AgentStep>;
   streamFinalAnswer: (params: {
     secret: ProviderSecret<K>;
@@ -28,11 +29,13 @@ export interface ProviderAdapter<K extends ProviderKind> {
     instructions: string;
     messages: ChatMessage[];
     onText: (chunk: string) => void;
+    signal?: AbortSignal;
   }) => Promise<void>;
   searchWeb?: (params: {
     secret: ProviderSecret<K>;
     model: string;
     query: string;
+    signal?: AbortSignal;
   }) => Promise<{
     backend: SearchBackendAvailability["kind"];
     query: string;

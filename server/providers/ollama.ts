@@ -31,6 +31,7 @@ async function generateText(params: {
   _reasoningLevel: ReasoningLevel;
   instructions: string;
   messages: ChatMessage[];
+  signal?: AbortSignal;
 }) {
   const response = await ensureOk(
     await fetch(`${normalizeOllamaRoot(params.secret.baseUrl)}/api/chat`, {
@@ -38,6 +39,7 @@ async function generateText(params: {
       headers: {
         "Content-Type": "application/json",
       },
+      signal: params.signal,
       body: JSON.stringify({
         model: params.model,
         messages: [
@@ -95,24 +97,26 @@ export const ollamaAdapter: ProviderAdapter<"ollama"> = {
     }
   },
 
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages }) {
+  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
     const text = await generateText({
       secret,
       model,
       _reasoningLevel: reasoningLevel,
       instructions,
       messages,
+      signal,
     });
     return parseAgentStep(text);
   },
 
-  async streamFinalAnswer({ secret, model, messages, instructions, onText }) {
+  async streamFinalAnswer({ secret, model, messages, instructions, onText, signal }) {
     const response = await ensureOk(
       await fetch(`${normalizeOllamaRoot(secret.baseUrl)}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
+        signal,
         body: JSON.stringify({
           model,
           messages: [
@@ -132,6 +136,6 @@ export const ollamaAdapter: ProviderAdapter<"ollama"> = {
       if (typeof chunk?.content === "string" && chunk.content.length > 0) {
         onText(chunk.content);
       }
-    });
+    }, signal);
   },
 };

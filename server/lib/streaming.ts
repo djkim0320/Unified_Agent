@@ -1,4 +1,39 @@
 import { createParser, type EventSourceMessage } from "eventsource-parser";
+import { createAbortError } from "./process-control.js";
+
+async function readWithSignal(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+) {
+  if (signal?.aborted) {
+    await reader.cancel().catch(() => undefined);
+    throw createAbortError("Streaming request was cancelled.");
+  }
+
+  if (!signal) {
+    return await reader.read();
+  }
+
+  return await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+    const abortHandler = () => {
+      void reader.cancel().finally(() =>
+        reject(createAbortError("Streaming request was cancelled.")),
+      );
+    };
+
+    signal.addEventListener("abort", abortHandler, { once: true });
+    reader.read().then(
+      (result) => {
+        signal.removeEventListener("abort", abortHandler);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", abortHandler);
+        reject(error);
+      },
+    );
+  });
+}
 
 export async function readJson<T>(response: Response) {
   const text = await response.text();
@@ -20,6 +55,7 @@ export async function ensureOk(response: Response) {
 export async function consumeSseStream(
   response: Response,
   onEvent: (event: EventSourceMessage) => void,
+  signal?: AbortSignal,
 ) {
   await ensureOk(response);
   const body = response.body;
@@ -34,17 +70,18 @@ export async function consumeSseStream(
   });
 
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
+    const result = await readWithSignal(reader, signal);
+    if (result.done) {
       break;
     }
-    parser.feed(decoder.decode(value, { stream: true }));
+    parser.feed(decoder.decode(result.value, { stream: true }));
   }
 }
 
 export async function consumeNdjsonStream(
   response: Response,
   onJson: (payload: Record<string, unknown>) => void,
+  signal?: AbortSignal,
 ) {
   await ensureOk(response);
   const body = response.body;
@@ -57,11 +94,11 @@ export async function consumeNdjsonStream(
   let buffer = "";
 
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
+    const result = await readWithSignal(reader, signal);
+    if (result.done) {
       break;
     }
-    buffer += decoder.decode(value, { stream: true });
+    buffer += decoder.decode(result.value, { stream: true });
     const parts = buffer.split("\n");
     buffer = parts.pop() ?? "";
 
@@ -79,4 +116,3 @@ export async function consumeNdjsonStream(
     onJson(JSON.parse(finalLine) as Record<string, unknown>);
   }
 }
-

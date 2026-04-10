@@ -1,12 +1,13 @@
-import path from "node:path";
-import { z } from "zod";
+import { ZodError, z } from "zod";
 import { searchDuckDuckGo } from "./duckduckgo.js";
 import { runWorkspaceCommand } from "./exec-command.js";
 import { fetchWebPage } from "./web-fetch.js";
+import { createAbortError, isAbortError } from "./process-control.js";
 import type { createBrowserRuntime } from "./browser-runtime.js";
 import type { createWorkspaceManager } from "./workspace.js";
 import type { ProviderAdapter } from "../providers/base.js";
 import type {
+  AgentStep,
   ChatMessage,
   ProviderKind,
   ProviderSecret,
@@ -15,8 +16,12 @@ import type {
   ToolCall,
   ToolName,
   WorkspaceRunEventRecord,
+  WorkspaceRunStatus,
   WorkspaceScope,
 } from "../types.js";
+
+const DEFAULT_MAX_STEPS = 8;
+const DEFAULT_RUN_TIMEOUT_MS = 120_000;
 
 const ScopeSchema = z.enum(["sandbox", "shared", "root"]).default("sandbox");
 
@@ -57,7 +62,9 @@ const ToolArgumentSchemas: Record<ToolName, z.ZodType<Record<string, unknown>>> 
     recursive: z.boolean().optional(),
   }),
   exec_command: z.object({
-    command: z.string().min(1),
+    program: z.string().min(1),
+    args: z.array(z.string()).optional(),
+    timeoutMs: z.number().int().min(1).max(120_000).optional(),
   }),
   provider_web_search: z.object({
     query: z.string().min(1),
@@ -91,15 +98,39 @@ const ToolArgumentSchemas: Record<ToolName, z.ZodType<Record<string, unknown>>> 
   browser_close: z.object({}),
 };
 
+export class AgentRunError extends Error {
+  status: Exclude<WorkspaceRunStatus, "running">;
+  runId: string | null;
+
+  constructor(message: string, status: Exclude<WorkspaceRunStatus, "running">, runId?: string) {
+    super(message);
+    this.name = "AgentRunError";
+    this.status = status;
+    this.runId = runId ?? null;
+  }
+}
+
 function clipText(text: string, maxLength = 4000) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-function relativeFromSandbox(sandboxDir: string, absolutePath: string) {
-  return path.relative(sandboxDir, absolutePath).replace(/\\/g, "/");
-}
-
 function toolStatusLabel(toolName: ToolName) {
+  const labels = {
+    search: "검색 중",
+    browser: "브라우저 조사 중",
+    command: "명령 실행 중",
+    file: "파일 작업 중",
+  } as const;
+  if (toolName.includes("search")) {
+    return labels.search;
+  }
+  if (toolName.startsWith("browser_")) {
+    return labels.browser;
+  }
+  if (toolName === "exec_command") {
+    return labels.command;
+  }
+  return labels.file;
   if (toolName.includes("search")) {
     return "검색 중";
   }
@@ -109,7 +140,7 @@ function toolStatusLabel(toolName: ToolName) {
   if (toolName === "exec_command") {
     return "명령 실행 중";
   }
-  return "파일 수정 중";
+  return "파일 작업 중";
 }
 
 function formatSearchBackends(backends: SearchBackendAvailability[]) {
@@ -132,7 +163,7 @@ function buildToolInstructions() {
     '- {"type":"tool_call","tool":{"name":"make_dir","arguments":{"scope":"sandbox","path":"research"}}}',
     '- {"type":"tool_call","tool":{"name":"move_path","arguments":{"scope":"sandbox","from":"a.txt","to":"archive/a.txt"}}}',
     '- {"type":"tool_call","tool":{"name":"delete_path","arguments":{"scope":"sandbox","path":"tmp","recursive":true}}}',
-    '- {"type":"tool_call","tool":{"name":"exec_command","arguments":{"command":"Get-ChildItem"}}}',
+    '- {"type":"tool_call","tool":{"name":"exec_command","arguments":{"program":"node","args":["--version"],"timeoutMs":10000}}}',
     '- {"type":"tool_call","tool":{"name":"provider_web_search","arguments":{"query":"..."}}}',
     '- {"type":"tool_call","tool":{"name":"duckduckgo_search","arguments":{"query":"...","maxResults":5}}}',
     '- {"type":"tool_call","tool":{"name":"web_fetch","arguments":{"url":"https://example.com"}}}',
@@ -147,6 +178,7 @@ function buildToolInstructions() {
     '- {"type":"final_answer"}',
     "Use only one tool per step.",
     "Do not invent tool results.",
+    "Use exec_command only with a direct program plus args. Shells such as PowerShell/cmd/bash are disabled unless the user explicitly enables unsafe mode.",
     "Prefer provider_web_search or duckduckgo_search for ordinary search, web_fetch for a direct URL, and browser tools for pages that need rendering or interaction.",
   ].join("\n");
 }
@@ -154,9 +186,10 @@ function buildToolInstructions() {
 function buildPlanningInstructions(params: {
   guides: { agents: string; memory: string; user: string; tools: string };
   stepIndex: number;
+  maxSteps: number;
   searchBackends: SearchBackendAvailability[];
-  sandboxDir: string;
   toolHistory: Array<{ tool: string; result: string }>;
+  repairHint?: string;
 }) {
   const historyBlock = params.toolHistory.length
     ? params.toolHistory
@@ -171,9 +204,10 @@ function buildPlanningInstructions(params: {
     "You are an autonomous workspace agent inside a local multi-provider chat app.",
     "The server will execute tools on your behalf.",
     "Stop and return final_answer when you have enough information to answer the user well.",
+    params.repairHint ? `Previous response problem: ${params.repairHint}` : "",
     "",
-    `Current planning step: ${params.stepIndex + 1} / 8`,
-    `Conversation sandbox: ${params.sandboxDir}`,
+    `Current planning step: ${params.stepIndex + 1} / ${params.maxSteps}`,
+    "Workspace scope: use sandbox for conversation files and shared for intentionally shared files.",
     "",
     "Available search backends:",
     formatSearchBackends(params.searchBackends),
@@ -191,7 +225,9 @@ function buildPlanningInstructions(params: {
     historyBlock,
     "",
     buildToolInstructions(),
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function buildFinalInstructions(params: {
@@ -237,6 +273,79 @@ function buildToolSummary(toolCall: ToolCall, result: Record<string, unknown>) {
   );
 }
 
+function combineRunSignal(signal: AbortSignal | undefined, timeoutMs: number) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(createAbortError(`Agent run timed out after ${timeoutMs}ms.`));
+  }, timeoutMs);
+
+  const abortListener = () => {
+    controller.abort(signal?.reason ?? createAbortError());
+  };
+
+  if (signal?.aborted) {
+    controller.abort(signal.reason ?? createAbortError());
+  } else {
+    signal?.addEventListener("abort", abortListener, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortListener);
+    },
+  };
+}
+
+function validationMessage(error: unknown) {
+  if (error instanceof ZodError) {
+    return error.issues.map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`).join("; ");
+  }
+  return error instanceof Error ? error.message : "Tool argument validation failed.";
+}
+
+async function planStepWithRecovery<K extends ProviderKind>(params: {
+  adapter: ProviderAdapter<K>;
+  secret: ProviderSecret<K>;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  instructions: string;
+  messages: ChatMessage[];
+  signal: AbortSignal;
+}) {
+  try {
+    return await params.adapter.planToolStep({
+      secret: params.secret,
+      model: params.model,
+      reasoningLevel: params.reasoningLevel,
+      instructions: params.instructions,
+      messages: params.messages,
+      signal: params.signal,
+    });
+  } catch (firstError) {
+    if (params.signal.aborted || isAbortError(firstError)) {
+      throw firstError;
+    }
+
+    const repairedInstructions = `${params.instructions}
+
+Your previous planner response was invalid or did not match the tool schema:
+${firstError instanceof Error ? firstError.message : "Invalid planner response."}
+
+Return exactly one valid JSON object now. No markdown, no prose.`;
+
+    return await params.adapter.planToolStep({
+      secret: params.secret,
+      model: params.model,
+      reasoningLevel: params.reasoningLevel,
+      instructions: repairedInstructions,
+      messages: params.messages,
+      signal: params.signal,
+    });
+  }
+}
+
 export async function runAgentTurn<K extends ProviderKind>(params: {
   adapter: ProviderAdapter<K>;
   secret: ProviderSecret<K>;
@@ -260,9 +369,18 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       eventType: WorkspaceRunEventRecord["eventType"];
       payload: Record<string, unknown>;
     }) => WorkspaceRunEventRecord;
-    completeWorkspaceRun: (id: string, status: "completed" | "failed") => unknown;
+    finalizeWorkspaceRun: (
+      id: string,
+      status: Exclude<WorkspaceRunStatus, "running">,
+      eventType: WorkspaceRunEventRecord["eventType"],
+      payload: Record<string, unknown>,
+    ) => { finalized: boolean; run: unknown };
   };
   sendEvent: (eventName: string, payload: Record<string, unknown>) => void;
+  signal?: AbortSignal;
+  maxSteps?: number;
+  runTimeoutMs?: number;
+  unsafeShellEnabled?: boolean;
 }) {
   const run = params.store.createWorkspaceRun({
     conversationId: params.conversationId,
@@ -270,8 +388,9 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
     model: params.model,
     userMessage: params.userMessage,
   });
+  const runSignal = combineRunSignal(params.signal, params.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS);
   const guides = params.workspace.readGuides();
-  const sandboxDir = params.workspace.getSandboxDir(params.conversationId);
+  params.workspace.createConversationWorkspace(params.conversationId);
   const searchBackends: SearchBackendAvailability[] = [
     {
       kind: "provider_web_search",
@@ -299,8 +418,10 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
     },
   ];
 
+  const maxSteps = params.maxSteps ?? DEFAULT_MAX_STEPS;
   const toolHistory: Array<{ tool: string; result: string }> = [];
   const changedFiles = new Set<string>();
+  let terminalState: Exclude<WorkspaceRunStatus, "running"> | null = null;
 
   const emit = (eventType: WorkspaceRunEventRecord["eventType"], payload: Record<string, unknown>) => {
     params.store.appendWorkspaceRunEvent({
@@ -310,30 +431,59 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
     });
   };
 
+  const finalize = (
+    status: Exclude<WorkspaceRunStatus, "running">,
+    eventType: WorkspaceRunEventRecord["eventType"],
+    payload: Record<string, unknown>,
+  ) => {
+    if (terminalState) {
+      return;
+    }
+    terminalState = status;
+    params.store.finalizeWorkspaceRun(run.id, status, eventType, payload);
+  };
+
   try {
-    for (let stepIndex = 0; stepIndex < 8; stepIndex += 1) {
+    let reachedFinalStep = false;
+
+    for (let stepIndex = 0; stepIndex < maxSteps; stepIndex += 1) {
+      if (runSignal.signal.aborted) {
+        throw runSignal.signal.reason ?? createAbortError();
+      }
+
       const instructions = buildPlanningInstructions({
         guides,
         stepIndex,
+        maxSteps,
         searchBackends,
-        sandboxDir,
         toolHistory,
       });
-      const step = await params.adapter.planToolStep({
-        secret: params.secret,
-        model: params.model,
-        reasoningLevel: params.reasoningLevel,
-        instructions,
-        messages: params.messages,
-      });
+
+      let step: AgentStep;
+      try {
+        step = await planStepWithRecovery({
+          adapter: params.adapter,
+          secret: params.secret,
+          model: params.model,
+          reasoningLevel: params.reasoningLevel,
+          instructions,
+          messages: params.messages,
+          signal: runSignal.signal,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Planner returned invalid JSON.";
+        emit("error", { error: message, phase: "planning" });
+        throw new AgentRunError(message, isAbortError(error) ? "cancelled" : "failed", run.id);
+      }
 
       if (step.type === "final_answer") {
+        reachedFinalStep = true;
         break;
       }
 
       const status = toolStatusLabel(step.tool.name);
       emit("status", { message: status, tool: step.tool.name });
-      params.sendEvent("status", { message: status, tool: step.tool.name });
+      params.sendEvent("status", { message: status, tool: step.tool.name, runId: run.id });
       emit("tool_call", {
         tool: step.tool.name,
         arguments: step.tool.arguments,
@@ -341,27 +491,35 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       params.sendEvent("tool_call", {
         tool: step.tool.name,
         arguments: step.tool.arguments,
+        runId: run.id,
       });
 
-      const result = (await executeTool({
-        toolCall: step.tool,
-        conversationId: params.conversationId,
-        workspace: params.workspace,
-        browserRuntime: params.browserRuntime,
-        adapter: params.adapter,
-        secret: params.secret,
-        model: params.model,
-        sandboxDir,
-      })) as Record<string, unknown>;
+      let result: Record<string, unknown>;
+      try {
+        result = await executeTool({
+          toolCall: step.tool,
+          conversationId: params.conversationId,
+          runId: run.id,
+          workspace: params.workspace,
+          browserRuntime: params.browserRuntime,
+          adapter: params.adapter,
+          secret: params.secret,
+          model: params.model,
+          signal: runSignal.signal,
+          unsafeShellEnabled: params.unsafeShellEnabled,
+        });
+      } catch (error) {
+        const message = validationMessage(error);
+        emit("error", { error: message, phase: "tool", tool: step.tool.name });
+        throw new AgentRunError(message, isAbortError(error) ? "cancelled" : "failed", run.id);
+      }
 
       const changedFilesInResult = Array.isArray(result.changedFiles)
         ? result.changedFiles.filter((value): value is string => typeof value === "string")
         : [];
 
-      if (changedFilesInResult.length) {
-        for (const file of changedFilesInResult) {
-          changedFiles.add(file);
-        }
+      for (const file of changedFilesInResult) {
+        changedFiles.add(file);
       }
 
       const compactResult = {
@@ -376,11 +534,20 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       params.sendEvent("tool_result", {
         tool: step.tool.name,
         result: compactResult,
+        runId: run.id,
       });
       toolHistory.push({
         tool: step.tool.name,
         result: buildToolSummary(step.tool, compactResult),
       });
+    }
+
+    if (!reachedFinalStep) {
+      throw new AgentRunError(`Agent stopped after reaching the ${maxSteps}-step limit.`, "failed", run.id);
+    }
+
+    if (runSignal.signal.aborted) {
+      throw runSignal.signal.reason ?? createAbortError();
     }
 
     const finalInstructions = buildFinalInstructions({
@@ -396,20 +563,21 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       reasoningLevel: params.reasoningLevel,
       instructions: finalInstructions,
       messages: params.messages,
+      signal: runSignal.signal,
       onText: (chunk) => {
         assistantText += chunk;
-        params.sendEvent("delta", { delta: chunk });
+        params.sendEvent("delta", { delta: chunk, runId: run.id });
       },
     });
 
-    emit("run_complete", {
+    const completionPayload = {
       changedFiles: [...changedFiles].sort(),
-    });
+    };
     params.sendEvent("run_complete", {
       runId: run.id,
-      changedFiles: [...changedFiles].sort(),
+      ...completionPayload,
     });
-    params.store.completeWorkspaceRun(run.id, "completed");
+    finalize("completed", "run_complete", completionPayload);
 
     return {
       runId: run.id,
@@ -417,26 +585,40 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       changedFiles: [...changedFiles].sort(),
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Agent runtime failed.";
-    emit("error", { error: message });
-    params.store.completeWorkspaceRun(run.id, "failed");
-    throw error;
+    const status: Exclude<WorkspaceRunStatus, "running"> =
+      error instanceof AgentRunError ? error.status : isAbortError(error) ? "cancelled" : "failed";
+    const message =
+      error instanceof Error
+        ? error.message
+        : status === "cancelled"
+          ? "Agent run was cancelled."
+          : "Agent runtime failed.";
+    const eventType = status === "cancelled" ? "run_cancelled" : "run_failed";
+    finalize(status, eventType, { error: message });
+    if (error instanceof AgentRunError) {
+      throw error;
+    }
+    throw new AgentRunError(message, status, run.id);
+  } finally {
+    runSignal.cleanup();
+    await params.browserRuntime.closeSession(run.id).catch(() => undefined);
   }
 }
 
 async function executeTool<K extends ProviderKind>(params: {
   toolCall: ToolCall;
   conversationId: string;
+  runId: string;
   workspace: ReturnType<typeof createWorkspaceManager>;
   browserRuntime: ReturnType<typeof createBrowserRuntime>;
   adapter: ProviderAdapter<K>;
   secret: ProviderSecret<K>;
   model: string;
-  sandboxDir: string;
+  signal: AbortSignal;
+  unsafeShellEnabled?: boolean;
 }) {
   const parser = ToolArgumentSchemas[params.toolCall.name];
   const args = parser.parse(params.toolCall.arguments);
-
   const scope = ("scope" in args ? (args.scope as WorkspaceScope | undefined) : undefined) ?? "sandbox";
 
   switch (params.toolCall.name) {
@@ -458,23 +640,25 @@ async function executeTool<K extends ProviderKind>(params: {
       return {
         path: file.path,
         binary: file.binary,
+        unsupportedEncoding: file.unsupportedEncoding,
+        encoding: file.encoding,
         text: file.binary ? "" : file.content,
       };
     }
     case "write_file": {
-      const absolutePath = params.workspace.writeFile({
+      const relativePath = params.workspace.writeFile({
         conversationId: params.conversationId,
         scope,
         relativePath: args.path as string,
         content: args.content as string,
       });
       return {
-        path: relativeFromSandbox(params.sandboxDir, absolutePath),
-        changedFiles: [relativeFromSandbox(params.sandboxDir, absolutePath)],
+        path: relativePath,
+        changedFiles: [relativePath],
       };
     }
     case "edit_file": {
-      params.workspace.editFile({
+      const relativePath = params.workspace.editFile({
         conversationId: params.conversationId,
         scope,
         relativePath: args.path as string,
@@ -483,30 +667,30 @@ async function executeTool<K extends ProviderKind>(params: {
         replaceAll: Boolean(args.replaceAll),
       });
       return {
-        path: args.path as string,
-        changedFiles: [String(args.path)],
+        path: relativePath,
+        changedFiles: [relativePath],
       };
     }
     case "make_dir": {
-      const absolutePath = params.workspace.makeDir({
+      const relativePath = params.workspace.makeDir({
         conversationId: params.conversationId,
         scope,
         relativePath: args.path as string,
       });
       return {
-        path: relativeFromSandbox(params.sandboxDir, absolutePath),
+        path: relativePath,
       };
     }
     case "move_path": {
-      const absolutePath = params.workspace.movePath({
+      const relativePath = params.workspace.movePath({
         conversationId: params.conversationId,
         scope,
         from: args.from as string,
         to: args.to as string,
       });
       return {
-        path: relativeFromSandbox(params.sandboxDir, absolutePath),
-        changedFiles: [String(args.to)],
+        path: relativePath,
+        changedFiles: [relativePath],
       };
     }
     case "delete_path": {
@@ -524,14 +708,20 @@ async function executeTool<K extends ProviderKind>(params: {
     }
     case "exec_command": {
       const result = await runWorkspaceCommand({
-        command: args.command as string,
-        cwd: params.sandboxDir,
+        program: args.program as string,
+        args: Array.isArray(args.args) ? (args.args as string[]) : [],
+        timeoutMs: typeof args.timeoutMs === "number" ? args.timeoutMs : undefined,
+        cwd: params.workspace.createConversationWorkspace(params.conversationId),
+        signal: params.signal,
+        allowUnsafeShell: params.unsafeShellEnabled,
       });
       return {
-        command: args.command,
+        program: args.program,
+        args: args.args ?? [],
         exitCode: result.exitCode,
         stdout: clipText(result.stdout, 5000),
         stderr: clipText(result.stderr, 3000),
+        timedOut: result.timedOut,
       };
     }
     case "provider_web_search": {
@@ -542,6 +732,7 @@ async function executeTool<K extends ProviderKind>(params: {
         secret: params.secret,
         model: params.model,
         query: args.query as string,
+        signal: params.signal,
       });
     }
     case "duckduckgo_search": {
@@ -555,39 +746,64 @@ async function executeTool<K extends ProviderKind>(params: {
       };
     }
     case "web_fetch": {
-      return await fetchWebPage(args.url as string);
+      return await fetchWebPage(args.url as string, { signal: params.signal });
     }
     case "browser_search": {
-      return await params.browserRuntime.search(params.conversationId, args.query as string);
+      return await params.browserRuntime.search({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        query: args.query as string,
+        signal: params.signal,
+      });
     }
     case "browser_open": {
-      return await params.browserRuntime.open(params.conversationId, args.url as string);
+      return await params.browserRuntime.open({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        url: args.url as string,
+        signal: params.signal,
+      });
     }
     case "browser_snapshot": {
-      return await params.browserRuntime.snapshot(params.conversationId);
+      return await params.browserRuntime.snapshot({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+      });
     }
     case "browser_extract": {
-      return await params.browserRuntime.extract(
-        params.conversationId,
-        typeof args.selector === "string" ? args.selector : undefined,
-      );
+      return await params.browserRuntime.extract({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        selector: typeof args.selector === "string" ? args.selector : undefined,
+      });
     }
     case "browser_click": {
-      return await params.browserRuntime.click(params.conversationId, args.selector as string);
+      return await params.browserRuntime.click({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        selector: args.selector as string,
+        signal: params.signal,
+      });
     }
     case "browser_type": {
-      return await params.browserRuntime.type(
-        params.conversationId,
-        args.selector as string,
-        args.text as string,
-        Boolean(args.submit),
-      );
+      return await params.browserRuntime.type({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        selector: args.selector as string,
+        text: args.text as string,
+        submit: Boolean(args.submit),
+        signal: params.signal,
+      });
     }
     case "browser_back": {
-      return await params.browserRuntime.back(params.conversationId);
+      return await params.browserRuntime.back({
+        sessionId: params.runId,
+        conversationId: params.conversationId,
+        signal: params.signal,
+      });
     }
     case "browser_close": {
-      await params.browserRuntime.closeSession(params.conversationId);
+      await params.browserRuntime.closeSession(params.runId);
       return { closed: true };
     }
   }

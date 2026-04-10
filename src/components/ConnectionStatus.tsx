@@ -1,4 +1,4 @@
-import type { ProviderSummary } from "../types";
+import { providerLabels, type ProviderSummary } from "../types";
 
 interface ConnectionStatusProps {
   provider: ProviderSummary | null;
@@ -7,46 +7,32 @@ interface ConnectionStatusProps {
   modelsError: string | null;
 }
 
-function formatIdentity(provider: ProviderSummary | null) {
-  if (!provider) {
-    return "선택된 프로바이더가 없습니다";
-  }
-  return provider.email ?? provider.displayName ?? provider.label;
-}
-
-function formatStatus(status: "connected" | "configured" | "disconnected") {
-  if (status === "connected") {
-    return "연결됨";
-  }
-  if (status === "configured") {
-    return "설정됨";
-  }
-  return "연결 안 됨";
-}
-
 export function ConnectionStatus(props: ConnectionStatusProps) {
-  const provider = props.provider;
-  const status = provider?.status ?? "disconnected";
+  const statusLabel = props.provider
+    ? props.provider.status === "connected"
+      ? "연결됨"
+      : props.provider.status === "configured"
+        ? "구성됨"
+        : "연결 안 됨"
+    : "연결 안 됨";
+
+  const statusClass =
+    props.provider?.status === "connected"
+      ? "is-connected"
+      : props.provider?.status === "configured"
+        ? "is-configured"
+        : "is-disconnected";
 
   return (
-    <div className="connection-status">
-      <div className="connection-status__headline">
-        <span className={`status-pill status-pill--${status}`}>{formatStatus(status)}</span>
-        <div>
-          <p className="connection-status__title">{provider?.label ?? "프로바이더 없음"}</p>
-          <span className="connection-status__identity">{formatIdentity(provider)}</span>
-        </div>
-      </div>
+    <section className="connection-status">
+      <div className={`connection-status__badge ${statusClass}`}>{statusLabel}</div>
 
-      <div className="connection-status__models">
-        {props.modelsLoading
-          ? "최신 모델 목록을 불러오는 중입니다."
-          : `정리된 모델 ${props.modelCount}개 준비됨`}
+      <div className="connection-status__body">
+        <strong>{props.provider ? providerLabels[props.provider.kind] : "프로바이더 없음"}</strong>
+        <span>{props.modelsLoading ? "모델 목록을 불러오는 중..." : `${props.modelCount}개 모델 후보`}</span>
+        {props.modelsError ? <p className="connection-status__error">{props.modelsError}</p> : null}
+        {!props.provider ? <p className="connection-status__hint">프로바이더를 먼저 연결해주세요.</p> : null}
       </div>
-
-      {props.modelsError ? (
-        <div className="connection-status__warning">{props.modelsError}</div>
-      ) : null}
-    </div>
+    </section>
   );
 }

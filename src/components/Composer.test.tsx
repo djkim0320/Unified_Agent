@@ -87,7 +87,7 @@ describe("Composer", () => {
       />,
     );
 
-    const textarea = screen.getByPlaceholderText("후속 변경 사항을 부탁해보세요");
+    const textarea = screen.getByPlaceholderText("후속 변경 사항을 입력하세요");
 
     fireEvent.keyDown(textarea, {
       key: "Enter",

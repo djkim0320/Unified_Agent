@@ -3,6 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import {
+  appendCappedText,
+  createAbortError,
+  createSanitizedEnvironment,
+  terminateProcessTree,
+} from "./process-control.js";
 
 type CodexJsonEvent = Record<string, unknown>;
 
@@ -52,6 +58,7 @@ async function runCodexCommand(params: {
   stdinText?: string;
   timeoutMs?: number;
   onStdoutLine?: (line: string) => void;
+  signal?: AbortSignal;
 }) {
   const spawnConfig = createSpawnConfig(params.args);
 
@@ -62,7 +69,7 @@ async function runCodexCommand(params: {
   }>((resolve, reject) => {
     const child = spawn(spawnConfig.command, spawnConfig.args, {
       cwd: params.cwd,
-      env: process.env,
+      env: createSanitizedEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -70,17 +77,40 @@ async function runCodexCommand(params: {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timeoutTriggered = false;
+    let abortTriggered = false;
+    const stdoutState = { truncated: false };
+    const stderrState = { truncated: false };
 
     const timeout =
       typeof params.timeoutMs === "number" && params.timeoutMs > 0
         ? setTimeout(() => {
-            child.kill();
-            if (!settled) {
-              settled = true;
-              reject(new Error("Codex command timed out"));
-            }
+            timeoutTriggered = true;
+            void terminateProcessTree(child.pid).finally(() => {
+              if (!settled) {
+                settled = true;
+                reject(new Error("Codex command timed out"));
+              }
+            });
           }, params.timeoutMs)
         : null;
+
+    const abortHandler = () => {
+      abortTriggered = true;
+      void terminateProcessTree(child.pid).finally(() => {
+        if (!settled) {
+          settled = true;
+          reject(createAbortError("Codex command was cancelled."));
+        }
+      });
+    };
+
+    if (params.signal?.aborted) {
+      abortHandler();
+      return;
+    }
+
+    params.signal?.addEventListener("abort", abortHandler, { once: true });
 
     const finalize = (
       result:
@@ -91,6 +121,7 @@ async function runCodexCommand(params: {
       if (timeout) {
         clearTimeout(timeout);
       }
+      params.signal?.removeEventListener("abort", abortHandler);
       if (settled) {
         return;
       }
@@ -108,17 +139,26 @@ async function runCodexCommand(params: {
     });
 
     stdoutReader.on("line", (line) => {
-      stdout += `${line}\n`;
+      stdout = appendCappedText(
+        stdout,
+        Buffer.from(`${line}\n`, "utf8"),
+        stdoutState,
+        128 * 1024,
+        "stdout",
+      );
       params.onStdoutLine?.(line);
     });
 
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      stderr = appendCappedText(stderr, chunk, stderrState, 64 * 1024, "stderr");
     });
 
     child.on("error", (error) => finalize(error, true));
     child.on("close", (code) => {
       stdoutReader.close();
+      if (timeoutTriggered || abortTriggered) {
+        return;
+      }
       finalize(
         {
           exitCode: code ?? 0,
@@ -178,6 +218,7 @@ export async function runCodexExec(params: {
   reasoningEffort?: string;
   prompt: string;
   onAgentMessage?: (text: string) => void;
+  signal?: AbortSignal;
 }) {
   let finalAgentMessage = "";
 
@@ -223,6 +264,7 @@ export async function runCodexExec(params: {
         params.onAgentMessage?.(item.text);
       }
     },
+    signal: params.signal,
   });
 
   if (result.exitCode !== 0) {

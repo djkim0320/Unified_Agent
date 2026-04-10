@@ -10,6 +10,22 @@ interface ChatViewProps {
   changedFiles: string[];
 }
 
+function eventLabel(event: WorkspaceRunEventRecord) {
+  if (event.eventType === "status" && typeof event.payload.message === "string") {
+    return event.payload.message;
+  }
+  if (event.eventType === "tool_call") {
+    return "도구 호출";
+  }
+  if (event.eventType === "tool_result") {
+    return "도구 결과";
+  }
+  if (event.eventType === "error") {
+    return "오류";
+  }
+  return event.eventType;
+}
+
 export function ChatView(props: ChatViewProps) {
   const endRef = useRef<HTMLDivElement | null>(null);
 
@@ -24,11 +40,8 @@ export function ChatView(props: ChatViewProps) {
       {showEmpty ? (
         <div className="chat-view__empty">
           <p className="eyebrow">채팅</p>
-          <h2>차분하고 정돈된 AI 작업 공간을 시작해보세요.</h2>
-          <p>
-            이제 채팅과 워크스페이스가 연결되어, 모델이 파일 작업과 연구 로그를 함께 남길 수
-            있습니다.
-          </p>
+          <h2>대화를 시작하면 AI 작업 공간이 열립니다.</h2>
+          <p>메시지, 워크스페이스 파일, 에이전트 실행 로그를 같은 화면에서 확인할 수 있습니다.</p>
         </div>
       ) : (
         <div className="chat-view__messages">
@@ -37,7 +50,7 @@ export function ChatView(props: ChatViewProps) {
               <h3>실시간 작업 상태</h3>
               {props.liveEvents.map((event) => (
                 <article className="chat-activity__item" key={event.id}>
-                  <strong>{event.eventType}</strong>
+                  <strong>{eventLabel(event)}</strong>
                   <span>{JSON.stringify(event.payload)}</span>
                 </article>
               ))}
@@ -51,11 +64,11 @@ export function ChatView(props: ChatViewProps) {
                   <div className="chat-bubble chat-bubble--user">
                     <p>{message.content}</p>
                   </div>
-                  <span className="chat-entry__meta">스레드에 고정됨</span>
+                  <span className="chat-entry__meta">이 대화에 고정됨</span>
                 </>
               ) : (
                 <div className="chat-response">
-                  <p className="chat-response__label">어시스턴트</p>
+                  <p className="chat-response__label">Assistant</p>
                   <div className="chat-response__body">
                     <p>{message.content}</p>
                     {props.changedFiles.length ? (
@@ -77,7 +90,7 @@ export function ChatView(props: ChatViewProps) {
           {props.pendingAssistantText ? (
             <article className="chat-entry chat-entry--assistant">
               <div className="chat-response is-pending">
-                <p className="chat-response__label">어시스턴트</p>
+                <p className="chat-response__label">Assistant</p>
                 <div className="chat-response__body">
                   <p>{props.pendingAssistantText}</p>
                 </div>
@@ -88,9 +101,9 @@ export function ChatView(props: ChatViewProps) {
           {props.loading && !props.pendingAssistantText ? (
             <article className="chat-entry chat-entry--assistant">
               <div className="chat-response is-pending">
-                <p className="chat-response__label">어시스턴트</p>
+                <p className="chat-response__label">Assistant</p>
                 <div className="chat-response__body">
-                  <p>생각하는 중입니다...</p>
+                  <p>응답을 생성하는 중입니다...</p>
                 </div>
               </div>
             </article>

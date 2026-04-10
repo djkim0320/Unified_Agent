@@ -1,202 +1,141 @@
 import type { ProviderDraft, ProviderKind, ProviderSummary } from "../types";
+import { providerKinds, providerLabels } from "../types";
 
 interface ProviderSettingsDialogProps {
-  open: boolean;
-  providers: ProviderSummary[];
   drafts: Record<ProviderKind, ProviderDraft>;
-  savingKind: ProviderKind | null;
-  testingKind: ProviderKind | null;
   notice: string | null;
   onClose: () => void;
-  onDraftChange: (
-    kind: Exclude<ProviderKind, "openai-codex">,
-    field: keyof ProviderDraft,
-    value: string,
-  ) => void;
-  onSave: (kind: Exclude<ProviderKind, "openai-codex">) => void;
-  onTest: (kind: ProviderKind) => void;
   onConnectCodex: () => void;
+  onDraftChange: (kind: ProviderKind, field: keyof ProviderDraft, value: string) => void;
   onImportCodex: () => void;
   onLogoutCodex: () => void;
+  onSave: (kind: ProviderKind) => void;
+  onTest: (kind: ProviderKind) => void;
+  open: boolean;
+  providers: ProviderSummary[];
+  savingKind: ProviderKind | null;
+  testingKind: ProviderKind | null;
 }
 
-const providerDescriptions: Record<ProviderKind, string> = {
-  openai: "GPT 모델과 Responses API",
-  anthropic: "Claude 모델과 Messages API",
-  gemini: "Google AI 기반 Gemini 모델",
-  ollama: "로컬 추론용 HTTP 엔드포인트",
-  "openai-codex": "ChatGPT OAuth 기반 Codex 연결",
-};
-
-function providerEnabled(provider: ProviderSummary) {
-  return provider.status !== "disconnected" || provider.configured;
+function statusLabel(status: ProviderSummary["status"]) {
+  switch (status) {
+    case "connected":
+      return "연결됨";
+    case "configured":
+      return "구성됨";
+    default:
+      return "미연결";
+  }
 }
 
-export function ProviderSettingsDialog(props: ProviderSettingsDialogProps) {
-  if (!props.open) {
+export function ProviderSettingsDialog({
+  drafts,
+  notice,
+  onClose,
+  onConnectCodex,
+  onDraftChange,
+  onImportCodex,
+  onLogoutCodex,
+  onSave,
+  onTest,
+  open,
+  providers,
+  savingKind,
+  testingKind,
+}: ProviderSettingsDialogProps) {
+  if (!open) {
     return null;
   }
 
-  const codexProvider =
-    props.providers.find((provider) => provider.kind === "openai-codex") ?? null;
-
   return (
-    <div className="modal-backdrop" onClick={props.onClose} role="presentation">
+    <div className="provider-dialog-backdrop" role="presentation" onClick={onClose}>
       <div
-        aria-modal="true"
-        className="modal-card modal-card--settings"
+        aria-label="프로바이더 설정"
+        className="provider-dialog"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
       >
-        <div className="modal-card__header modal-card__header--spacious">
+        <div className="provider-dialog__header">
           <div>
-            <p className="eyebrow">프로바이더 설정</p>
-            <h2>AI 연결을 설정하세요</h2>
-            <p className="modal-card__lede">
-              이 작업 공간에서 사용할 API 키, 로컬 엔드포인트, ChatGPT OAuth 기반 Codex 연결을
-              관리할 수 있습니다.
-            </p>
+            <h2>프로바이더 설정</h2>
+            <p>각 API 키와 연결 상태를 관리합니다.</p>
           </div>
-          <button className="ghost-button" onClick={props.onClose} type="button">
+          <button className="icon-button" onClick={onClose} type="button">
             닫기
           </button>
         </div>
 
-        {props.notice ? <p className="settings-notice">{props.notice}</p> : null}
+        {notice ? <div className="notice-banner">{notice}</div> : null}
 
-        <div className="settings-stack">
-          {props.providers
-            .filter((provider) => provider.kind !== "openai-codex")
-            .map((provider) => {
-              const draft = props.drafts[provider.kind];
-              const busy =
-                props.savingKind === provider.kind || props.testingKind === provider.kind;
+        <div className="provider-grid">
+          {providerKinds.map((kind) => {
+            const provider = providers.find((item) => item.kind === kind);
+            const draft = drafts[kind];
+            const isSaving = savingKind === kind;
+            const isTesting = testingKind === kind;
 
-              return (
-                <section className="settings-card" key={provider.kind}>
-                  <div className="settings-card__header">
-                    <div>
-                      <div className="settings-card__title-row">
-                        <h3>{provider.label}</h3>
-                        <span
-                          className={`settings-toggle ${providerEnabled(provider) ? "is-on" : ""}`}
-                        />
-                      </div>
-                      <p>{providerDescriptions[provider.kind]}</p>
-                    </div>
+            return (
+              <section className="provider-card" key={kind}>
+                <div className="provider-card__title-row">
+                  <div>
+                    <h3>{providerLabels[kind]}</h3>
+                    <p>
+                      {provider
+                        ? `${statusLabel(provider.status)} / ${provider.displayName ?? "계정 없음"}`
+                        : "연결되지 않음"}
+                    </p>
                   </div>
-
-                  <div className="settings-card__fields">
-                    {provider.kind === "ollama" ? (
-                      <>
-                        <label className="field">
-                          <span>Base URL</span>
-                          <input
-                            onChange={(event) =>
-                              props.onDraftChange("ollama", "baseUrl", event.target.value)
-                            }
-                            placeholder="http://127.0.0.1:11434"
-                            value={draft.baseUrl}
-                          />
-                        </label>
-                        <div className="field">
-                          <span>모델</span>
-                          <div className="settings-static-value">
-                            메인 채팅 화면에서 대화별로 설정합니다.
-                          </div>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <label className="field">
-                          <span>API 키</span>
-                          <input
-                            autoComplete="off"
-                            onChange={(event) =>
-                              props.onDraftChange(
-                                provider.kind as Exclude<ProviderKind, "openai-codex">,
-                                "apiKey",
-                                event.target.value,
-                              )
-                            }
-                            placeholder="프로바이더 API 키를 입력하세요"
-                            type="password"
-                            value={draft.apiKey}
-                          />
-                        </label>
-                        <div className="field">
-                          <span>기본 모델</span>
-                          <div className="settings-static-value">
-                            모델 선택은 채팅 화면에서 대화별로 저장됩니다.
-                          </div>
-                        </div>
-                      </>
-                    )}
-                  </div>
-
-                  <div className="settings-card__actions">
-                    <button
-                      className="ghost-button"
-                      disabled={busy}
-                      onClick={() => props.onSave(provider.kind as Exclude<ProviderKind, "openai-codex">)}
-                      type="button"
-                    >
-                      저장
-                    </button>
-                    <button
-                      className="primary-button settings-card__test"
-                      disabled={busy}
-                      onClick={() => props.onTest(provider.kind)}
-                      type="button"
-                    >
-                      연결 테스트
-                    </button>
-                  </div>
-                </section>
-              );
-            })}
-
-          <section className="settings-card settings-card--codex">
-            <div className="settings-card__header">
-              <div>
-                <div className="settings-card__title-row">
-                  <h3>OpenAI Codex</h3>
-                  <span
-                    className={`settings-toggle ${
-                      codexProvider && providerEnabled(codexProvider) ? "is-on" : ""
-                    }`}
-                  />
+                  <span className={`status-pill status-pill--${provider?.status ?? "disconnected"}`}>
+                    {statusLabel(provider?.status ?? "disconnected")}
+                  </span>
                 </div>
-                <p>{providerDescriptions["openai-codex"]}</p>
-              </div>
-            </div>
 
-            <div className="codex-account">
-              <strong>{codexProvider?.displayName ?? "연결된 ChatGPT 계정이 없습니다"}</strong>
-              <span>
-                {codexProvider?.email ?? "OAuth로 연결하거나 Codex CLI auth.json을 가져오세요"}
-              </span>
-            </div>
+                <label className="field">
+                  <span>API 키</span>
+                  <input
+                    autoComplete="off"
+                    className="field__input"
+                    onChange={(event) => onDraftChange(kind, "apiKey", event.target.value)}
+                    value={draft.apiKey}
+                  />
+                </label>
 
-            <div className="settings-card__actions settings-card__actions--wrap">
-              <button className="ghost-button" onClick={props.onConnectCodex} type="button">
-                OAuth로 연결
-              </button>
-              <button className="ghost-button" onClick={props.onImportCodex} type="button">
-                CLI 인증 가져오기
-              </button>
-              <button
-                className="primary-button settings-card__test"
-                onClick={() => props.onTest("openai-codex")}
-                type="button"
-              >
-                연결 테스트
-              </button>
-              <button className="ghost-button" onClick={props.onLogoutCodex} type="button">
-                로그아웃
-              </button>
-            </div>
-          </section>
+                <label className="field">
+                  <span>기본 URL</span>
+                  <input
+                    autoComplete="off"
+                    className="field__input"
+                    onChange={(event) => onDraftChange(kind, "baseUrl", event.target.value)}
+                    placeholder={kind === "ollama" ? "http://127.0.0.1:11434" : "선택 사항"}
+                    value={draft.baseUrl}
+                  />
+                </label>
+
+                <div className="provider-card__actions">
+                  <button disabled={isTesting} onClick={() => onTest(kind)} type="button">
+                    {isTesting ? "연결 확인 중..." : "연결 확인"}
+                  </button>
+                  <button disabled={isSaving} onClick={() => onSave(kind)} type="button">
+                    {isSaving ? "저장 중..." : "저장"}
+                  </button>
+                </div>
+
+                {kind === "openai-codex" ? (
+                  <div className="provider-card__actions provider-card__actions--stacked">
+                    <button onClick={onConnectCodex} type="button">
+                      Codex OAuth 연결
+                    </button>
+                    <button onClick={onImportCodex} type="button">
+                      CLI 인증 가져오기
+                    </button>
+                    <button onClick={onLogoutCodex} type="button">
+                      로그아웃
+                    </button>
+                  </div>
+                ) : null}
+              </section>
+            );
+          })}
         </div>
       </div>
     </div>

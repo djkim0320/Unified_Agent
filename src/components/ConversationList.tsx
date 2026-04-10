@@ -35,6 +35,7 @@ export function ConversationList(props: ConversationListProps) {
         {props.conversations.map((conversation) => {
           const active = conversation.id === props.activeConversationId;
           const model = getModelOption(conversation.providerKind, conversation.model);
+
           return (
             <div className={`conversation-list__item ${active ? "is-active" : ""}`} key={conversation.id}>
               <button
@@ -62,7 +63,7 @@ export function ConversationList(props: ConversationListProps) {
 
         {props.conversations.length === 0 ? (
           <div className="conversation-list__empty">
-            대화를 시작하면 선택한 프로바이더와 모델 정보가 여기에 저장됩니다.
+            대화를 시작하면 선택한 프로바이더와 모델 정보가 여기에 표시됩니다.
           </div>
         ) : null}
       </div>

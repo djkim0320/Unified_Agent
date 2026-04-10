@@ -1,50 +1,88 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { assertSafeOutboundUrl } from "./network-guard.js";
 
 type BrowserSession = {
   browser: Browser;
   context: BrowserContext;
   page: Page;
+  conversationId: string;
   lastUsedAt: number;
+};
+
+type SessionParams = {
+  sessionId: string;
+  conversationId: string;
 };
 
 function summarizeText(text: string, maxLength = 6000) {
   return text.replace(/\s+/g, " ").trim().slice(0, maxLength);
 }
 
-export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
+async function assertSafeNavigationUrl(url: string) {
+  if (url === "about:blank") {
+    return;
+  }
+  await assertSafeOutboundUrl(url);
+}
+
+export function createBrowserRuntime(options?: {
+  idleTimeoutMs?: number;
+  launch?: typeof chromium.launch;
+}) {
   const idleTimeoutMs = options?.idleTimeoutMs ?? 5 * 60_000;
+  const launch = options?.launch ?? chromium.launch;
   const sessions = new Map<string, BrowserSession>();
 
-  async function closeSession(conversationId: string) {
-    const session = sessions.get(conversationId);
+  async function closeSession(sessionId: string) {
+    const session = sessions.get(sessionId);
     if (!session) {
       return;
     }
-    sessions.delete(conversationId);
+    sessions.delete(sessionId);
     await session.context.close().catch(() => undefined);
     await session.browser.close().catch(() => undefined);
   }
 
-  async function ensureSession(conversationId: string) {
-    const existing = sessions.get(conversationId);
+  async function closeConversationSessions(conversationId: string) {
+    const ids = [...sessions.entries()]
+      .filter(([, session]) => session.conversationId === conversationId)
+      .map(([sessionId]) => sessionId);
+    await Promise.all(ids.map((sessionId) => closeSession(sessionId)));
+  }
+
+  async function ensureSession(params: SessionParams) {
+    const existing = sessions.get(params.sessionId);
     if (existing) {
+      if (existing.conversationId !== params.conversationId) {
+        throw new Error("Browser session conversation mismatch.");
+      }
       existing.lastUsedAt = Date.now();
       return existing;
     }
 
     try {
-      const browser = await chromium.launch({
+      const browser = await launch({
         headless: true,
       });
       const context = await browser.newContext();
+      await context.route("**/*", async (route) => {
+        const request = route.request();
+        try {
+          await assertSafeNavigationUrl(request.url());
+          await route.continue();
+        } catch {
+          await route.abort("blockedbyclient").catch(() => undefined);
+        }
+      });
       const page = await context.newPage();
       const session = {
         browser,
         context,
         page,
+        conversationId: params.conversationId,
         lastUsedAt: Date.now(),
       } satisfies BrowserSession;
-      sessions.set(conversationId, session);
+      sessions.set(params.sessionId, session);
       return session;
     } catch (error) {
       throw new Error(
@@ -59,18 +97,23 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     const now = Date.now();
     const staleIds = [...sessions.entries()]
       .filter(([, session]) => now - session.lastUsedAt > idleTimeoutMs)
-      .map(([conversationId]) => conversationId);
-    for (const conversationId of staleIds) {
-      void closeSession(conversationId);
+      .map(([sessionId]) => sessionId);
+    for (const sessionId of staleIds) {
+      void closeSession(sessionId);
     }
   }
 
-  async function search(conversationId: string, query: string) {
-    const session = await ensureSession(conversationId);
-    await session.page.goto(`https://duckduckgo.com/?q=${encodeURIComponent(query)}`, {
+  async function search(params: SessionParams & { query: string; signal?: AbortSignal }) {
+    const session = await ensureSession(params);
+    const url = `https://duckduckgo.com/?q=${encodeURIComponent(params.query)}`;
+    await assertSafeOutboundUrl(url);
+    await session.page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: 45_000,
     });
+    if (params.signal?.aborted) {
+      throw params.signal.reason;
+    }
     await session.page.waitForTimeout(1_000);
     session.lastUsedAt = Date.now();
 
@@ -89,14 +132,13 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
       return candidates
         .map((link) => {
           const title = link.textContent?.replace(/\s+/g, " ").trim() ?? "";
-          const url =
-            typeof link.getAttribute("href") === "string" ? link.getAttribute("href") : "";
-          if (!title || !url) {
+          const urlValue = link.getAttribute("href") || "";
+          if (!title || !urlValue) {
             return null;
           }
           return {
             title,
-            url,
+            url: urlValue,
           };
         })
         .filter(Boolean)
@@ -104,18 +146,23 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     });
 
     return {
-      query,
+      query: params.query,
       url: session.page.url(),
       results,
     };
   }
 
-  async function open(conversationId: string, url: string) {
-    const session = await ensureSession(conversationId);
-    await session.page.goto(url, {
+  async function open(params: SessionParams & { url: string; signal?: AbortSignal }) {
+    await assertSafeOutboundUrl(params.url);
+    const session = await ensureSession(params);
+    await session.page.goto(params.url, {
       waitUntil: "domcontentloaded",
       timeout: 45_000,
     });
+    if (params.signal?.aborted) {
+      throw params.signal.reason;
+    }
+    await assertSafeNavigationUrl(session.page.url());
     session.lastUsedAt = Date.now();
     return {
       url: session.page.url(),
@@ -123,8 +170,8 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     };
   }
 
-  async function snapshot(conversationId: string) {
-    const session = await ensureSession(conversationId);
+  async function snapshot(params: SessionParams) {
+    const session = await ensureSession(params);
     session.lastUsedAt = Date.now();
     return {
       url: session.page.url(),
@@ -133,9 +180,9 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     };
   }
 
-  async function extract(conversationId: string, selector?: string) {
-    const session = await ensureSession(conversationId);
-    const locator = selector ? session.page.locator(selector).first() : session.page.locator("body");
+  async function extract(params: SessionParams & { selector?: string }) {
+    const session = await ensureSession(params);
+    const locator = params.selector ? session.page.locator(params.selector).first() : session.page.locator("body");
     session.lastUsedAt = Date.now();
     return {
       url: session.page.url(),
@@ -144,22 +191,13 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     };
   }
 
-  async function click(conversationId: string, selector: string) {
-    const session = await ensureSession(conversationId);
-    await session.page.locator(selector).first().click();
-    session.lastUsedAt = Date.now();
-    return {
-      url: session.page.url(),
-      title: await session.page.title(),
-    };
-  }
-
-  async function type(conversationId: string, selector: string, text: string, submit?: boolean) {
-    const session = await ensureSession(conversationId);
-    await session.page.locator(selector).first().fill(text);
-    if (submit) {
-      await session.page.locator(selector).first().press("Enter");
+  async function click(params: SessionParams & { selector: string; signal?: AbortSignal }) {
+    const session = await ensureSession(params);
+    await session.page.locator(params.selector).first().click();
+    if (params.signal?.aborted) {
+      throw params.signal.reason;
     }
+    await assertSafeNavigationUrl(session.page.url());
     session.lastUsedAt = Date.now();
     return {
       url: session.page.url(),
@@ -167,9 +205,30 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     };
   }
 
-  async function back(conversationId: string) {
-    const session = await ensureSession(conversationId);
+  async function type(params: SessionParams & { selector: string; text: string; submit?: boolean; signal?: AbortSignal }) {
+    const session = await ensureSession(params);
+    await session.page.locator(params.selector).first().fill(params.text);
+    if (params.submit) {
+      await session.page.locator(params.selector).first().press("Enter");
+    }
+    if (params.signal?.aborted) {
+      throw params.signal.reason;
+    }
+    await assertSafeNavigationUrl(session.page.url());
+    session.lastUsedAt = Date.now();
+    return {
+      url: session.page.url(),
+      title: await session.page.title(),
+    };
+  }
+
+  async function back(params: SessionParams & { signal?: AbortSignal }) {
+    const session = await ensureSession(params);
     await session.page.goBack({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => null);
+    if (params.signal?.aborted) {
+      throw params.signal.reason;
+    }
+    await assertSafeNavigationUrl(session.page.url());
     session.lastUsedAt = Date.now();
     return {
       url: session.page.url(),
@@ -177,7 +236,8 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     };
   }
 
-  setInterval(collectGarbage, Math.min(idleTimeoutMs, 60_000)).unref?.();
+  const interval = setInterval(collectGarbage, Math.min(idleTimeoutMs, 60_000));
+  interval.unref?.();
 
   return {
     ensureSession,
@@ -189,5 +249,7 @@ export function createBrowserRuntime(options?: { idleTimeoutMs?: number }) {
     type,
     back,
     closeSession,
+    closeConversationSessions,
+    getSessionCount: () => sessions.size,
   };
 }

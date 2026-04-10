@@ -1,10 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getModelOption } from "../model-catalog";
-import {
-  getReasoningLabel,
-  getReasoningOptions,
-  normalizeReasoningLevel,
-} from "../reasoning-options";
+import { getReasoningLabel, getReasoningOptions, normalizeReasoningLevel } from "../reasoning-options";
 import {
   providerKinds,
   providerLabels,
@@ -70,11 +66,9 @@ export function Composer(props: ComposerProps) {
       if (!(target instanceof Node)) {
         return;
       }
-
       if (modelPickerRef.current?.contains(target) || reasoningPickerRef.current?.contains(target)) {
         return;
       }
-
       setModelMenuOpen(false);
       setReasoningMenuOpen(false);
     };
@@ -109,7 +103,7 @@ export function Composer(props: ComposerProps) {
               props.onSend();
             }
           }}
-          placeholder="후속 변경 사항을 부탁해보세요"
+          placeholder="후속 변경 사항을 입력하세요"
         />
 
         <div className="composer__footer composer__footer--prompt">
@@ -150,9 +144,8 @@ export function Composer(props: ComposerProps) {
                   {providerKinds.map((kind) => {
                     const provider = providersByKind[kind];
                     const enabled = isProviderEnabled(provider);
-                    const baseModels = props.modelsByProvider[kind].map((model) =>
-                      getModelOption(kind, model),
-                    );
+                    const providerModels = props.modelsByProvider[kind] ?? [];
+                    const baseModels = providerModels.map((model) => getModelOption(kind, model));
 
                     if (
                       kind === props.providerKind &&
@@ -181,15 +174,11 @@ export function Composer(props: ComposerProps) {
 
                         <div className="composer-picker__section-options">
                           {baseModels.map((option) => {
-                            const selected =
-                              kind === props.providerKind && option.id === props.model;
-
+                            const selected = kind === props.providerKind && option.id === props.model;
                             return (
                               <button
                                 aria-selected={selected}
-                                className={`composer-picker__option ${
-                                  selected ? "is-selected" : ""
-                                }`}
+                                className={`composer-picker__option ${selected ? "is-selected" : ""}`}
                                 disabled={!enabled}
                                 key={`${kind}:${option.id}`}
                                 onClick={() => {
@@ -199,9 +188,7 @@ export function Composer(props: ComposerProps) {
                                 role="option"
                                 type="button"
                               >
-                                <span className="composer-picker__option-title">
-                                  {option.label}
-                                </span>
+                                <span className="composer-picker__option-title">{option.label}</span>
                                 <span className="composer-picker__option-note">{option.note}</span>
                               </button>
                             );

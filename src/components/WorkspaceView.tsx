@@ -7,144 +7,158 @@ import type {
 } from "../types";
 
 interface WorkspaceViewProps {
-  scope: WorkspaceScope;
-  tree: WorkspaceTreeNode[];
   file: WorkspaceFileRecord | null;
-  runs: WorkspaceRunRecord[];
-  runEvents: WorkspaceRunEventRecord[];
   loading: boolean;
   onScopeChange: (scope: WorkspaceScope) => void;
   onSelectFile: (path: string) => void;
+  onSelectRun: (runId: string) => void;
+  runEvents: WorkspaceRunEventRecord[];
+  runs: WorkspaceRunRecord[];
+  scope: WorkspaceScope;
+  selectedRunId: string | null;
+  tree: WorkspaceTreeNode[];
 }
 
-function TreeNode(props: {
-  node: WorkspaceTreeNode;
-  onSelectFile: (path: string) => void;
-}) {
-  if (props.node.kind === "file") {
+function formatTime(timestamp: number) {
+  return new Intl.DateTimeFormat("ko-KR", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(timestamp));
+}
+
+function renderTreeNode(node: WorkspaceTreeNode, onSelectFile: (path: string) => void) {
+  if (node.kind === "file") {
     return (
-      <li className="workspace-tree__node">
-        <button
-          className="workspace-tree__file"
-          onClick={() => props.onSelectFile(props.node.path)}
-          type="button"
-        >
-          {props.node.name}
+      <li key={node.path}>
+        <button className="workspace-tree__file" onClick={() => onSelectFile(node.path)} type="button">
+          {node.name}
         </button>
       </li>
     );
   }
 
   return (
-    <li className="workspace-tree__node">
-      <details className="workspace-tree__group" open>
-        <summary>{props.node.name}</summary>
-        {props.node.children?.length ? (
-          <ul className="workspace-tree__list">
-            {props.node.children.map((child) => (
-              <TreeNode key={child.path} node={child} onSelectFile={props.onSelectFile} />
-            ))}
-          </ul>
-        ) : (
-          <div className="workspace-tree__empty">빈 폴더</div>
-        )}
+    <li key={node.path}>
+      <details open>
+        <summary>{node.name}</summary>
+        <ul>{node.children?.map((child) => renderTreeNode(child, onSelectFile))}</ul>
       </details>
     </li>
   );
 }
 
-export function WorkspaceView(props: WorkspaceViewProps) {
-  return (
-    <section className="workspace-view">
-      <header className="workspace-view__header">
-        <div>
-          <p className="eyebrow">워크스페이스</p>
-          <h2>파일 탐색과 에이전트 실행 로그</h2>
-        </div>
+export function WorkspaceView({
+  file,
+  loading,
+  onScopeChange,
+  onSelectFile,
+  onSelectRun,
+  runEvents,
+  runs,
+  scope,
+  selectedRunId,
+  tree,
+}: WorkspaceViewProps) {
+  const selectedRun = runs.find((run) => run.id === selectedRunId) ?? null;
+  const eventsForSelectedRun = selectedRun ? runEvents : [];
 
-        <div className="workspace-view__scope-switch">
-          {(["sandbox", "shared", "root"] as const).map((scope) => (
-            <button
-              className={`workspace-view__scope-chip ${
-                props.scope === scope ? "is-active" : ""
-              }`}
-              key={scope}
-              onClick={() => props.onScopeChange(scope)}
-              type="button"
-            >
-              {scope === "sandbox" ? "대화 샌드박스" : scope === "shared" ? "공용" : "루트"}
-            </button>
-          ))}
+  return (
+    <div className="workspace-panel">
+      <header className="workspace-panel__header">
+        <div>
+          <h2>워크스페이스</h2>
+          <p>현재 대화의 샌드박스와 작업 기록을 확인합니다.</p>
+        </div>
+        <div className="workspace-panel__scope-switcher">
+          <button
+            aria-pressed={scope === "sandbox"}
+            onClick={() => onScopeChange("sandbox")}
+            type="button"
+          >
+            샌드박스
+          </button>
+          <button aria-pressed={scope === "shared"} onClick={() => onScopeChange("shared")} type="button">
+            공유
+          </button>
         </div>
       </header>
 
-      <div className="workspace-view__grid">
-        <section className="workspace-card workspace-card--tree">
-          <header className="workspace-card__header">
+      <div className="workspace-panel__content">
+        <aside className="workspace-panel__sidebar">
+          <section>
             <h3>파일 트리</h3>
-            {props.loading ? <span>불러오는 중...</span> : null}
-          </header>
+            {loading ? <p>불러오는 중...</p> : null}
+            {tree.length ? (
+              <ul className="workspace-tree">
+                {tree.map((node) => renderTreeNode(node, onSelectFile))}
+              </ul>
+            ) : (
+              <p>선택한 범위에 파일이 없습니다.</p>
+            )}
+          </section>
 
-          {props.tree.length ? (
-            <ul className="workspace-tree__list">
-              {props.tree.map((node) => (
-                <TreeNode key={node.path} node={node} onSelectFile={props.onSelectFile} />
+          <section>
+            <h3>실행 기록</h3>
+            <ul className="workspace-runs">
+              {runs.map((run) => (
+                <li key={run.id}>
+                  <button
+                    aria-pressed={run.id === selectedRunId}
+                    className={`workspace-run${run.id === selectedRunId ? " is-active" : ""}`}
+                    onClick={() => onSelectRun(run.id)}
+                    type="button"
+                  >
+                    <strong>{run.model}</strong>
+                    <span>{run.providerKind}</span>
+                    <small>{run.userMessage}</small>
+                    <small>
+                      {run.status} / {formatTime(run.createdAt)}
+                    </small>
+                  </button>
+                </li>
               ))}
             </ul>
-          ) : (
-            <div className="workspace-card__empty">표시할 파일이 없습니다.</div>
-          )}
-        </section>
+          </section>
+        </aside>
 
-        <section className="workspace-card workspace-card--preview">
-          <header className="workspace-card__header">
+        <section className="workspace-panel__preview">
+          <div className="workspace-preview">
             <h3>파일 미리보기</h3>
-            <span>{props.file?.path ?? "파일을 선택하세요"}</span>
-          </header>
-
-          {props.file ? (
-            props.file.binary ? (
-              <div className="workspace-card__empty">바이너리 파일은 미리보기를 지원하지 않습니다.</div>
+            {file ? (
+              <article>
+                <p>{file.path}</p>
+                {file.binary ? <p>바이너리 파일입니다.</p> : null}
+                {file.unsupportedEncoding ? <p>지원되지 않는 인코딩입니다.</p> : null}
+                {!file.binary && !file.unsupportedEncoding ? <pre>{file.content}</pre> : null}
+              </article>
             ) : (
-              <pre className="workspace-preview">{props.file.content}</pre>
-            )
-          ) : (
-            <div className="workspace-card__empty">왼쪽에서 파일을 선택하면 내용을 볼 수 있습니다.</div>
-          )}
-        </section>
-
-        <section className="workspace-card workspace-card--runs">
-          <header className="workspace-card__header">
-            <h3>에이전트 로그</h3>
-            <span>{props.runs.length}개 실행</span>
-          </header>
-
-          <div className="workspace-runs">
-            {props.runs.length ? (
-              props.runs.map((run) => (
-                <article className="workspace-run" key={run.id}>
-                  <div className="workspace-run__top">
-                    <strong>{run.model}</strong>
-                    <span>{run.status}</span>
-                  </div>
-                  <p className="workspace-run__message">{run.userMessage}</p>
-                </article>
-              ))
-            ) : (
-              <div className="workspace-card__empty">아직 실행 로그가 없습니다.</div>
+              <p>파일을 선택해주세요.</p>
             )}
           </div>
 
-          <div className="workspace-events">
-            {props.runEvents.map((event) => (
-              <article className="workspace-event" key={event.id}>
-                <strong>{event.eventType}</strong>
-                <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+          <div className="workspace-preview">
+            <h3>선택한 실행</h3>
+            {selectedRun ? (
+              <article>
+                <p>
+                  {selectedRun.providerKind} / {selectedRun.model} / {selectedRun.status}
+                </p>
+                <p>{selectedRun.userMessage}</p>
+                <ul className="workspace-run-events">
+                  {eventsForSelectedRun.map((event) => (
+                    <li key={event.id}>
+                      <strong>{event.eventType}</strong>
+                      <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                    </li>
+                  ))}
+                </ul>
               </article>
-            ))}
+            ) : (
+              <p>실행 기록을 선택해주세요.</p>
+            )}
           </div>
         </section>
       </div>
-    </section>
+    </div>
   );
 }

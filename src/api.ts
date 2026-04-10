@@ -84,12 +84,9 @@ export async function startCodexOAuth(frontendOrigin: string) {
 }
 
 export async function importCodexCliAuth() {
-  return apiRequest<{ provider: ProviderSummary }>(
-    "/api/providers/openai-codex/import-cli-auth",
-    {
-      method: "POST",
-    },
-  );
+  return apiRequest<{ provider: ProviderSummary }>("/api/providers/openai-codex/import-cli-auth", {
+    method: "POST",
+  });
 }
 
 export async function logoutCodex() {
@@ -98,8 +95,8 @@ export async function logoutCodex() {
   });
 }
 
-export async function listConversations() {
-  return apiRequest<{ conversations: ConversationRecord[] }>("/api/conversations");
+export async function listConversations(signal?: AbortSignal) {
+  return apiRequest<{ conversations: ConversationRecord[] }>("/api/conversations", { signal });
 }
 
 export async function deleteConversation(conversationId: string) {
@@ -121,11 +118,11 @@ export async function saveConversation(payload: {
   });
 }
 
-export async function getConversationMessages(conversationId: string) {
+export async function getConversationMessages(conversationId: string, signal?: AbortSignal) {
   return apiRequest<{
     conversation: ConversationRecord;
     messages: MessageRecord[];
-  }>(`/api/conversations/${conversationId}/messages`);
+  }>(`/api/conversations/${conversationId}/messages`, { signal });
 }
 
 export async function getWorkspaceTree(params: {
@@ -133,6 +130,7 @@ export async function getWorkspaceTree(params: {
   scope: WorkspaceScope;
   path?: string;
   maxDepth?: number;
+  signal?: AbortSignal;
 }) {
   const searchParams = new URLSearchParams({
     conversationId: params.conversationId,
@@ -148,14 +146,14 @@ export async function getWorkspaceTree(params: {
     scope: WorkspaceScope;
     path: string;
     tree: WorkspaceTreeNode[];
-    workspaceRoot: string;
-  }>(`/api/workspace/tree?${searchParams.toString()}`);
+  }>(`/api/workspace/tree?${searchParams.toString()}`, { signal: params.signal });
 }
 
 export async function getWorkspaceFile(params: {
   conversationId: string;
   scope: WorkspaceScope;
   path: string;
+  signal?: AbortSignal;
 }) {
   const searchParams = new URLSearchParams({
     conversationId: params.conversationId,
@@ -164,18 +162,30 @@ export async function getWorkspaceFile(params: {
   });
   return apiRequest<{
     file: WorkspaceFileRecord;
-  }>(`/api/workspace/file?${searchParams.toString()}`);
+  }>(`/api/workspace/file?${searchParams.toString()}`, { signal: params.signal });
 }
 
-export async function listWorkspaceRuns(conversationId: string) {
+export async function listWorkspaceRuns(
+  conversationId: string,
+  signal?: AbortSignal,
+) {
   return apiRequest<{ runs: WorkspaceRunRecord[] }>(
     `/api/workspace/runs?conversationId=${encodeURIComponent(conversationId)}`,
+    { signal },
   );
 }
 
-export async function listWorkspaceRunEvents(runId: string) {
+export async function listWorkspaceRunEvents(
+  conversationId: string,
+  runId: string,
+  signal?: AbortSignal,
+) {
+  const searchParams = new URLSearchParams({
+    conversationId,
+  });
   return apiRequest<{ events: WorkspaceRunEventRecord[] }>(
-    `/api/workspace/runs/${encodeURIComponent(runId)}/events`,
+    `/api/workspace/runs/${encodeURIComponent(runId)}/events?${searchParams.toString()}`,
+    { signal },
   );
 }
 
@@ -208,6 +218,7 @@ export async function streamChat(
     eventName: K,
     eventPayload: StreamEventPayloadMap[K],
   ) => void,
+  signal?: AbortSignal,
 ) {
   const response = await fetch("/api/chat/stream", {
     method: "POST",
@@ -215,6 +226,7 @@ export async function streamChat(
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal,
   });
 
   if (!response.ok) {

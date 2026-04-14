@@ -48,6 +48,40 @@ function createFakeJwt(payload: Record<string, unknown>) {
   return `${encode({ alg: "HS256", typ: "JWT" })}.${encode(payload)}.signature`;
 }
 
+function createOpenAiResponsesFetchMock() {
+  return vi.fn(async (input: string | URL, init?: RequestInit) => {
+    const url = input.toString();
+    if (url !== "https://api.openai.com/v1/responses") {
+      throw new Error(`Unhandled fetch ${url}`);
+    }
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as { stream?: boolean };
+    if (body.stream) {
+      return textResponse(
+        [
+          "event: delta",
+          'data: {"type":"response.output_text.delta","delta":"done"}',
+          "",
+          "event: done",
+          "data: {}",
+          "",
+        ].join("\n"),
+        {
+          headers: {
+            "Content-Type": "text/event-stream",
+          },
+        },
+      );
+    }
+
+    return jsonResponse({
+      output_text: JSON.stringify({
+        type: "final_answer",
+      }),
+    });
+  });
+}
+
 describe("createApp", () => {
   let dataDir: string;
   let originalCodexHome: string | undefined;
@@ -131,6 +165,76 @@ describe("createApp", () => {
     ]);
   });
 
+  it("exposes normalized channels, plugin manifests, and agent skill summaries", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const toolsResponse = await request(app).get("/api/tools");
+    expect(toolsResponse.status).toBe(200);
+    expect(toolsResponse.body.tools).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "list_tree",
+          description: "List files and folders in a workspace scope.",
+          permission: "workspace",
+          audit: expect.objectContaining({
+            category: "unknown",
+            safeByDefault: true,
+          }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(toolsResponse.body)).not.toContain("execute");
+
+    const channelsResponse = await request(app).get("/api/channels");
+    expect(channelsResponse.status).toBe(200);
+    expect(channelsResponse.body.channels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "webchat",
+          label: "Web Chat",
+          enabled: true,
+          description: "Browser-based local chat channel.",
+          note: "Primary channel for local conversations.",
+        }),
+      ]),
+    );
+
+    const pluginsResponse = await request(app).get("/api/plugins");
+    expect(pluginsResponse.status).toBe(200);
+    expect(pluginsResponse.body.plugins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "core",
+          name: "Core Tools",
+          description: "Built-in workspace, research, memory, task, and execution tools.",
+          tools: expect.arrayContaining(["list_tree", "exec_command", "spawn_task"]),
+          skills: expect.arrayContaining([
+            expect.objectContaining({
+              name: "workspace-runtime",
+              summary: expect.stringContaining("Core runtime guidance"),
+            }),
+          ]),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(pluginsResponse.body)).not.toContain("Use the sandbox files");
+
+    const skillsResponse = await request(app).get("/api/agents/default-agent/skills");
+    expect(skillsResponse.status).toBe(200);
+    expect(skillsResponse.body.agentId).toBe("default-agent");
+    expect(skillsResponse.body.skills).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "plugin",
+          name: "workspace-runtime",
+          summary: expect.stringContaining("Core runtime guidance"),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(skillsResponse.body)).not.toContain("Use the sandbox files");
+  });
+
   it("creates agents, scopes sessions, and exposes explicit memory files", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
@@ -176,6 +280,289 @@ describe("createApp", () => {
     expect(memoryResponse.status).toBe(200);
     expect(memoryResponse.body.memory.durableMemoryPath).toBe("MEMORY.md");
     expect(JSON.stringify(memoryResponse.body)).not.toContain(dataDir);
+
+    const memorySearchResponse = await request(app).get(
+      `/api/agents/${agentId}/memory/search?query=${encodeURIComponent("Korean summaries")}&maxResults=5`,
+    );
+    expect(memorySearchResponse.status).toBe(200);
+    expect(memorySearchResponse.body.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "MEMORY.md",
+          kind: "durable",
+        }),
+      ]),
+    );
+  });
+
+  it("exposes soul and heartbeat routes and records manual heartbeat triggers", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const createAgentResponse = await request(app)
+      .post("/api/agents")
+      .send({
+        name: "Heartbeat Agent",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "high",
+      });
+    expect(createAgentResponse.status).toBe(200);
+    const agentId = createAgentResponse.body.agent.id as string;
+
+    const soulResponse = await request(app).get(`/api/agents/${agentId}/soul`);
+    expect(soulResponse.status).toBe(200);
+    expect(soulResponse.body.soul).toEqual(
+      expect.objectContaining({
+        path: "SOUL.md",
+        content: expect.stringContaining("# SOUL"),
+      }),
+    );
+
+    const writeSoulResponse = await request(app)
+      .put(`/api/agents/${agentId}/soul`)
+      .send({ content: "# SOUL\n\nKeep it simple." });
+    expect(writeSoulResponse.status).toBe(200);
+    expect(writeSoulResponse.body.soul.content).toContain("Keep it simple.");
+
+    const heartbeatResponse = await request(app).get(`/api/agents/${agentId}/heartbeat`);
+    expect(heartbeatResponse.status).toBe(200);
+    expect(heartbeatResponse.body.heartbeat).toEqual(
+      expect.objectContaining({
+        path: "HEARTBEAT.md",
+        enabled: false,
+        intervalMinutes: 60,
+        lastRun: null,
+      }),
+    );
+
+    const writeHeartbeatResponse = await request(app)
+      .put(`/api/agents/${agentId}/heartbeat`)
+      .send({
+        enabled: true,
+        intervalMinutes: 15,
+        lastRun: null,
+        instructions: "Check inbox and summarize changes.",
+      });
+    expect(writeHeartbeatResponse.status).toBe(200);
+    expect(writeHeartbeatResponse.body.heartbeat).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        intervalMinutes: 15,
+        instructions: "Check inbox and summarize changes.",
+      }),
+    );
+
+    const triggerResponse = await request(app).post(`/api/agents/${agentId}/heartbeat/trigger`);
+    expect(triggerResponse.status).toBe(200);
+    expect(triggerResponse.body.task).toEqual(
+      expect.objectContaining({
+        taskKind: "heartbeat",
+        title: `Heartbeat: Heartbeat Agent`,
+        parentTaskId: null,
+      }),
+    );
+    expect(triggerResponse.body.heartbeatLog).toEqual(
+      expect.objectContaining({
+        agentId,
+        triggerSource: "manual",
+        status: "queued",
+        taskId: triggerResponse.body.task.id,
+      }),
+    );
+    expect(triggerResponse.body.heartbeat.lastRun).toBeTruthy();
+
+    const logsResponse = await request(app).get(`/api/agents/${agentId}/heartbeat/logs`);
+    expect(logsResponse.status).toBe(200);
+    expect(logsResponse.body.logs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskId: triggerResponse.body.task.id,
+          triggerSource: "manual",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(logsResponse.body)).not.toContain(dataDir);
+  });
+
+  it("manages standing orders, sub-agent sessions, task flows, and run control routes", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const agent = store.saveAgent({
+      name: "Coordinator",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const conversation = store.saveConversation({
+      agentId: agent.id,
+      title: "Parent session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const parentRun = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: conversation.providerKind,
+      model: conversation.model,
+      userMessage: "Coordinate work",
+    });
+
+    const getStandingOrdersResponse = await request(app).get(
+      `/api/agents/${agent.id}/standing-orders`,
+    );
+    expect(getStandingOrdersResponse.status).toBe(200);
+    expect(getStandingOrdersResponse.body.standingOrders.path).toBe("STANDING_ORDERS.md");
+
+    const putStandingOrdersResponse = await request(app)
+      .put(`/api/agents/${agent.id}/standing-orders`)
+      .send({ content: "# Standing Orders\n\nAlways summarize child work clearly." });
+    expect(putStandingOrdersResponse.status).toBe(200);
+    expect(putStandingOrdersResponse.body.standingOrders.content).toContain("summarize child work");
+
+    const createSubagentResponse = await request(app)
+      .post(`/api/sessions/${conversation.id}/subagents`)
+      .send({
+        title: "Investigate tests",
+        prompt: "Inspect the test failures and summarize them.",
+      });
+    expect(createSubagentResponse.status).toBe(200);
+    expect(createSubagentResponse.body.session).toEqual(
+      expect.objectContaining({
+        sessionKind: "subagent",
+        parentConversationId: conversation.id,
+        ownerRunId: parentRun.id,
+      }),
+    );
+
+    const listSubagentsResponse = await request(app).get(`/api/sessions/${conversation.id}/subagents`);
+    expect(listSubagentsResponse.status).toBe(200);
+    expect(listSubagentsResponse.body.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: createSubagentResponse.body.session.id,
+          sessionKind: "subagent",
+        }),
+      ]),
+    );
+
+    const createFlowResponse = await request(app)
+      .post(`/api/agents/${agent.id}/flows`)
+      .send({
+        conversationId: conversation.id,
+        title: "Patch flow",
+        steps: [
+          {
+            stepKey: "inspect",
+            title: "Inspect",
+            prompt: "Inspect the current state.",
+          },
+          {
+            stepKey: "summarize",
+            title: "Summarize",
+            prompt: "Summarize the inspection.",
+            dependencyStepKey: "inspect",
+          },
+        ],
+      });
+    expect(createFlowResponse.status).toBe(200);
+    expect(createFlowResponse.body.flow).toEqual(
+      expect.objectContaining({
+        agentId: agent.id,
+        conversationId: conversation.id,
+        title: "Patch flow",
+      }),
+    );
+    expect(createFlowResponse.body.steps).toHaveLength(2);
+
+    const getFlowResponse = await request(app).get(`/api/flows/${createFlowResponse.body.flow.id}`);
+    expect(getFlowResponse.status).toBe(200);
+    expect(getFlowResponse.body.steps).toHaveLength(2);
+
+    const cancelFlowResponse = await request(app).post(
+      `/api/flows/${createFlowResponse.body.flow.id}/cancel`,
+    );
+    expect(cancelFlowResponse.status).toBe(200);
+    expect(cancelFlowResponse.body.flow).toEqual(
+      expect.objectContaining({
+        id: createFlowResponse.body.flow.id,
+      }),
+    );
+
+    const detachedTask = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Later",
+      prompt: "Finish later",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      taskKind: "scheduled",
+      scheduledFor: Date.now() + 60_000,
+    });
+    const taskBackedRun = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      taskId: detachedTask.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Resume later",
+      phase: "planning",
+      checkpoint: {
+        stepIndex: 1,
+        maxSteps: 8,
+        userMessage: "Resume later",
+        toolHistory: [],
+        changedFiles: [],
+        runMode: "foreground",
+        lastToolName: null,
+      },
+    });
+
+    const getRunResponse = await request(app).get(`/api/runs/${taskBackedRun.id}`);
+    expect(getRunResponse.status).toBe(200);
+    expect(getRunResponse.body.run).toEqual(
+      expect.objectContaining({
+        id: taskBackedRun.id,
+        taskId: detachedTask.id,
+        phase: "planning",
+      }),
+    );
+
+    const cancelRunResponse = await request(app).post(`/api/runs/${taskBackedRun.id}/cancel`);
+    expect(cancelRunResponse.status).toBe(200);
+    expect(cancelRunResponse.body.task).toEqual(
+      expect.objectContaining({
+        id: detachedTask.id,
+      }),
+    );
+
+    const resumableRun = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Pick this back up",
+      phase: "planning",
+      checkpoint: {
+        stepIndex: 2,
+        maxSteps: 8,
+        userMessage: "Pick this back up",
+        toolHistory: [{ tool: "list_tree", result: "[]" }],
+        changedFiles: [],
+        runMode: "foreground",
+        lastToolName: "list_tree",
+      },
+    });
+    store.completeWorkspaceRun(resumableRun.id, "failed");
+
+    const resumeRunResponse = await request(app).post(`/api/runs/${resumableRun.id}/resume`);
+    expect(resumeRunResponse.status).toBe(200);
+    expect(resumeRunResponse.body.task).toEqual(
+      expect.objectContaining({
+        taskKind: "continuation",
+        originRunId: resumableRun.id,
+      }),
+    );
   });
 
   it("records detached task lifecycle and enforces task-event ownership", async () => {
@@ -627,6 +1014,314 @@ describe("createApp", () => {
     );
     expect(rightResponse.status).toBe(200);
     expect(rightResponse.body.events.length).toBeGreaterThan(0);
+  });
+
+  it("reads standing orders, searches agent memory, and lists sub-agent sessions", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const standingOrdersResponse = await request(app)
+      .put("/api/agents/default-agent/standing-orders")
+      .send({ content: "# Standing Orders\n\n- Keep replies concise.\n- Cite workspace state." });
+    expect(standingOrdersResponse.status).toBe(200);
+    expect(standingOrdersResponse.body.standingOrders).toEqual(
+      expect.objectContaining({
+        path: "STANDING_ORDERS.md",
+        content: expect.stringContaining("Keep replies concise"),
+      }),
+    );
+
+    const standingOrdersGetResponse = await request(app).get("/api/agents/default-agent/standing-orders");
+    expect(standingOrdersGetResponse.status).toBe(200);
+    expect(standingOrdersGetResponse.body.standingOrders.content).toContain("Cite workspace state");
+
+    const memoryWriteResponse = await request(app)
+      .post("/api/agents/default-agent/memory")
+      .send({ content: "User prefers Korean summaries.", target: "durable" });
+    expect(memoryWriteResponse.status).toBe(200);
+
+    const memorySearchResponse = await request(app).get(
+      "/api/agents/default-agent/memory/search?query=Korean&maxResults=5",
+    );
+    expect(memorySearchResponse.status).toBe(200);
+    expect(memorySearchResponse.body.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "MEMORY.md",
+          text: expect.stringContaining("Korean"),
+        }),
+      ]),
+    );
+
+    const parentConversation = store.saveConversation({
+      title: "Parent session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const childConversation = store.saveConversation({
+      agentId: parentConversation.agentId,
+      title: "Child session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      sessionKind: "subagent",
+      parentConversationId: parentConversation.id,
+      ownerRunId: "run-123",
+    });
+
+    const subagentSessionsResponse = await request(app).get(
+      `/api/sessions/${parentConversation.id}/subagents`,
+    );
+    expect(subagentSessionsResponse.status).toBe(200);
+    expect(subagentSessionsResponse.body.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: childConversation.id,
+          sessionKind: "subagent",
+          parentConversationId: parentConversation.id,
+        }),
+      ]),
+    );
+  });
+
+  it("creates flows, exposes them through the flow APIs, and lets them complete", async () => {
+    const fetchMock = createOpenAiResponsesFetchMock();
+    const { app, store } = createApp({
+      dataDir,
+      projectRoot: dataDir,
+      fetchImpl: fetchMock as typeof fetch,
+    });
+    openStores.push(store);
+
+    await request(app).put("/api/providers/openai/account").send({ apiKey: "sk-flow" });
+    const conversationResponse = await request(app)
+      .post("/api/conversations")
+      .send({
+        title: "Flow session",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+    const conversationId = conversationResponse.body.conversation.id as string;
+
+    const createFlowResponse = await request(app)
+      .post("/api/agents/default-agent/flows")
+      .send({
+        conversationId,
+        title: "Ship patch",
+        steps: [
+          {
+            stepKey: "inspect",
+            title: "Inspect repo",
+            prompt: "Inspect the repo and report the current state.",
+          },
+        ],
+      });
+
+    expect(createFlowResponse.status).toBe(200);
+    const flowId = createFlowResponse.body.flow.id as string;
+    expect(createFlowResponse.body.steps).toHaveLength(1);
+
+    await vi.waitFor(() => {
+      expect(store.getTaskFlow(flowId)?.status).toBe("completed");
+    });
+
+    const agentFlowsResponse = await request(app).get("/api/agents/default-agent/flows");
+    expect(agentFlowsResponse.status).toBe(200);
+    expect(agentFlowsResponse.body.flows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: flowId,
+          status: "completed",
+        }),
+      ]),
+    );
+
+    const flowResponse = await request(app).get(`/api/flows/${flowId}`);
+    expect(flowResponse.status).toBe(200);
+    expect(flowResponse.body.flow).toEqual(
+      expect.objectContaining({
+        id: flowId,
+        status: "completed",
+      }),
+    );
+    expect(flowResponse.body.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stepKey: "inspect",
+          status: "completed",
+        }),
+      ]),
+    );
+  });
+
+  it("returns run details, cancels task-backed runs, and resumes from checkpoints", async () => {
+    const fetchMock = createOpenAiResponsesFetchMock();
+    const { app, store } = createApp({
+      dataDir,
+      projectRoot: dataDir,
+      fetchImpl: fetchMock as typeof fetch,
+    });
+    openStores.push(store);
+
+    await request(app).put("/api/providers/openai/account").send({ apiKey: "sk-run" });
+
+    const cancelConversation = store.saveConversation({
+      title: "Cancel session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const cancelTask = store.createTask({
+      agentId: cancelConversation.agentId,
+      conversationId: cancelConversation.id,
+      title: "Queued work",
+      prompt: "Do this later",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const cancelRun = store.createWorkspaceRun({
+      conversationId: cancelConversation.id,
+      taskId: cancelTask.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Do this later",
+      checkpoint: {
+        stepIndex: 0,
+        maxSteps: 4,
+        userMessage: "Do this later",
+        toolHistory: [],
+        changedFiles: [],
+        runMode: "foreground",
+        lastToolName: null,
+      },
+    });
+
+    const runResponse = await request(app).get(`/api/runs/${cancelRun.id}`);
+    expect(runResponse.status).toBe(200);
+    expect(runResponse.body.run).toEqual(
+      expect.objectContaining({
+        id: cancelRun.id,
+        taskId: cancelTask.id,
+      }),
+    );
+
+    const cancelResponse = await request(app).post(`/api/runs/${cancelRun.id}/cancel`);
+    expect(cancelResponse.status).toBe(200);
+    expect(cancelResponse.body.task.status).toBe("cancelled");
+
+    const resumeConversation = store.saveConversation({
+      title: "Resume session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const resumeRun = store.createWorkspaceRun({
+      conversationId: resumeConversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Finish the draft",
+      checkpoint: {
+        stepIndex: 2,
+        maxSteps: 4,
+        userMessage: "Finish the draft",
+        toolHistory: [
+          {
+            tool: "list_tree",
+            result: "workspace listed",
+          },
+        ],
+        changedFiles: ["notes.txt"],
+        runMode: "foreground",
+        lastToolName: "list_tree",
+      },
+    });
+    store.finalizeWorkspaceRun(resumeRun.id, "failed", "run_failed", { error: "boom" });
+
+    const resumeResponse = await request(app).post(`/api/runs/${resumeRun.id}/resume`);
+    expect(resumeResponse.status).toBe(200);
+    expect(resumeResponse.body.task).toEqual(
+      expect.objectContaining({
+        taskKind: "continuation",
+        originRunId: resumeRun.id,
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(store.getTask(resumeResponse.body.task.id)?.status).toBe("completed");
+    });
+  });
+
+  it("spawns sub-agent sessions and records their completion in the parent session", async () => {
+    const fetchMock = createOpenAiResponsesFetchMock();
+    const { app, store } = createApp({
+      dataDir,
+      projectRoot: dataDir,
+      fetchImpl: fetchMock as typeof fetch,
+    });
+    openStores.push(store);
+
+    await request(app).put("/api/providers/openai/account").send({ apiKey: "sk-subagent" });
+
+    const parentConversation = store.saveConversation({
+      title: "Parent session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const parentRun = store.createWorkspaceRun({
+      conversationId: parentConversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Investigate the repo",
+    });
+
+    const spawnResponse = await request(app)
+      .post(`/api/sessions/${parentConversation.id}/subagents`)
+      .send({
+        title: "Investigate tests",
+        prompt: "Inspect the failing tests and summarize the root cause.",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+
+    expect(spawnResponse.status).toBe(200);
+    expect(spawnResponse.body.session).toEqual(
+      expect.objectContaining({
+        sessionKind: "subagent",
+        parentConversationId: parentConversation.id,
+        ownerRunId: parentRun.id,
+      }),
+    );
+
+    await vi.waitFor(() => {
+      const childMessages = store.listMessages(parentConversation.id);
+      expect(childMessages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role: "assistant",
+            content: expect.stringContaining("[Sub-agent complete:"),
+          }),
+        ]),
+      );
+    });
+
+    const cancelConversation = store.saveConversation({
+      agentId: parentConversation.agentId,
+      title: "Idle subagent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      sessionKind: "subagent",
+      parentConversationId: parentConversation.id,
+      ownerRunId: parentRun.id,
+    });
+    const cancelResponse = await request(app).post(`/api/subagents/${cancelConversation.id}/cancel`);
+    expect(cancelResponse.status).toBe(200);
+    expect(cancelResponse.body).toEqual({ ok: true, task: null });
   });
 
   it("marks a streamed run cancelled when the client disconnects", async () => {

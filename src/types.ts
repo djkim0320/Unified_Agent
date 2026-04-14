@@ -13,6 +13,14 @@ export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type WorkspaceScope = "sandbox" | "shared" | "root";
 export type ChannelKind = "webchat";
 export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
+export type TaskKind = "detached" | "heartbeat" | "continuation" | "scheduled";
+export type ToolPermission =
+  | "workspace"
+  | "memory"
+  | "network"
+  | "browser"
+  | "exec"
+  | "tasks";
 export type TaskStatus =
   | "queued"
   | "running"
@@ -20,6 +28,8 @@ export type TaskStatus =
   | "failed"
   | "timed_out"
   | "cancelled";
+export type HeartbeatLogStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type HeartbeatTriggerSource = "manual" | "scheduler";
 
 export interface AgentRecord {
   id: string;
@@ -36,6 +46,9 @@ export interface ConversationRecord {
   agentId?: string;
   title: string;
   channelKind?: ChannelKind;
+  sessionKind: string;
+  parentConversationId: string | null;
+  ownerRunId: string | null;
   providerKind: ProviderKind;
   model: string;
   reasoningLevel: ReasoningLevel;
@@ -67,6 +80,98 @@ export interface ProviderDraft {
   baseUrl: string;
 }
 
+export interface ToolDescriptor {
+  name: string;
+  description: string;
+  permission: ToolPermission;
+  risk: string;
+  costHint: string | null;
+  concurrencyClass: string | null;
+  batchable: boolean;
+  rolePolicy: string | null;
+  example?: string;
+  audit?: {
+    category: string;
+    safeByDefault: boolean;
+  };
+}
+
+export interface StandingOrdersRecord {
+  path: string;
+  content: string;
+}
+
+export interface MemorySearchResult {
+  path?: string;
+  content?: string;
+  excerpt?: string;
+  score?: number;
+  title?: string;
+  line?: number;
+  agentId?: string;
+  updatedAt?: number;
+}
+
+export interface TaskFlowRecord {
+  id: string;
+  agentId: string;
+  conversationId: string | null;
+  title: string;
+  status: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TaskFlowStepRecord {
+  id: string;
+  flowId: string;
+  stepKey: string;
+  title: string;
+  prompt: string;
+  dependencyStepKey: string | null;
+  status: string | null;
+  taskId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PluginSkillSummary {
+  name: string;
+  summary?: string | null;
+}
+
+export interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  tools: string[];
+  skills: PluginSkillSummary[];
+}
+
+export interface AgentSkillSummary {
+  id: string;
+  name: string;
+  source: "agent" | "shared" | "plugin";
+  summary: string;
+  pluginId: string | null;
+}
+
+export interface ChannelSummary {
+  kind: ChannelKind | string;
+  label: string;
+  description?: string;
+  enabled: boolean;
+  note?: string | null;
+}
+
+export interface PlatformMetadata {
+  plugins: PluginManifest[];
+  tools: ToolDescriptor[];
+  channels: ChannelSummary[];
+  agentSkills?: AgentSkillSummary[];
+}
+
 export interface WorkspaceTreeNode {
   name: string;
   path: string;
@@ -87,7 +192,11 @@ export interface WorkspaceFileRecord {
 export interface WorkspaceRunRecord {
   id: string;
   conversationId: string;
-  taskId?: string | null;
+  taskId: string | null;
+  parentRunId: string | null;
+  phase: string | null;
+  checkpoint: string | null;
+  resumeToken: string | null;
   providerKind: ProviderKind;
   model: string;
   userMessage: string;
@@ -116,6 +225,12 @@ export interface TaskRecord {
   agentId: string;
   conversationId: string;
   runId: string | null;
+  taskFlowId: string | null;
+  flowStepKey: string | null;
+  originRunId: string | null;
+  taskKind: TaskKind;
+  parentTaskId: string | null;
+  nestingDepth: number;
   title: string;
   prompt: string;
   providerKind: ProviderKind;
@@ -144,6 +259,36 @@ export interface TaskEventRecord {
     | "result_delivered";
   payload: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface AgentSoulRecord {
+  path: string;
+  content: string;
+}
+
+export interface AgentHeartbeatRecord {
+  path: string;
+  content: string;
+  enabled: boolean;
+  intervalMinutes: number;
+  lastRun: string | null;
+  instructions: string;
+  parseError: string | null;
+}
+
+export interface HeartbeatLogRecord {
+  id: string;
+  agentId: string;
+  conversationId: string;
+  taskId: string | null;
+  triggerSource: HeartbeatTriggerSource;
+  status: HeartbeatLogStatus;
+  summary: string | null;
+  errorText: string | null;
+  triggeredAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  updatedAt: number;
 }
 
 export interface AgentMemorySnapshot {

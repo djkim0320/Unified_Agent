@@ -6,15 +6,27 @@ import { createSecretBox } from "./lib/crypto.js";
 import type {
   AgentRecord,
   ConversationRecord,
+  HeartbeatLogRecord,
+  HeartbeatTriggerSource,
+  MemorySearchResult,
   MessageRecord,
   ProviderAccountRecord,
   ProviderKind,
   ProviderSecret,
   ReasoningLevel,
+  RunCheckpoint,
+  SessionKind,
+  TaskKind,
+  TaskFlowRecord,
+  TaskFlowStatus,
+  TaskFlowStepRecord,
+  TaskFlowStepStatus,
+  TaskFlowTriggerSource,
   TaskEventRecord,
   TaskRecord,
   TaskStatus,
   WorkspaceRunEventRecord,
+  WorkspaceRunPhase,
   WorkspaceRunRecord,
   WorkspaceRunStatus,
 } from "./types.js";
@@ -50,6 +62,9 @@ type ConversationRow = {
   id: string;
   agent_id: string;
   channel_kind: ConversationRecord["channelKind"];
+  session_kind: SessionKind;
+  parent_conversation_id: string | null;
+  owner_run_id: string | null;
   title: string;
   provider_kind: ProviderKind;
   model: string;
@@ -69,10 +84,15 @@ type MessageRow = {
 type WorkspaceRunRow = {
   id: string;
   conversation_id: string;
+  task_id: string | null;
+  parent_run_id: string | null;
   provider_kind: ProviderKind;
   model: string;
   user_message: string;
   status: WorkspaceRunStatus;
+  phase: WorkspaceRunPhase;
+  checkpoint_json: string | null;
+  resume_token: string | null;
   created_at: number;
   updated_at: number;
 };
@@ -89,6 +109,12 @@ type TaskRow = {
   id: string;
   agent_id: string;
   conversation_id: string;
+  task_kind: TaskKind;
+  task_flow_id: string | null;
+  flow_step_key: string | null;
+  origin_run_id: string | null;
+  parent_task_id: string | null;
+  nesting_depth: number;
   title: string;
   prompt: string;
   provider_kind: ProviderKind;
@@ -104,12 +130,56 @@ type TaskRow = {
   scheduled_for: number | null;
 };
 
+type TaskFlowRow = {
+  id: string;
+  agent_id: string;
+  conversation_id: string;
+  origin_run_id: string | null;
+  trigger_source: TaskFlowTriggerSource;
+  title: string;
+  status: TaskFlowStatus;
+  result_summary: string | null;
+  error_text: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+};
+
+type TaskFlowStepRow = {
+  id: string;
+  flow_id: string;
+  task_id: string | null;
+  step_key: string;
+  dependency_step_key: string | null;
+  title: string;
+  prompt: string;
+  status: TaskFlowStepStatus;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+};
+
 type TaskEventRow = {
   id: string;
   task_id: string;
   event_type: TaskEventRecord["eventType"];
   payload_json: string;
   created_at: number;
+};
+
+type HeartbeatLogRow = {
+  id: string;
+  agent_id: string;
+  conversation_id: string;
+  task_id: string | null;
+  trigger_source: HeartbeatTriggerSource;
+  status: HeartbeatLogRecord["status"];
+  summary: string | null;
+  error_text: string | null;
+  triggered_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+  updated_at: number;
 };
 
 const WORKSPACE_RUN_EVENT_TYPES = [
@@ -133,8 +203,30 @@ const TASK_EVENT_TYPES = [
   "result_delivered",
 ];
 
+const HEARTBEAT_LOG_STATUSES = ["queued", "running", "completed", "failed", "cancelled"] as const;
+const HEARTBEAT_TRIGGER_SOURCES = ["manual", "scheduler"] as const;
+const WORKSPACE_RUN_PHASES = [
+  "accepted",
+  "planning",
+  "tool_execution",
+  "synthesizing",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+const TASK_FLOW_STATUSES = ["queued", "running", "completed", "failed", "cancelled"] as const;
+const TASK_FLOW_STEP_STATUSES = [
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "skipped",
+] as const;
+const TASK_FLOW_TRIGGER_SOURCES = ["manual", "schedule", "event_hook"] as const;
+
 export const DEFAULT_AGENT_ID = "default-agent";
-export const DEFAULT_CONVERSATION_TITLE = "새 채팅";
+export const DEFAULT_CONVERSATION_TITLE = "\uC0C8 \uCC44\uD305";
 
 function now() {
   return Date.now();
@@ -145,10 +237,15 @@ function createWorkspaceRunsSql(tableName: string) {
     CREATE TABLE ${tableName} (
       id TEXT PRIMARY KEY,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      parent_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
       provider_kind TEXT NOT NULL,
       model TEXT NOT NULL,
       user_message TEXT NOT NULL,
       status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
+      phase TEXT NOT NULL CHECK(phase IN ('${WORKSPACE_RUN_PHASES.join("', '")}')),
+      checkpoint_json TEXT,
+      resume_token TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -175,6 +272,9 @@ function createConversationsSql(tableName: string) {
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
       channel_kind TEXT NOT NULL DEFAULT 'webchat',
+      session_kind TEXT NOT NULL DEFAULT 'primary',
+      parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+      owner_run_id TEXT,
       title TEXT NOT NULL,
       provider_kind TEXT NOT NULL,
       model TEXT NOT NULL,
@@ -191,6 +291,12 @@ function createTasksSql(tableName: string) {
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      task_kind TEXT NOT NULL DEFAULT 'detached' CHECK(task_kind IN ('detached', 'heartbeat', 'continuation', 'scheduled', 'subagent', 'flow_step')),
+      task_flow_id TEXT REFERENCES task_flows(id) ON DELETE SET NULL,
+      flow_step_key TEXT,
+      origin_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
+      parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      nesting_depth INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL,
       prompt TEXT NOT NULL,
       provider_kind TEXT NOT NULL,
@@ -204,6 +310,76 @@ function createTasksSql(tableName: string) {
       updated_at INTEGER NOT NULL,
       completed_at INTEGER,
       scheduled_for INTEGER
+    );
+  `;
+}
+
+function createTaskFlowsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      origin_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
+      trigger_source TEXT NOT NULL CHECK(trigger_source IN ('${TASK_FLOW_TRIGGER_SOURCES.join("', '")}')),
+      title TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('${TASK_FLOW_STATUSES.join("', '")}')),
+      result_summary TEXT,
+      error_text TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER
+    );
+  `;
+}
+
+function createTaskFlowStepsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      flow_id TEXT NOT NULL REFERENCES task_flows(id) ON DELETE CASCADE,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      step_key TEXT NOT NULL,
+      dependency_step_key TEXT,
+      title TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('${TASK_FLOW_STEP_STATUSES.join("', '")}')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER
+    );
+  `;
+}
+
+function createMemoryIndexSql(tableName: string) {
+  return `
+    CREATE VIRTUAL TABLE IF NOT EXISTS ${tableName} USING fts5(
+      agent_id UNINDEXED,
+      path UNINDEXED,
+      kind UNINDEXED,
+      line UNINDEXED,
+      reason UNINDEXED,
+      text,
+      tokenize = 'unicode61'
+    );
+  `;
+}
+
+function createHeartbeatLogsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      trigger_source TEXT NOT NULL CHECK(trigger_source IN ('${HEARTBEAT_TRIGGER_SOURCES.join("', '")}')),
+      status TEXT NOT NULL CHECK(status IN ('${HEARTBEAT_LOG_STATUSES.join("', '")}')),
+      summary TEXT,
+      error_text TEXT,
+      triggered_at INTEGER NOT NULL,
+      started_at INTEGER,
+      completed_at INTEGER,
+      updated_at INTEGER NOT NULL
     );
   `;
 }
@@ -244,9 +420,9 @@ function migrateWorkspaceTables(db: Database.Database) {
     db.exec(createWorkspaceRunsSql("workspace_runs_next"));
     db.exec(`
       INSERT INTO workspace_runs_next (
-        id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+        id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
       )
-      SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+      SELECT id, conversation_id, NULL, NULL, provider_kind, model, user_message, status, 'accepted', NULL, NULL, created_at, updated_at
       FROM workspace_runs;
     `);
 
@@ -270,6 +446,178 @@ function migrateWorkspaceTables(db: Database.Database) {
   }
 }
 
+function migrateTaskMetadataColumns(db: Database.Database) {
+  const tasksSql = tableSql(db, "tasks");
+  const requiresRebuild =
+    Boolean(tasksSql) &&
+    (!tasksSql.includes("'subagent'") ||
+      !tasksSql.includes("'flow_step'") ||
+      !tasksSql.includes("task_flow_id") ||
+      !tasksSql.includes("origin_run_id") ||
+      !tasksSql.includes("flow_step_key"));
+
+  if (requiresRebuild) {
+    db.pragma("foreign_keys = OFF");
+    try {
+      db.exec("BEGIN");
+      db.exec(createTasksSql("tasks_next"));
+      db.exec(`
+        INSERT INTO tasks_next (
+          id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id,
+          parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
+        )
+        SELECT
+          id,
+          agent_id,
+          conversation_id,
+          COALESCE(task_kind, 'detached'),
+          NULL,
+          NULL,
+          NULL,
+          parent_task_id,
+          COALESCE(nesting_depth, 0),
+          title,
+          prompt,
+          provider_kind,
+          model,
+          reasoning_level,
+          status,
+          run_id,
+          result_text,
+          created_at,
+          started_at,
+          updated_at,
+          completed_at,
+          scheduled_for
+        FROM tasks;
+      `);
+      db.exec("DROP TABLE tasks");
+      db.exec("ALTER TABLE tasks_next RENAME TO tasks");
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      db.pragma("foreign_keys = ON");
+    }
+    return;
+  }
+
+  const columns = db.prepare(`PRAGMA table_info(tasks)`).all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  const statements: string[] = [];
+
+  if (!columnNames.has("task_kind")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'detached'`);
+  }
+  if (!columnNames.has("parent_task_id")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`);
+  }
+  if (!columnNames.has("nesting_depth")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN nesting_depth INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!columnNames.has("task_flow_id")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN task_flow_id TEXT`);
+  }
+  if (!columnNames.has("flow_step_key")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN flow_step_key TEXT`);
+  }
+  if (!columnNames.has("origin_run_id")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN origin_run_id TEXT`);
+  }
+
+  if (statements.length) {
+    db.pragma("foreign_keys = OFF");
+    try {
+      db.exec("BEGIN");
+      for (const statement of statements) {
+        db.exec(statement);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      db.pragma("foreign_keys = ON");
+    }
+  }
+}
+
+function migrateConversationLineageColumns(db: Database.Database) {
+  const columns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  const statements: string[] = [];
+
+  if (!columnNames.has("session_kind")) {
+    statements.push(`ALTER TABLE conversations ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'primary'`);
+  }
+  if (!columnNames.has("parent_conversation_id")) {
+    statements.push(`ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT`);
+  }
+  if (!columnNames.has("owner_run_id")) {
+    statements.push(`ALTER TABLE conversations ADD COLUMN owner_run_id TEXT`);
+  }
+
+  if (!statements.length) {
+    return;
+  }
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    for (const statement of statements) {
+      db.exec(statement);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+}
+
+function migrateWorkspaceRunMetadataColumns(db: Database.Database) {
+  const columns = db.prepare(`PRAGMA table_info(workspace_runs)`).all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  const statements: string[] = [];
+
+  if (!columnNames.has("task_id")) {
+    statements.push(`ALTER TABLE workspace_runs ADD COLUMN task_id TEXT`);
+  }
+  if (!columnNames.has("parent_run_id")) {
+    statements.push(`ALTER TABLE workspace_runs ADD COLUMN parent_run_id TEXT`);
+  }
+  if (!columnNames.has("phase")) {
+    statements.push(`ALTER TABLE workspace_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'accepted'`);
+  }
+  if (!columnNames.has("checkpoint_json")) {
+    statements.push(`ALTER TABLE workspace_runs ADD COLUMN checkpoint_json TEXT`);
+  }
+  if (!columnNames.has("resume_token")) {
+    statements.push(`ALTER TABLE workspace_runs ADD COLUMN resume_token TEXT`);
+  }
+
+  if (!statements.length) {
+    return;
+  }
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    for (const statement of statements) {
+      db.exec(statement);
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+}
+
 function ensureDefaultAgent(db: Database.Database) {
   const timestamp = now();
   db.prepare(`
@@ -279,7 +627,7 @@ function ensureDefaultAgent(db: Database.Database) {
     ON CONFLICT(id) DO NOTHING;
   `).run(
     DEFAULT_AGENT_ID,
-    "기본 에이전트",
+    "\uAE30\uBCF8 \uC5D0\uC774\uC804\uD2B8",
     "Migrated local webchat agent.",
     "openai",
     "gpt-5.4",
@@ -301,12 +649,15 @@ function migrateConversationSessionColumns(db: Database.Database) {
     db.exec(createConversationsSql("conversations_next"));
     db.exec(`
       INSERT INTO conversations_next (
-        id, agent_id, channel_kind, title, provider_kind, model, reasoning_level, created_at, updated_at
+        id, agent_id, channel_kind, session_kind, parent_conversation_id, owner_run_id, title, provider_kind, model, reasoning_level, created_at, updated_at
       )
       SELECT
         id,
         '${DEFAULT_AGENT_ID}',
         'webchat',
+        'primary',
+        NULL,
+        NULL,
         title,
         provider_kind,
         model,
@@ -374,30 +725,19 @@ export function createStore(dataDir: string) {
       created_at INTEGER NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS workspace_runs (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      provider_kind TEXT NOT NULL,
-      model TEXT NOT NULL,
-      user_message TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
+    ${createTaskFlowsSql("task_flows")}
 
-    CREATE TABLE IF NOT EXISTS workspace_run_events (
-      id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL REFERENCES workspace_runs(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL CHECK(
-        event_type IN ('status', 'tool_call', 'tool_result', 'error', 'run_complete', 'run_failed', 'run_cancelled')
-      ),
-      payload_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
+    ${createTaskFlowStepsSql("task_flow_steps")}
 
     ${createTasksSql("tasks")}
 
     ${createTaskEventsSql("task_events")}
+
+    ${createWorkspaceRunsSql("workspace_runs")}
+
+    ${createWorkspaceRunEventsSql("workspace_run_events")}
+
+    ${createHeartbeatLogsSql("heartbeat_logs")}
 
     CREATE TABLE IF NOT EXISTS plugins (
       id TEXT PRIMARY KEY,
@@ -409,9 +749,14 @@ export function createStore(dataDir: string) {
     );
   `);
 
+  db.exec(createMemoryIndexSql("memory_index"));
+
   ensureDefaultAgent(db);
   migrateConversationSessionColumns(db);
+  migrateConversationLineageColumns(db);
   migrateWorkspaceTables(db);
+  migrateWorkspaceRunMetadataColumns(db);
+  migrateTaskMetadataColumns(db);
 
   const conversationColumns = db
     .prepare(`PRAGMA table_info(conversations)`)
@@ -463,13 +808,16 @@ export function createStore(dataDir: string) {
 
   const saveConversationStmt = db.prepare(`
     INSERT INTO conversations (
-      id, agent_id, channel_kind, title, provider_kind, model, reasoning_level, created_at, updated_at
+      id, agent_id, channel_kind, session_kind, parent_conversation_id, owner_run_id, title, provider_kind, model, reasoning_level, created_at, updated_at
     ) VALUES (
-      @id, @agent_id, @channel_kind, @title, @provider_kind, @model, @reasoning_level, @created_at, @updated_at
+      @id, @agent_id, @channel_kind, @session_kind, @parent_conversation_id, @owner_run_id, @title, @provider_kind, @model, @reasoning_level, @created_at, @updated_at
     )
     ON CONFLICT(id) DO UPDATE SET
       agent_id = excluded.agent_id,
       channel_kind = excluded.channel_kind,
+      session_kind = excluded.session_kind,
+      parent_conversation_id = excluded.parent_conversation_id,
+      owner_run_id = excluded.owner_run_id,
       title = excluded.title,
       provider_kind = excluded.provider_kind,
       model = excluded.model,
@@ -488,17 +836,31 @@ export function createStore(dataDir: string) {
 
   const insertWorkspaceRunStmt = db.prepare(`
     INSERT INTO workspace_runs (
-      id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+      id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
     ) VALUES (
-      @id, @conversation_id, @provider_kind, @model, @user_message, @status, @created_at, @updated_at
+      @id, @conversation_id, @task_id, @parent_run_id, @provider_kind, @model, @user_message, @status, @phase, @checkpoint_json, @resume_token, @created_at, @updated_at
     );
   `);
 
   const updateWorkspaceRunStatusStmt = db.prepare(`
     UPDATE workspace_runs
     SET status = @status,
+        phase = @phase,
+        checkpoint_json = COALESCE(@checkpoint_json, checkpoint_json),
+        resume_token = COALESCE(@resume_token, resume_token),
         updated_at = @updated_at
     WHERE id = @id AND status = 'running';
+  `);
+
+  const patchWorkspaceRunStmt = db.prepare(`
+    UPDATE workspace_runs
+    SET task_id = COALESCE(@task_id, task_id),
+        parent_run_id = COALESCE(@parent_run_id, parent_run_id),
+        phase = COALESCE(@phase, phase),
+        checkpoint_json = COALESCE(@checkpoint_json, checkpoint_json),
+        resume_token = COALESCE(@resume_token, resume_token),
+        updated_at = @updated_at
+    WHERE id = @id;
   `);
 
   const insertWorkspaceRunEventStmt = db.prepare(`
@@ -511,10 +873,10 @@ export function createStore(dataDir: string) {
 
   const insertTaskStmt = db.prepare(`
     INSERT INTO tasks (
-      id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+      id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
       status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
     ) VALUES (
-      @id, @agent_id, @conversation_id, @title, @prompt, @provider_kind, @model, @reasoning_level,
+      @id, @agent_id, @conversation_id, @task_kind, @task_flow_id, @flow_step_key, @origin_run_id, @parent_task_id, @nesting_depth, @title, @prompt, @provider_kind, @model, @reasoning_level,
       @status, @run_id, @result_text, @created_at, @started_at, @updated_at, @completed_at, @scheduled_for
     );
   `);
@@ -524,6 +886,7 @@ export function createStore(dataDir: string) {
     SET status = @status,
         run_id = COALESCE(@run_id, run_id),
         result_text = COALESCE(@result_text, result_text),
+        origin_run_id = COALESCE(@origin_run_id, origin_run_id),
         started_at = COALESCE(@started_at, started_at),
         updated_at = @updated_at,
         completed_at = @completed_at
@@ -531,9 +894,75 @@ export function createStore(dataDir: string) {
       AND status IN ('queued', 'running');
   `);
 
+  const insertTaskFlowStmt = db.prepare(`
+    INSERT INTO task_flows (
+      id, agent_id, conversation_id, origin_run_id, trigger_source, title, status, result_summary, error_text, created_at, updated_at, completed_at
+    ) VALUES (
+      @id, @agent_id, @conversation_id, @origin_run_id, @trigger_source, @title, @status, @result_summary, @error_text, @created_at, @updated_at, @completed_at
+    );
+  `);
+
+  const updateTaskFlowStmt = db.prepare(`
+    UPDATE task_flows
+    SET status = COALESCE(@status, status),
+        result_summary = COALESCE(@result_summary, result_summary),
+        error_text = COALESCE(@error_text, error_text),
+        updated_at = @updated_at,
+        completed_at = COALESCE(@completed_at, completed_at)
+    WHERE id = @id;
+  `);
+
+  const insertTaskFlowStepStmt = db.prepare(`
+    INSERT INTO task_flow_steps (
+      id, flow_id, task_id, step_key, dependency_step_key, title, prompt, status, created_at, updated_at, completed_at
+    ) VALUES (
+      @id, @flow_id, @task_id, @step_key, @dependency_step_key, @title, @prompt, @status, @created_at, @updated_at, @completed_at
+    );
+  `);
+
+  const updateTaskFlowStepStmt = db.prepare(`
+    UPDATE task_flow_steps
+    SET task_id = COALESCE(@task_id, task_id),
+        status = COALESCE(@status, status),
+        updated_at = @updated_at,
+        completed_at = COALESCE(@completed_at, completed_at)
+    WHERE id = @id;
+  `);
+
   const insertTaskEventStmt = db.prepare(`
     INSERT INTO task_events (id, task_id, event_type, payload_json, created_at)
     VALUES (@id, @task_id, @event_type, @payload_json, @created_at);
+  `);
+
+  const insertHeartbeatLogStmt = db.prepare(`
+    INSERT INTO heartbeat_logs (
+      id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
+      triggered_at, started_at, completed_at, updated_at
+    ) VALUES (
+      @id, @agent_id, @conversation_id, @task_id, @trigger_source, @status, @summary, @error_text,
+      @triggered_at, @started_at, @completed_at, @updated_at
+    );
+  `);
+
+  const updateHeartbeatLogStmt = db.prepare(`
+    UPDATE heartbeat_logs
+    SET task_id = COALESCE(@task_id, task_id),
+        status = COALESCE(@status, status),
+        summary = COALESCE(@summary, summary),
+        error_text = COALESCE(@error_text, error_text),
+        started_at = COALESCE(@started_at, started_at),
+        completed_at = COALESCE(@completed_at, completed_at),
+        updated_at = @updated_at
+    WHERE id = @id;
+  `);
+
+  const deleteMemoryIndexForAgentStmt = db.prepare(`
+    DELETE FROM memory_index WHERE agent_id = ?;
+  `);
+
+  const insertMemoryIndexStmt = db.prepare(`
+    INSERT INTO memory_index (agent_id, path, kind, line, reason, text)
+    VALUES (@agent_id, @path, @kind, @line, @reason, @text);
   `);
 
   const appendMessageTx = db.transaction((input: {
@@ -580,6 +1009,9 @@ export function createStore(dataDir: string) {
     const result = updateWorkspaceRunStatusStmt.run({
       id: input.runId,
       status: input.status,
+      phase: input.status,
+      checkpoint_json: null,
+      resume_token: null,
       updated_at: input.timestamp,
     });
 
@@ -601,6 +1033,9 @@ export function createStore(dataDir: string) {
       id: row.id,
       agentId: row.agent_id,
       channelKind: row.channel_kind,
+      sessionKind: row.session_kind,
+      parentConversationId: row.parent_conversation_id,
+      ownerRunId: row.owner_run_id,
       title: row.title,
       providerKind: row.provider_kind,
       model: row.model,
@@ -649,11 +1084,15 @@ export function createStore(dataDir: string) {
     return {
       id: row.id,
       conversationId: row.conversation_id,
-      taskId: null,
+      taskId: row.task_id,
+      parentRunId: row.parent_run_id,
       providerKind: row.provider_kind,
       model: row.model,
       userMessage: row.user_message,
       status: row.status,
+      phase: row.phase,
+      checkpoint: row.checkpoint_json ? (JSON.parse(row.checkpoint_json) as RunCheckpoint) : null,
+      resumeToken: row.resume_token,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -674,6 +1113,12 @@ export function createStore(dataDir: string) {
       id: row.id,
       agentId: row.agent_id,
       conversationId: row.conversation_id,
+      taskKind: row.task_kind,
+      taskFlowId: row.task_flow_id,
+      flowStepKey: row.flow_step_key,
+      originRunId: row.origin_run_id,
+      parentTaskId: row.parent_task_id,
+      nestingDepth: row.nesting_depth,
       title: row.title,
       prompt: row.prompt,
       providerKind: row.provider_kind,
@@ -697,6 +1142,56 @@ export function createStore(dataDir: string) {
       eventType: row.event_type,
       payload: JSON.parse(row.payload_json) as Record<string, unknown>,
       createdAt: row.created_at,
+    };
+  }
+
+  function mapHeartbeatLog(row: HeartbeatLogRow): HeartbeatLogRecord {
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      conversationId: row.conversation_id,
+      taskId: row.task_id,
+      triggerSource: row.trigger_source,
+      status: row.status,
+      summary: row.summary,
+      errorText: row.error_text,
+      triggeredAt: row.triggered_at,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  function mapTaskFlow(row: TaskFlowRow): TaskFlowRecord {
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      conversationId: row.conversation_id,
+      originRunId: row.origin_run_id,
+      triggerSource: row.trigger_source,
+      title: row.title,
+      status: row.status,
+      resultSummary: row.result_summary,
+      errorText: row.error_text,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at,
+    };
+  }
+
+  function mapTaskFlowStep(row: TaskFlowStepRow): TaskFlowStepRecord {
+    return {
+      id: row.id,
+      flowId: row.flow_id,
+      taskId: row.task_id,
+      stepKey: row.step_key,
+      dependencyStepKey: row.dependency_step_key,
+      title: row.title,
+      prompt: row.prompt,
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at,
     };
   }
 
@@ -761,22 +1256,59 @@ export function createStore(dataDir: string) {
       return result.changes > 0;
     },
 
-    listConversations(agentId?: string): ConversationRecord[] {
+    listConversations(
+      agentId?: string,
+      options?: {
+        includeSubagents?: boolean;
+        parentConversationId?: string | null;
+        ownerRunId?: string | null;
+        sessionKind?: SessionKind;
+      },
+    ): ConversationRecord[] {
+      const conditions: string[] = [];
+      const values: Array<string> = [];
+      if (agentId) {
+        conditions.push("agent_id = ?");
+        values.push(agentId);
+      }
+      if (!options?.includeSubagents && !options?.parentConversationId && !options?.ownerRunId && !options?.sessionKind) {
+        conditions.push("session_kind = 'primary'");
+      }
+      if (options?.parentConversationId !== undefined) {
+        if (options.parentConversationId === null) {
+          conditions.push("parent_conversation_id IS NULL");
+        } else {
+          conditions.push("parent_conversation_id = ?");
+          values.push(options.parentConversationId);
+        }
+      }
+      if (options?.ownerRunId !== undefined) {
+        if (options.ownerRunId === null) {
+          conditions.push("owner_run_id IS NULL");
+        } else {
+          conditions.push("owner_run_id = ?");
+          values.push(options.ownerRunId);
+        }
+      }
+      if (options?.sessionKind) {
+        conditions.push("session_kind = ?");
+        values.push(options.sessionKind);
+      }
       const rows = db
         .prepare(
-          `SELECT id, agent_id, channel_kind, title, provider_kind, model, reasoning_level, created_at, updated_at
+          `SELECT id, agent_id, channel_kind, session_kind, parent_conversation_id, owner_run_id, title, provider_kind, model, reasoning_level, created_at, updated_at
            FROM conversations
-           ${agentId ? "WHERE agent_id = ?" : ""}
+           ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
            ORDER BY updated_at DESC`,
         )
-        .all(...(agentId ? [agentId] : [])) as ConversationRow[];
+        .all(...values) as ConversationRow[];
       return rows.map(mapConversation);
     },
 
     getConversation(id: string): ConversationRecord | null {
       const row = db
         .prepare(
-          `SELECT id, agent_id, channel_kind, title, provider_kind, model, reasoning_level, created_at, updated_at
+          `SELECT id, agent_id, channel_kind, session_kind, parent_conversation_id, owner_run_id, title, provider_kind, model, reasoning_level, created_at, updated_at
            FROM conversations
            WHERE id = ?`,
         )
@@ -788,6 +1320,9 @@ export function createStore(dataDir: string) {
       id?: string;
       agentId?: string;
       channelKind?: ConversationRecord["channelKind"];
+      sessionKind?: SessionKind;
+      parentConversationId?: string | null;
+      ownerRunId?: string | null;
       title: string;
       providerKind: ProviderKind;
       model: string;
@@ -804,6 +1339,9 @@ export function createStore(dataDir: string) {
         id,
         agent_id: agentId,
         channel_kind: input.channelKind ?? existing?.channelKind ?? "webchat",
+        session_kind: input.sessionKind ?? existing?.sessionKind ?? "primary",
+        parent_conversation_id: input.parentConversationId ?? existing?.parentConversationId ?? null,
+        owner_run_id: input.ownerRunId ?? existing?.ownerRunId ?? null,
         title: input.title,
         provider_kind: input.providerKind,
         model: input.model,
@@ -856,12 +1394,12 @@ export function createStore(dataDir: string) {
 
     ensureConversationTitle(conversationId: string, fallbackText: string) {
       const conversation = store.getConversation(conversationId);
-      const defaultConversationTitle = "새 채팅";
+      const defaultConversationTitle = DEFAULT_CONVERSATION_TITLE;
       if (!conversation) {
         return;
       }
-      if (conversation.title === "새 채팅") {
-        const nextTitle = fallbackText.trim().slice(0, 60) || "새 채팅";
+      if (conversation.title === DEFAULT_CONVERSATION_TITLE) {
+        const nextTitle = fallbackText.trim().slice(0, 60) || DEFAULT_CONVERSATION_TITLE;
         store.saveConversation({
           id: conversationId,
           agentId: conversation.agentId,
@@ -886,10 +1424,10 @@ export function createStore(dataDir: string) {
         });
         return;
       }
-      if (!conversation || conversation.title !== "새 채팅") {
+      if (!conversation || conversation.title !== DEFAULT_CONVERSATION_TITLE) {
         return;
       }
-      const title = fallbackText.trim().slice(0, 60) || "새 채팅";
+      const title = fallbackText.trim().slice(0, 60) || DEFAULT_CONVERSATION_TITLE;
       store.saveConversation({
         id: conversationId,
         agentId: conversation.agentId,
@@ -903,9 +1441,14 @@ export function createStore(dataDir: string) {
 
     createWorkspaceRun(input: {
       conversationId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
       providerKind: ProviderKind;
       model: string;
       userMessage: string;
+      phase?: WorkspaceRunPhase;
+      checkpoint?: RunCheckpoint | null;
+      resumeToken?: string | null;
     }) {
       const id = crypto.randomUUID();
       const timestamp = now();
@@ -913,10 +1456,15 @@ export function createStore(dataDir: string) {
         insertWorkspaceRunStmt.run({
           id,
           conversation_id: input.conversationId,
+          task_id: input.taskId ?? null,
+          parent_run_id: input.parentRunId ?? null,
           provider_kind: input.providerKind,
           model: input.model,
           user_message: input.userMessage,
           status: "running",
+          phase: input.phase ?? "accepted",
+          checkpoint_json: input.checkpoint ? JSON.stringify(input.checkpoint) : null,
+          resume_token: input.resumeToken ?? null,
           created_at: timestamp,
           updated_at: timestamp,
         });
@@ -924,7 +1472,7 @@ export function createStore(dataDir: string) {
           id: crypto.randomUUID(),
           run_id: id,
           event_type: "status",
-          payload_json: JSON.stringify({ message: "작업을 시작했습니다." }),
+          payload_json: JSON.stringify({ message: "\uC791\uC5C5\uC744 \uC2DC\uC791\uD588\uC2B5\uB2C8\uB2E4." }),
           created_at: timestamp,
         });
       })();
@@ -934,7 +1482,7 @@ export function createStore(dataDir: string) {
     getWorkspaceRun(id: string): WorkspaceRunRecord | null {
       const row = db
         .prepare(
-          `SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+          `SELECT id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
            FROM workspace_runs
            WHERE id = ?`,
         )
@@ -945,7 +1493,7 @@ export function createStore(dataDir: string) {
     getWorkspaceRunForConversation(conversationId: string, runId: string): WorkspaceRunRecord | null {
       const row = db
         .prepare(
-          `SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+          `SELECT id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
            FROM workspace_runs
            WHERE conversation_id = ? AND id = ?`,
         )
@@ -956,13 +1504,33 @@ export function createStore(dataDir: string) {
     listWorkspaceRuns(conversationId: string) {
       const rows = db
         .prepare(
-          `SELECT id, conversation_id, provider_kind, model, user_message, status, created_at, updated_at
+          `SELECT id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
            FROM workspace_runs
            WHERE conversation_id = ?
            ORDER BY created_at DESC`,
         )
         .all(conversationId) as WorkspaceRunRow[];
       return rows.map(mapWorkspaceRun);
+    },
+
+    patchWorkspaceRun(input: {
+      runId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
+      phase?: WorkspaceRunPhase | null;
+      checkpoint?: RunCheckpoint | null;
+      resumeToken?: string | null;
+    }) {
+      patchWorkspaceRunStmt.run({
+        id: input.runId,
+        task_id: input.taskId ?? null,
+        parent_run_id: input.parentRunId ?? null,
+        phase: input.phase ?? null,
+        checkpoint_json: input.checkpoint ? JSON.stringify(input.checkpoint) : null,
+        resume_token: input.resumeToken ?? null,
+        updated_at: now(),
+      });
+      return store.getWorkspaceRun(input.runId);
     },
 
     completeWorkspaceRun(id: string, status: WorkspaceRunStatus) {
@@ -1037,6 +1605,12 @@ export function createStore(dataDir: string) {
     createTask(input: {
       agentId: string;
       conversationId: string;
+      taskKind?: TaskKind;
+      taskFlowId?: string | null;
+      flowStepKey?: string | null;
+      originRunId?: string | null;
+      parentTaskId?: string | null;
+      nestingDepth?: number;
       title: string;
       prompt: string;
       providerKind: ProviderKind;
@@ -1051,6 +1625,15 @@ export function createStore(dataDir: string) {
       if (!conversation || conversation.agentId !== input.agentId) {
         throw new Error("Session not found for agent.");
       }
+      const parentTask = input.parentTaskId ? store.getTask(input.parentTaskId) : null;
+      if (input.parentTaskId && !parentTask) {
+        throw new Error("Parent task not found.");
+      }
+      const taskKind =
+        input.taskKind ??
+        (input.parentTaskId ? "continuation" : input.scheduledFor != null ? "scheduled" : "detached");
+      const nestingDepth =
+        input.nestingDepth ?? (parentTask ? parentTask.nestingDepth + 1 : input.parentTaskId ? 1 : 0);
 
       const id = crypto.randomUUID();
       const timestamp = now();
@@ -1059,6 +1642,12 @@ export function createStore(dataDir: string) {
           id,
           agent_id: input.agentId,
           conversation_id: input.conversationId,
+          task_kind: taskKind,
+          task_flow_id: input.taskFlowId ?? null,
+          flow_step_key: input.flowStepKey ?? null,
+          origin_run_id: input.originRunId ?? null,
+          parent_task_id: input.parentTaskId ?? null,
+          nesting_depth: nestingDepth,
           title: input.title,
           prompt: input.prompt,
           provider_kind: input.providerKind,
@@ -1077,7 +1666,7 @@ export function createStore(dataDir: string) {
           id: crypto.randomUUID(),
           task_id: id,
           event_type: "queued",
-          payload_json: JSON.stringify({ message: "Task queued." }),
+          payload_json: JSON.stringify({ message: "\uD0DC\uC2A4\uD06C\uAC00 \uB300\uAE30\uC5F4\uC5D0 \uB4E4\uC5B4\uAC14\uC2B5\uB2C8\uB2E4." }),
           created_at: timestamp,
         });
       })();
@@ -1087,7 +1676,7 @@ export function createStore(dataDir: string) {
     getTask(id: string): TaskRecord | null {
       const row = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE id = ?`,
@@ -1099,7 +1688,7 @@ export function createStore(dataDir: string) {
     getTaskForAgent(agentId: string, taskId: string): TaskRecord | null {
       const row = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE agent_id = ? AND id = ?`,
@@ -1111,13 +1700,26 @@ export function createStore(dataDir: string) {
     listTasks(agentId: string): TaskRecord[] {
       const rows = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE agent_id = ?
            ORDER BY updated_at DESC`,
         )
         .all(agentId) as TaskRow[];
+      return rows.map(mapTask);
+    },
+
+    listTasksForConversation(conversationId: string): TaskRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+                  status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
+           FROM tasks
+           WHERE conversation_id = ?
+           ORDER BY updated_at DESC`,
+        )
+        .all(conversationId) as TaskRow[];
       return rows.map(mapTask);
     },
 
@@ -1136,6 +1738,7 @@ export function createStore(dataDir: string) {
           status: input.status,
           run_id: input.runId ?? null,
           result_text: input.resultText ?? null,
+          origin_run_id: input.runId ?? null,
           started_at: input.status === "running" ? timestamp : null,
           updated_at: timestamp,
           completed_at:
@@ -1197,6 +1800,312 @@ export function createStore(dataDir: string) {
         )
         .all(agentId, taskId) as TaskEventRow[];
       return rows.map(mapTaskEvent);
+    },
+
+    createHeartbeatLog(input: {
+      agentId: string;
+      conversationId: string;
+      triggerSource?: HeartbeatTriggerSource;
+      taskId?: string | null;
+      status?: HeartbeatLogRecord["status"];
+      summary?: string | null;
+      errorText?: string | null;
+      startedAt?: number | null;
+      completedAt?: number | null;
+    }): HeartbeatLogRecord {
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      insertHeartbeatLogStmt.run({
+        id,
+        agent_id: input.agentId,
+        conversation_id: input.conversationId,
+        task_id: input.taskId ?? null,
+        trigger_source: input.triggerSource ?? "manual",
+        status: input.status ?? "queued",
+        summary: input.summary ?? null,
+        error_text: input.errorText ?? null,
+        triggered_at: timestamp,
+        started_at: input.startedAt ?? null,
+        completed_at: input.completedAt ?? null,
+        updated_at: timestamp,
+      });
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
+                  triggered_at, started_at, completed_at, updated_at
+           FROM heartbeat_logs
+           WHERE id = ?`,
+        )
+        .get(id) as HeartbeatLogRow | undefined;
+      return row ? mapHeartbeatLog(row) : mapHeartbeatLog({
+        id,
+        agent_id: input.agentId,
+        conversation_id: input.conversationId,
+        task_id: input.taskId ?? null,
+        trigger_source: input.triggerSource ?? "manual",
+        status: input.status ?? "queued",
+        summary: input.summary ?? null,
+        error_text: input.errorText ?? null,
+        triggered_at: timestamp,
+        started_at: input.startedAt ?? null,
+        completed_at: input.completedAt ?? null,
+        updated_at: timestamp,
+      });
+    },
+
+    transitionHeartbeatLog(input: {
+      id: string;
+      taskId?: string | null;
+      status?: HeartbeatLogRecord["status"];
+      summary?: string | null;
+      errorText?: string | null;
+      startedAt?: number | null;
+      completedAt?: number | null;
+    }) {
+      const timestamp = now();
+      const result = updateHeartbeatLogStmt.run({
+        id: input.id,
+        task_id: input.taskId ?? null,
+        status: input.status ?? null,
+        summary: input.summary ?? null,
+        error_text: input.errorText ?? null,
+        started_at: input.startedAt ?? null,
+        completed_at: input.completedAt ?? null,
+        updated_at: timestamp,
+      });
+      if (!result.changes) {
+        return null;
+      }
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
+                  triggered_at, started_at, completed_at, updated_at
+           FROM heartbeat_logs
+           WHERE id = ?`,
+        )
+        .get(input.id) as HeartbeatLogRow | undefined;
+      return row ? mapHeartbeatLog(row) : null;
+    },
+
+    listHeartbeatLogs(agentId: string) {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
+                  triggered_at, started_at, completed_at, updated_at
+           FROM heartbeat_logs
+           WHERE agent_id = ?
+           ORDER BY triggered_at DESC`,
+        )
+        .all(agentId) as HeartbeatLogRow[];
+      return rows.map(mapHeartbeatLog);
+    },
+
+    getHeartbeatLog(agentId: string, logId: string) {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
+                  triggered_at, started_at, completed_at, updated_at
+           FROM heartbeat_logs
+           WHERE agent_id = ? AND id = ?`,
+        )
+        .get(agentId, logId) as HeartbeatLogRow | undefined;
+      return row ? mapHeartbeatLog(row) : null;
+    },
+
+    createTaskFlow(input: {
+      agentId: string;
+      conversationId: string;
+      title: string;
+      triggerSource?: TaskFlowTriggerSource;
+      originRunId?: string | null;
+    }) {
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      insertTaskFlowStmt.run({
+        id,
+        agent_id: input.agentId,
+        conversation_id: input.conversationId,
+        origin_run_id: input.originRunId ?? null,
+        trigger_source: input.triggerSource ?? "manual",
+        title: input.title,
+        status: "queued",
+        result_summary: null,
+        error_text: null,
+        created_at: timestamp,
+        updated_at: timestamp,
+        completed_at: null,
+      });
+      return store.getTaskFlow(id)!;
+    },
+
+    getTaskFlow(flowId: string): TaskFlowRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, origin_run_id, trigger_source, title, status, result_summary, error_text, created_at, updated_at, completed_at
+           FROM task_flows
+           WHERE id = ?`,
+        )
+        .get(flowId) as TaskFlowRow | undefined;
+      return row ? mapTaskFlow(row) : null;
+    },
+
+    listTaskFlows(agentId: string): TaskFlowRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, origin_run_id, trigger_source, title, status, result_summary, error_text, created_at, updated_at, completed_at
+           FROM task_flows
+           WHERE agent_id = ?
+           ORDER BY updated_at DESC`,
+        )
+        .all(agentId) as TaskFlowRow[];
+      return rows.map(mapTaskFlow);
+    },
+
+    transitionTaskFlow(input: {
+      flowId: string;
+      status?: TaskFlowStatus;
+      resultSummary?: string | null;
+      errorText?: string | null;
+      completedAt?: number | null;
+    }) {
+      updateTaskFlowStmt.run({
+        id: input.flowId,
+        status: input.status ?? null,
+        result_summary: input.resultSummary ?? null,
+        error_text: input.errorText ?? null,
+        updated_at: now(),
+        completed_at: input.completedAt ?? null,
+      });
+      return store.getTaskFlow(input.flowId);
+    },
+
+    createTaskFlowStep(input: {
+      flowId: string;
+      stepKey: string;
+      dependencyStepKey?: string | null;
+      title: string;
+      prompt: string;
+    }) {
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      insertTaskFlowStepStmt.run({
+        id,
+        flow_id: input.flowId,
+        task_id: null,
+        step_key: input.stepKey,
+        dependency_step_key: input.dependencyStepKey ?? null,
+        title: input.title,
+        prompt: input.prompt,
+        status: "queued",
+        created_at: timestamp,
+        updated_at: timestamp,
+        completed_at: null,
+      });
+      return store.getTaskFlowStep(id)!;
+    },
+
+    getTaskFlowStep(stepId: string): TaskFlowStepRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, title, prompt, status, created_at, updated_at, completed_at
+           FROM task_flow_steps
+           WHERE id = ?`,
+        )
+        .get(stepId) as TaskFlowStepRow | undefined;
+      return row ? mapTaskFlowStep(row) : null;
+    },
+
+    listTaskFlowSteps(flowId: string): TaskFlowStepRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, title, prompt, status, created_at, updated_at, completed_at
+           FROM task_flow_steps
+           WHERE flow_id = ?
+           ORDER BY created_at ASC`,
+        )
+        .all(flowId) as TaskFlowStepRow[];
+      return rows.map(mapTaskFlowStep);
+    },
+
+    transitionTaskFlowStep(input: {
+      stepId: string;
+      taskId?: string | null;
+      status?: TaskFlowStepStatus;
+      completedAt?: number | null;
+    }) {
+      updateTaskFlowStepStmt.run({
+        id: input.stepId,
+        task_id: input.taskId ?? null,
+        status: input.status ?? null,
+        updated_at: now(),
+        completed_at: input.completedAt ?? null,
+      });
+      return store.getTaskFlowStep(input.stepId);
+    },
+
+    replaceMemoryIndex(
+      agentId: string,
+      entries: Array<{
+        path: string;
+        kind: MemorySearchResult["kind"];
+        line: number;
+        reason: string;
+        text: string;
+      }>,
+    ) {
+      const tx = db.transaction(() => {
+        deleteMemoryIndexForAgentStmt.run(agentId);
+        for (const entry of entries) {
+          insertMemoryIndexStmt.run({
+            agent_id: agentId,
+            path: entry.path,
+            kind: entry.kind,
+            line: entry.line,
+            reason: entry.reason,
+            text: entry.text,
+          });
+        }
+      });
+      tx();
+      return entries.length;
+    },
+
+    searchMemoryIndex(agentId: string, query: string, maxResults = 8): MemorySearchResult[] {
+      if (!query.trim()) {
+        return [];
+      }
+      const tokens = query
+        .toLowerCase()
+        .split(/[\s,.;:!?()[\]{}"']+/)
+        .filter((token) => token.length >= 2)
+        .map((token) => `"${token.replace(/"/g, '""')}"`);
+      if (!tokens.length) {
+        return [];
+      }
+      const rows = db
+        .prepare(
+          `SELECT path, kind, line, reason, text, bm25(memory_index) AS score
+           FROM memory_index
+           WHERE memory_index MATCH ? AND agent_id = ?
+           ORDER BY score
+           LIMIT ?`,
+        )
+        .all(tokens.join(" OR "), agentId, maxResults) as Array<{
+          path: string;
+          kind: MemorySearchResult["kind"];
+          line: number | string;
+          reason: string;
+          text: string;
+          score: number;
+        }>;
+      return rows.map((row) => ({
+        path: row.path,
+        kind: row.kind,
+        line: typeof row.line === "number" ? row.line : Number.parseInt(String(row.line), 10) || 1,
+        reason: row.reason,
+        text: row.text,
+        score: typeof row.score === "number" ? row.score : 0,
+      }));
     },
 
     getProviderAccount(kind: ProviderKind): ProviderAccountRecord | null {

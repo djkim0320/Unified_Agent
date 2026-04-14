@@ -17,6 +17,35 @@ export const corePlugin: RegisteredPlugin = {
     id: "core",
     name: "Core Tools",
     version: "1.0.0",
+    description: "Built-in workspace, research, memory, task, and execution tools.",
+    tools: [
+      "list_tree",
+      "read_file",
+      "write_file",
+      "edit_file",
+      "make_dir",
+      "move_path",
+      "delete_path",
+      "exec_command",
+      "provider_web_search",
+      "duckduckgo_search",
+      "web_fetch",
+      "browser_search",
+      "browser_open",
+      "browser_snapshot",
+      "browser_extract",
+      "browser_click",
+      "browser_type",
+      "browser_back",
+      "browser_close",
+      "memory_get",
+      "memory_search",
+      "memory_write",
+      "spawn_subagent_session",
+      "spawn_task",
+      "schedule_task",
+      "create_task_flow",
+    ],
     skills: [
       {
         name: "workspace-runtime",
@@ -26,7 +55,12 @@ export const corePlugin: RegisteredPlugin = {
           "- Use sandbox files for session-specific work and shared only for intentionally shared artifacts.",
           "- Prefer provider_web_search or duckduckgo_search for simple research, web_fetch for a known URL, and browser_* for rendered pages.",
           "- When the user asks to remember a durable preference, call memory_write before answering.",
+          "- Use standing orders and memory as durable operating context, not as a replacement for the current task.",
+          "- Use spawn_subagent_session when a bounded child session can investigate or implement in parallel without blocking the parent transcript.",
           "- Use spawn_task for long-running detached work instead of blocking the foreground session.",
+          "- Use create_task_flow when a multi-step background sequence should run in order with explicit dependencies.",
+          "- Use schedule_task when the follow-up should happen later instead of immediately.",
+          "- Nested spawned tasks are allowed only up to depth 2.",
           "- Use exec_command only with a direct program plus args. Raw shells are disabled unless unsafe mode is explicitly enabled.",
         ].join("\n"),
       },
@@ -490,6 +524,67 @@ export function registerCoreTools(registry: ReturnType<typeof createToolRegistry
   });
 
   registry.register({
+    name: "spawn_subagent_session",
+    description: "Spawn a child session that works in parallel and reports back into the parent session.",
+    permission: "tasks",
+    risk: "medium",
+    costHint: "moderate",
+    concurrencyClass: "exclusive",
+    batchable: false,
+    rolePolicy: {
+      allowPrimary: true,
+      allowSubagent: true,
+      maxNestingDepth: 2,
+    },
+    audit: {
+      category: "subagent",
+      safeByDefault: true,
+    },
+    schema: z.object({
+      prompt: z.string().min(1),
+      title: z.string().min(1).optional(),
+      providerKind: z.enum(["openai", "anthropic", "gemini", "ollama", "openai-codex"]).optional(),
+      model: z.string().min(1).optional(),
+      reasoningLevel: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+    }),
+    example:
+      '{"type":"tool_call","tool":{"name":"spawn_subagent_session","arguments":{"title":"Investigate tests","prompt":"Inspect the failing tests and summarize the root cause."}}}',
+    async execute({
+      arguments: args,
+      agentId,
+      conversationId,
+      runId,
+      sessionManager,
+      adapter,
+      model,
+      reasoningLevel,
+    }) {
+      if (!sessionManager) {
+        throw new Error("Sub-agent session manager is unavailable.");
+      }
+      const created = await sessionManager.spawnSubagentSession({
+        agentId,
+        parentConversationId: conversationId,
+        parentRunId: runId,
+        prompt: args.prompt as string,
+        title: typeof args.title === "string" ? args.title : undefined,
+        providerKind: (args.providerKind as typeof adapter.kind | undefined) ?? adapter.kind,
+        model: typeof args.model === "string" ? (args.model as string) : model,
+        reasoningLevel:
+          (args.reasoningLevel as typeof reasoningLevel | undefined) ?? reasoningLevel,
+      });
+      return {
+        sessionId: created.session.id,
+        taskId: created.task.id,
+        title: created.session.title,
+        providerKind: created.session.providerKind,
+        model: created.session.model,
+        reasoningLevel: created.session.reasoningLevel,
+      };
+    },
+  });
+
+  registry.register({
     name: "spawn_task",
     description: "Queue a detached background task for the current agent and session.",
     permission: "tasks",
@@ -506,13 +601,15 @@ export function registerCoreTools(registry: ReturnType<typeof createToolRegistry
       adapter,
       model,
       reasoningLevel,
-      isDetachedTask,
+      currentTaskId,
+      nestingDepth,
     }) {
-      if (isDetachedTask) {
-        throw new Error("Detached tasks cannot spawn nested detached tasks.");
-      }
       if (!taskManager) {
         throw new Error("Task manager is unavailable.");
+      }
+      const nextDepth = (nestingDepth ?? 0) + 1;
+      if (nextDepth > 2) {
+        throw new Error("Nested tasks are limited to depth 2.");
       }
       const task = await taskManager.enqueueDetachedTask({
         agentId,
@@ -522,10 +619,139 @@ export function registerCoreTools(registry: ReturnType<typeof createToolRegistry
         providerKind: adapter.kind,
         model,
         reasoningLevel,
+        taskKind: "detached",
+        parentTaskId: currentTaskId ?? null,
+        nestingDepth: nextDepth,
       });
       return {
         taskId: task.id,
         status: "queued",
+      };
+    },
+  });
+
+  registry.register({
+    name: "create_task_flow",
+    description: "Create a multi-step background flow with ordered dependencies.",
+    permission: "tasks",
+    risk: "medium",
+    costHint: "moderate",
+    concurrencyClass: "exclusive",
+    batchable: false,
+    rolePolicy: {
+      allowPrimary: true,
+      allowSubagent: true,
+      maxNestingDepth: 2,
+    },
+    audit: {
+      category: "automation",
+      safeByDefault: true,
+    },
+    schema: z.object({
+      title: z.string().min(1),
+      steps: z
+        .array(
+          z.object({
+            stepKey: z.string().min(1),
+            title: z.string().min(1),
+            prompt: z.string().min(1),
+            dependencyStepKey: z.string().min(1).optional(),
+          }),
+        )
+        .min(1)
+        .max(8),
+    }),
+    example:
+      '{"type":"tool_call","tool":{"name":"create_task_flow","arguments":{"title":"Ship patch","steps":[{"stepKey":"inspect","title":"Inspect repo","prompt":"Inspect the relevant files."},{"stepKey":"implement","title":"Implement changes","prompt":"Make the required changes.","dependencyStepKey":"inspect"}]}}}',
+    async execute({ arguments: args, agentId, conversationId, flowManager, runId }) {
+      if (!flowManager) {
+        throw new Error("Task flow manager is unavailable.");
+      }
+      const created = await flowManager.createFlow({
+        agentId,
+        conversationId,
+        title: args.title as string,
+        originRunId: runId,
+        steps: (args.steps as Array<{
+          stepKey: string;
+          title: string;
+          prompt: string;
+          dependencyStepKey?: string;
+        }>).map((step) => ({
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: step.prompt,
+          dependencyStepKey: step.dependencyStepKey ?? null,
+        })),
+      });
+      return {
+        flowId: created.flow.id,
+        status: created.flow.status,
+        steps: created.steps.map((step) => ({
+          id: step.id,
+          stepKey: step.stepKey,
+          status: step.status,
+        })),
+      };
+    },
+  });
+
+  registry.register({
+    name: "schedule_task",
+    description: "Schedule a background task for later execution.",
+    permission: "tasks",
+    schema: z.object({
+      prompt: z.string().min(1),
+      title: z.string().min(1).optional(),
+      delayMs: z.number().int().min(1).max(7 * 24 * 60 * 60 * 1000).optional(),
+      scheduledFor: z.number().int().min(0).optional(),
+    }),
+    example: '{"type":"tool_call","tool":{"name":"schedule_task","arguments":{"title":"Follow up later","prompt":"Check whether the workspace diff is clean.","delayMs":600000}}}',
+    async execute({
+      arguments: args,
+      agentId,
+      conversationId,
+      taskManager,
+      adapter,
+      model,
+      reasoningLevel,
+      currentTaskId,
+      nestingDepth,
+    }) {
+      if (!taskManager) {
+        throw new Error("Task manager is unavailable.");
+      }
+      const nextDepth = (nestingDepth ?? 0) + 1;
+      if (nextDepth > 2) {
+        throw new Error("Nested tasks are limited to depth 2.");
+      }
+      const scheduledFor =
+        typeof args.scheduledFor === "number"
+          ? args.scheduledFor
+          : typeof args.delayMs === "number"
+            ? Date.now() + args.delayMs
+            : null;
+      if (scheduledFor == null) {
+        throw new Error("schedule_task requires delayMs or scheduledFor.");
+      }
+      const task = await taskManager.enqueueDetachedTask({
+        agentId,
+        conversationId,
+        prompt: args.prompt as string,
+        title: typeof args.title === "string" ? args.title : undefined,
+        providerKind: adapter.kind,
+        model,
+        reasoningLevel,
+        taskKind: "scheduled",
+        parentTaskId: currentTaskId ?? null,
+        nestingDepth: nextDepth,
+        scheduledFor,
+        startImmediately: false,
+      });
+      return {
+        taskId: task.id,
+        status: "queued",
+        scheduledFor,
       };
     },
   });

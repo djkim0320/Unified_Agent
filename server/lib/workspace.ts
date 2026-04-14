@@ -1,6 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { WorkspaceFileRecord, WorkspaceScope, WorkspaceTreeNode } from "../types.js";
+import { parseHeartbeatDocument, serializeHeartbeatDocument } from "./heartbeat-config.js";
+import type {
+  AgentHeartbeatRecord,
+  AgentStandingOrdersRecord,
+  AgentSoulRecord,
+  WorkspaceFileRecord,
+  WorkspaceScope,
+  WorkspaceTreeNode,
+} from "../types.js";
 
 const TEXT_EXTENSIONS = new Set([
   ".md",
@@ -284,10 +292,42 @@ export function createWorkspaceManager(
   function createAgentWorkspace(agentId: string) {
     const agentDir = getAgentDir(agentId);
     fs.mkdirSync(path.join(agentDir, "memory"), { recursive: true });
+    fs.mkdirSync(path.join(agentDir, "summaries"), { recursive: true });
+    fs.mkdirSync(path.join(agentDir, "outcomes"), { recursive: true });
     readBootstrapFile(
       agentDir,
       "MEMORY.md",
       ["# MEMORY", "", "Durable facts, preferences, and decisions for this agent."].join("\n"),
+    );
+    readBootstrapFile(
+      agentDir,
+      "SOUL.md",
+      ["# SOUL", "", "Identity, values, and preferred tone for this agent."].join("\n"),
+    );
+    readBootstrapFile(
+      agentDir,
+      "HEARTBEAT.md",
+      [
+        "---",
+        "enabled: false",
+        "interval_minutes: 60",
+        "last_run: null",
+        "---",
+        "",
+        "# HEARTBEAT",
+        "",
+        "Describe what the agent should inspect or update when the heartbeat runs.",
+      ].join("\n"),
+    );
+    readBootstrapFile(
+      agentDir,
+      "STANDING_ORDERS.md",
+      [
+        "# STANDING ORDERS",
+        "",
+        "- Apply these rules to every foreground, background, and sub-agent run.",
+        "- Keep work scoped, auditable, and reversible when possible.",
+      ].join("\n"),
     );
     readBootstrapFile(
       agentDir,
@@ -331,6 +371,70 @@ export function createWorkspaceManager(
       dailyNote: fs.readFileSync(dailyPath, "utf8"),
       date: todayMemoryFileName().replace(".md", ""),
     };
+  }
+
+  function readAgentSoul(agentId: string): AgentSoulRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const soulPath = path.join(agentDir, "SOUL.md");
+    return {
+      path: "SOUL.md",
+      content: fs.readFileSync(soulPath, "utf8"),
+    };
+  }
+
+  function writeAgentSoul(agentId: string, content: string): AgentSoulRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const soulPath = path.join(agentDir, "SOUL.md");
+    fs.writeFileSync(soulPath, content, "utf8");
+    return readAgentSoul(agentId);
+  }
+
+  function readAgentStandingOrders(agentId: string): AgentStandingOrdersRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const standingOrdersPath = path.join(agentDir, "STANDING_ORDERS.md");
+    return {
+      path: "STANDING_ORDERS.md",
+      content: fs.readFileSync(standingOrdersPath, "utf8"),
+    };
+  }
+
+  function writeAgentStandingOrders(agentId: string, content: string): AgentStandingOrdersRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const standingOrdersPath = path.join(agentDir, "STANDING_ORDERS.md");
+    fs.writeFileSync(standingOrdersPath, content, "utf8");
+    return readAgentStandingOrders(agentId);
+  }
+
+  function readAgentHeartbeat(agentId: string): AgentHeartbeatRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const heartbeatPath = path.join(agentDir, "HEARTBEAT.md");
+    const content = fs.readFileSync(heartbeatPath, "utf8");
+    const parsed = parseHeartbeatDocument(content);
+    return {
+      path: "HEARTBEAT.md",
+      content,
+      enabled: parsed.enabled,
+      intervalMinutes: parsed.intervalMinutes,
+      lastRun: parsed.lastRun,
+      instructions: parsed.instructions,
+      parseError: parsed.parseError,
+    };
+  }
+
+  function writeAgentHeartbeat(
+    agentId: string,
+    input: {
+      enabled: boolean;
+      intervalMinutes: number;
+      lastRun: string | null;
+      instructions: string;
+    },
+  ): AgentHeartbeatRecord {
+    const agentDir = createAgentWorkspace(agentId);
+    const heartbeatPath = path.join(agentDir, "HEARTBEAT.md");
+    const content = serializeHeartbeatDocument(input);
+    fs.writeFileSync(heartbeatPath, content, "utf8");
+    return readAgentHeartbeat(agentId);
   }
 
   function appendAgentMemory(params: {
@@ -752,6 +856,12 @@ export function createWorkspaceManager(
     deletePath,
     resolveSandboxDirectory,
     readAgentMemory,
+    readAgentSoul,
+    writeAgentSoul,
+    readAgentStandingOrders,
+    writeAgentStandingOrders,
+    readAgentHeartbeat,
+    writeAgentHeartbeat,
     appendAgentMemory,
     searchAgentMemory,
     readGuides,

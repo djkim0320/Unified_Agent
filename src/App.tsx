@@ -1,9 +1,17 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   cancelAgentTask,
   deleteConversation,
+  deleteAgent,
   createAgentTask,
+  cancelSubagentSession,
+  cancelTaskFlow,
+  createSubagentSession,
+  createTaskFlow,
+  getAgentStandingOrders,
   getAgentMemory,
+  getAgentHeartbeat,
+  getAgentSoul,
   getConversationMessages,
   getWorkspaceFile,
   getWorkspaceTree,
@@ -11,20 +19,36 @@ import {
   listAgentTasks,
   listAgents,
   listConversations,
+  listSubagentSessions,
   listModels,
+  listHeartbeatLogs,
+  listPlatformMetadata,
   listProviders,
   listTaskEvents,
+  listTaskFlows,
   listWorkspaceRunEvents,
   listWorkspaceRuns,
   logoutCodex,
+  saveAgentStandingOrders,
   saveAgent,
+  saveAgentHeartbeat,
+  saveAgentSoul,
   saveConversation,
   saveProviderAccount,
   startCodexOAuth,
+  triggerAgentHeartbeat,
+  searchAgentMemory,
+  getTaskFlow,
   streamChat,
   testProvider,
 } from "./api";
 import { ChatView } from "./components/ChatView";
+import {
+  AgentSettingsDialog,
+  type AgentDraft,
+  type AgentHeartbeatDraft,
+  type AgentSoulDraft,
+} from "./components/AgentSettingsDialog";
 import { Composer } from "./components/Composer";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConversationList } from "./components/ConversationList";
@@ -39,13 +63,21 @@ import {
   providerLabels,
   type AgentMemoryRecord,
   type AgentRecord,
+  type AgentHeartbeatRecord,
   type ConversationRecord,
   type DisplayMessage,
+  type HeartbeatLogRecord,
+  type AgentSoulRecord,
+  type MemorySearchResult,
   type ProviderDraft,
   type ProviderKind,
+  type PlatformMetadata,
   type ProviderSummary,
+  type StandingOrdersRecord,
   type StreamEventPayloadMap,
   type TaskEventRecord,
+  type TaskFlowRecord,
+  type TaskFlowStepRecord,
   type TaskRecord,
   type WorkspaceFileRecord,
   type WorkspaceRunEventRecord,
@@ -92,6 +124,33 @@ function createErrorMap(): Record<ProviderKind, string | null> {
     ollama: null,
     "openai-codex": null,
   } satisfies Record<ProviderKind, string | null>;
+}
+
+function createAgentDraft(agent: AgentRecord | null): AgentDraft {
+  const providerKind = agent?.providerKind ?? "openai";
+  const model = agent?.model ?? defaultModels[providerKind];
+  return {
+    name: agent?.name ?? "새 에이전트",
+    providerKind,
+    model,
+    reasoningLevel: normalizeReasoningLevel(
+      providerKind,
+      model,
+      agent?.reasoningLevel ?? defaultReasoningLevels[providerKind],
+    ),
+  };
+}
+
+function createAgentSoulDraft(soul: AgentSoulRecord | null): AgentSoulDraft {
+  return soul?.content ?? "";
+}
+
+function createAgentHeartbeatDraft(heartbeat: AgentHeartbeatRecord | null): AgentHeartbeatDraft {
+  return {
+    enabled: heartbeat?.enabled ?? false,
+    intervalMinutes: String(heartbeat?.intervalMinutes ?? 60),
+    instructions: heartbeat?.instructions ?? "",
+  };
 }
 
 function mergeConversationList(
@@ -203,6 +262,29 @@ export default function App() {
     createEmptyDrafts(),
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [agentSettingsOpen, setAgentSettingsOpen] = useState(false);
+  const [agentDraft, setAgentDraft] = useState<AgentDraft>(() => createAgentDraft(null));
+  const [agentSoul, setAgentSoul] = useState<AgentSoulRecord | null>(null);
+  const [agentSoulDraft, setAgentSoulDraft] = useState<AgentSoulDraft>("");
+  const [agentHeartbeat, setAgentHeartbeat] = useState<AgentHeartbeatRecord | null>(null);
+  const [agentHeartbeatDraft, setAgentHeartbeatDraft] = useState<AgentHeartbeatDraft>(() =>
+    createAgentHeartbeatDraft(null),
+  );
+  const [standingOrders, setStandingOrders] = useState<StandingOrdersRecord | null>(null);
+  const [standingOrdersDraft, setStandingOrdersDraft] = useState("");
+  const [memorySearchResults, setMemorySearchResults] = useState<MemorySearchResult[]>([]);
+  const [memorySearchLoading, setMemorySearchLoading] = useState(false);
+  const [subagentSessions, setSubagentSessions] = useState<ConversationRecord[]>([]);
+  const [taskFlows, setTaskFlows] = useState<TaskFlowRecord[]>([]);
+  const [selectedTaskFlowId, setSelectedTaskFlowId] = useState<string | null>(null);
+  const [selectedTaskFlow, setSelectedTaskFlow] = useState<{
+    flow: TaskFlowRecord;
+    steps: TaskFlowStepRecord[];
+  } | null>(null);
+  const [heartbeatLogs, setHeartbeatLogs] = useState<HeartbeatLogRecord[]>([]);
+  const [savingAgent, setSavingAgent] = useState(false);
+  const [savingStandingOrders, setSavingStandingOrders] = useState(false);
+  const [deletingAgentId, setDeletingAgentId] = useState<string | null>(null);
   const [savingKind, setSavingKind] = useState<ProviderKind | null>(null);
   const [testingKind, setTestingKind] = useState<ProviderKind | null>(null);
   const [streaming, setStreaming] = useState(false);
@@ -216,6 +298,8 @@ export default function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [taskEvents, setTaskEvents] = useState<TaskEventRecord[]>([]);
+  const [platformMetadata, setPlatformMetadata] = useState<PlatformMetadata | null>(null);
+  const [platformMetadataLoading, setPlatformMetadataLoading] = useState(false);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
   const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
@@ -226,6 +310,7 @@ export default function App() {
   const activeAgentIdRef = useRef<string | null>(null);
   const selectedRunIdRef = useRef<string | null>(null);
   const selectedTaskIdRef = useRef<string | null>(null);
+  const selectedTaskFlowIdRef = useRef<string | null>(null);
   const manualRunSelectionRef = useRef(false);
   const lastConversationIdRef = useRef<string | null>(null);
   const conversationListSeqRef = useRef(0);
@@ -242,6 +327,24 @@ export default function App() {
   const taskEventsControllerRef = useRef<AbortController | null>(null);
   const memorySeqRef = useRef(0);
   const memoryControllerRef = useRef<AbortController | null>(null);
+  const soulSeqRef = useRef(0);
+  const soulControllerRef = useRef<AbortController | null>(null);
+  const heartbeatSeqRef = useRef(0);
+  const heartbeatControllerRef = useRef<AbortController | null>(null);
+  const heartbeatLogsSeqRef = useRef(0);
+  const heartbeatLogsControllerRef = useRef<AbortController | null>(null);
+  const standingOrdersSeqRef = useRef(0);
+  const standingOrdersControllerRef = useRef<AbortController | null>(null);
+  const memorySearchSeqRef = useRef(0);
+  const memorySearchControllerRef = useRef<AbortController | null>(null);
+  const subagentSessionsSeqRef = useRef(0);
+  const subagentSessionsControllerRef = useRef<AbortController | null>(null);
+  const taskFlowsSeqRef = useRef(0);
+  const taskFlowsControllerRef = useRef<AbortController | null>(null);
+  const taskFlowDetailSeqRef = useRef(0);
+  const taskFlowDetailControllerRef = useRef<AbortController | null>(null);
+  const platformMetadataSeqRef = useRef(0);
+  const platformMetadataControllerRef = useRef<AbortController | null>(null);
   const workspaceEventsSeqRef = useRef(0);
   const workspaceEventsControllerRef = useRef<AbortController | null>(null);
   const workspaceFileSeqRef = useRef(0);
@@ -259,12 +362,35 @@ export default function App() {
   }, [activeAgentId, agents]);
 
   useEffect(() => {
+    if (!agentSettingsOpen) {
+      setAgentDraft(createAgentDraft(activeAgent));
+      setAgentSoulDraft(createAgentSoulDraft(agentSoul));
+      setAgentHeartbeatDraft(createAgentHeartbeatDraft(agentHeartbeat));
+      setStandingOrdersDraft(standingOrders?.content ?? "");
+    }
+  }, [activeAgent, agentHeartbeat, agentSettingsOpen, agentSoul, standingOrders]);
+
+  useEffect(() => {
     selectedRunIdRef.current = selectedRunId;
   }, [selectedRunId]);
 
   useEffect(() => {
     selectedTaskIdRef.current = selectedTaskId;
   }, [selectedTaskId]);
+
+  useEffect(() => {
+    selectedTaskFlowIdRef.current = selectedTaskFlowId;
+  }, [selectedTaskFlowId]);
+
+  useEffect(() => {
+    if (!activeAgentId) {
+      setSelectedTaskFlowId(null);
+      setSelectedTaskFlow(null);
+      return;
+    }
+
+    void refreshTaskFlowDetail(activeAgentId, selectedTaskFlowId);
+  }, [activeAgentId, selectedTaskFlowId]);
 
   const providersByKind = useMemo(
     () =>
@@ -275,12 +401,24 @@ export default function App() {
     [providers],
   );
 
-  function abortAllPendingRequests() {
+  function abortAgentScopedRequests() {
     abortRef(conversationListControllerRef);
     abortConversationScopedRequests();
     abortRef(tasksControllerRef);
     abortRef(taskEventsControllerRef);
     abortRef(memoryControllerRef);
+    abortRef(soulControllerRef);
+    abortRef(heartbeatControllerRef);
+    abortRef(heartbeatLogsControllerRef);
+    abortRef(standingOrdersControllerRef);
+    abortRef(memorySearchControllerRef);
+    abortRef(taskFlowsControllerRef);
+    abortRef(taskFlowDetailControllerRef);
+  }
+
+  function abortAllPendingRequests() {
+    abortAgentScopedRequests();
+    abortRef(platformMetadataControllerRef);
   }
 
   function abortConversationScopedRequests() {
@@ -290,9 +428,12 @@ export default function App() {
     abortRef(workspaceEventsControllerRef);
     abortRef(workspaceFileControllerRef);
     abortRef(streamControllerRef);
+    abortRef(subagentSessionsControllerRef);
   }
 
   function resetConversationWorkspaceState() {
+    selectedRunIdRef.current = null;
+    manualRunSelectionRef.current = false;
     setWorkspaceTree([]);
     setWorkspaceFile(null);
     setWorkspaceRuns([]);
@@ -303,12 +444,25 @@ export default function App() {
     setWorkspaceTreeLoading(false);
     setWorkspaceRunsLoading(false);
     setWorkspaceFileLoading(false);
+    setSubagentSessions([]);
   }
 
   function resetWorkspaceState() {
     resetConversationWorkspaceState();
+    selectedTaskIdRef.current = null;
+    selectedTaskFlowIdRef.current = null;
+    setSelectedTaskFlowId(null);
     setTasks([]);
     setAgentMemory(null);
+    setAgentSoul(null);
+    setAgentHeartbeat(null);
+    setStandingOrders(null);
+    setStandingOrdersDraft("");
+    setMemorySearchResults([]);
+    setMemorySearchLoading(false);
+    setTaskFlows([]);
+    setSelectedTaskFlow(null);
+    setHeartbeatLogs([]);
     setSelectedTaskId(null);
     setTaskEvents([]);
   }
@@ -351,7 +505,7 @@ export default function App() {
 
       const nextId =
         preferredConversationId &&
-        response.conversations.some((item) => item.id === preferredConversationId)
+          response.conversations.some((item) => item.id === preferredConversationId)
           ? preferredConversationId
           : response.conversations[0]?.id ?? null;
 
@@ -588,6 +742,282 @@ export default function App() {
     }
   }
 
+  async function refreshAgentSoul(agentId: string) {
+    const request = beginRequest(soulSeqRef, soulControllerRef);
+
+    try {
+      const response = await getAgentSoul(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        soulSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setAgentSoul(response.soul);
+    } catch (error) {
+      if (request.controller.signal.aborted || soulSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "SOUL.md를 불러오지 못했습니다.");
+    } finally {
+      if (soulSeqRef.current === request.seq) {
+        abortRef(soulControllerRef);
+      }
+    }
+  }
+
+  async function refreshStandingOrders(agentId: string) {
+    const request = beginRequest(standingOrdersSeqRef, standingOrdersControllerRef);
+
+    try {
+      const response = await getAgentStandingOrders(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        standingOrdersSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setStandingOrders(response.standingOrders);
+      setStandingOrdersDraft(response.standingOrders.content);
+    } catch (error) {
+      if (request.controller.signal.aborted || standingOrdersSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Failed to load standing orders.");
+    } finally {
+      if (standingOrdersSeqRef.current === request.seq) {
+        abortRef(standingOrdersControllerRef);
+      }
+    }
+  }
+
+  async function refreshMemorySearch(agentId: string, query: string) {
+    const trimmedQuery = query.trim();
+    const request = beginRequest(memorySearchSeqRef, memorySearchControllerRef);
+
+    if (!trimmedQuery) {
+      setMemorySearchResults([]);
+      setMemorySearchLoading(false);
+      abortRef(memorySearchControllerRef);
+      return;
+    }
+
+    setMemorySearchLoading(true);
+
+    try {
+      const response = await searchAgentMemory(agentId, { query: trimmedQuery, maxResults: 20 }, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        memorySearchSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setMemorySearchResults(response.results);
+    } catch (error) {
+      if (request.controller.signal.aborted || memorySearchSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Failed to search agent memory.");
+    } finally {
+      if (memorySearchSeqRef.current === request.seq) {
+        setMemorySearchLoading(false);
+        abortRef(memorySearchControllerRef);
+      }
+    }
+  }
+
+  async function refreshSubagentSessions(sessionId: string) {
+    const request = beginRequest(subagentSessionsSeqRef, subagentSessionsControllerRef);
+
+    try {
+      const response = await listSubagentSessions(sessionId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        subagentSessionsSeqRef.current !== request.seq ||
+        activeConversationIdRef.current !== sessionId
+      ) {
+        return;
+      }
+
+      setSubagentSessions(response.sessions);
+      setConversations((current) =>
+        response.sessions.reduce((next, session) => mergeConversationList(next, session), current),
+      );
+    } catch (error) {
+      if (request.controller.signal.aborted || subagentSessionsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Failed to load sub-agent sessions.");
+    } finally {
+      if (subagentSessionsSeqRef.current === request.seq) {
+        abortRef(subagentSessionsControllerRef);
+      }
+    }
+  }
+
+  async function refreshTaskFlows(agentId: string, preferredFlowId?: string | null) {
+    const request = beginRequest(taskFlowsSeqRef, taskFlowsControllerRef);
+
+    try {
+      const response = await listTaskFlows(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        taskFlowsSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setTaskFlows(response.flows);
+      const nextFlowId =
+        preferredFlowId && response.flows.some((flow) => flow.id === preferredFlowId)
+          ? preferredFlowId
+          : selectedTaskFlowIdRef.current && response.flows.some((flow) => flow.id === selectedTaskFlowIdRef.current)
+            ? selectedTaskFlowIdRef.current
+            : response.flows[0]?.id ?? null;
+
+      setSelectedTaskFlowId(nextFlowId);
+      if (!nextFlowId) {
+        setSelectedTaskFlow(null);
+      }
+    } catch (error) {
+      if (request.controller.signal.aborted || taskFlowsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Failed to load task flows.");
+    } finally {
+      if (taskFlowsSeqRef.current === request.seq) {
+        abortRef(taskFlowsControllerRef);
+      }
+    }
+  }
+
+  async function refreshTaskFlowDetail(agentId: string, flowId: string | null) {
+    const request = beginRequest(taskFlowDetailSeqRef, taskFlowDetailControllerRef);
+
+    if (!flowId) {
+      setSelectedTaskFlow(null);
+      abortRef(taskFlowDetailControllerRef);
+      return;
+    }
+
+    try {
+      const response = await getTaskFlow(flowId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        taskFlowDetailSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId ||
+        selectedTaskFlowIdRef.current !== flowId
+      ) {
+        return;
+      }
+
+      setSelectedTaskFlow(response);
+    } catch (error) {
+      if (request.controller.signal.aborted || taskFlowDetailSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Failed to load task flow details.");
+    } finally {
+      if (taskFlowDetailSeqRef.current === request.seq) {
+        abortRef(taskFlowDetailControllerRef);
+      }
+    }
+  }
+
+  async function refreshAgentHeartbeat(agentId: string) {
+    const request = beginRequest(heartbeatSeqRef, heartbeatControllerRef);
+
+    try {
+      const response = await getAgentHeartbeat(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        heartbeatSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setAgentHeartbeat(response.heartbeat);
+    } catch (error) {
+      if (request.controller.signal.aborted || heartbeatSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "HEARTBEAT.md를 불러오지 못했습니다.");
+    } finally {
+      if (heartbeatSeqRef.current === request.seq) {
+        abortRef(heartbeatControllerRef);
+      }
+    }
+  }
+
+  async function refreshHeartbeatLogs(agentId: string) {
+    const request = beginRequest(heartbeatLogsSeqRef, heartbeatLogsControllerRef);
+
+    try {
+      const response = await listHeartbeatLogs(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        heartbeatLogsSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setHeartbeatLogs(response.logs);
+    } catch (error) {
+      if (request.controller.signal.aborted || heartbeatLogsSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "Heartbeat 로그를 불러오지 못했습니다.");
+    } finally {
+      if (heartbeatLogsSeqRef.current === request.seq) {
+        abortRef(heartbeatLogsControllerRef);
+      }
+    }
+  }
+
+  async function refreshPlatformMetadata(agentId = activeAgentIdRef.current) {
+    const request = beginRequest(platformMetadataSeqRef, platformMetadataControllerRef);
+    setPlatformMetadataLoading(true);
+
+    try {
+      const response = await listPlatformMetadata(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        platformMetadataSeqRef.current !== request.seq ||
+        agentId !== activeAgentIdRef.current
+      ) {
+        return;
+      }
+      setPlatformMetadata(response);
+    } catch (error) {
+      if (request.controller.signal.aborted || platformMetadataSeqRef.current !== request.seq) {
+        return;
+      }
+      setAppNotice(error instanceof Error ? error.message : "플랫폼 정보를 불러오지 못했습니다.");
+    } finally {
+      if (platformMetadataSeqRef.current === request.seq) {
+        setPlatformMetadataLoading(false);
+        abortRef(platformMetadataControllerRef);
+      }
+    }
+  }
+
   async function refreshWorkspaceRunEvents(conversationId: string, runId: string | null) {
     const request = beginRequest(workspaceEventsSeqRef, workspaceEventsControllerRef);
 
@@ -599,7 +1029,12 @@ export default function App() {
 
     try {
       const response = await listWorkspaceRunEvents(conversationId, runId, request.controller.signal);
-      if (request.controller.signal.aborted || workspaceEventsSeqRef.current !== request.seq) {
+      if (
+        request.controller.signal.aborted ||
+        workspaceEventsSeqRef.current !== request.seq ||
+        activeConversationIdRef.current !== conversationId ||
+        selectedRunIdRef.current !== runId
+      ) {
         return;
       }
 
@@ -699,7 +1134,8 @@ export default function App() {
     void (async () => {
       try {
         await refreshProviders();
-        await refreshAgents();
+        const loadedAgents = await refreshAgents();
+        await refreshPlatformMetadata(loadedAgents[0]?.id ?? null);
       } catch (error) {
         if (!cancelled) {
           setAppNotice(error instanceof Error ? error.message : "초기 데이터를 불러오지 못했습니다.");
@@ -753,10 +1189,22 @@ export default function App() {
 
   useEffect(() => {
     if (!activeAgentId) {
+      setPlatformMetadata(null);
+      setAgentSoul(null);
+      setAgentHeartbeat(null);
+      setHeartbeatLogs([]);
+      setStandingOrders(null);
+      setStandingOrdersDraft("");
+      setMemorySearchResults([]);
+      setMemorySearchLoading(false);
+      setTaskFlows([]);
+      setSelectedTaskFlowId(null);
+      setSelectedTaskFlow(null);
+      setSubagentSessions([]);
       return;
     }
 
-    abortAllPendingRequests();
+    abortAgentScopedRequests();
     resetWorkspaceState();
     setActiveConversation(null);
     setActiveConversationId(null);
@@ -767,6 +1215,12 @@ export default function App() {
     manualRunSelectionRef.current = false;
 
     void (async () => {
+      void refreshPlatformMetadata(activeAgentId);
+      void refreshAgentSoul(activeAgentId);
+      void refreshAgentHeartbeat(activeAgentId);
+      void refreshHeartbeatLogs(activeAgentId);
+      void refreshStandingOrders(activeAgentId);
+      void refreshTaskFlows(activeAgentId);
       const loadedConversations = await refreshConversationList(null, activeAgentId);
       void refreshAgentTasks(activeAgentId);
       void refreshAgentMemory(activeAgentId);
@@ -794,10 +1248,12 @@ export default function App() {
     }
 
     if (!activeConversationId) {
+      setSubagentSessions([]);
       return;
     }
 
     void loadConversation(activeConversationId);
+    void refreshSubagentSessions(activeConversationId);
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -949,27 +1405,179 @@ export default function App() {
     setActiveAgentId(agentId);
   }
 
+  function handleOpenAgentSettings() {
+    setSettingsOpen(false);
+    setAgentDraft(createAgentDraft(activeAgent));
+    setAgentSoulDraft(createAgentSoulDraft(agentSoul));
+    setAgentHeartbeatDraft(createAgentHeartbeatDraft(agentHeartbeat));
+    setStandingOrdersDraft(standingOrders?.content ?? "");
+    setAgentSettingsOpen(true);
+  }
+
+  function handleOpenProviderSettings() {
+    setAgentSettingsOpen(false);
+    setSettingsOpen(true);
+  }
+
+  async function handleSaveAgentDefaults() {
+    if (!activeAgentId) {
+      setAppNotice("수정할 에이전트를 선택하세요.");
+      return;
+    }
+
+    const agentId = activeAgentId;
+    const parsedIntervalMinutes = Number.parseInt(agentHeartbeatDraft.intervalMinutes, 10);
+    if (!Number.isInteger(parsedIntervalMinutes) || parsedIntervalMinutes < 1) {
+      setAppNotice("Heartbeat 주기는 1분 이상의 정수여야 합니다.");
+      return;
+    }
+
+    setSavingAgent(true);
+    try {
+      const agentResponse = await saveAgent({
+        agentId,
+        name: agentDraft.name.trim(),
+        providerKind: agentDraft.providerKind,
+        model: agentDraft.model,
+        reasoningLevel: normalizeReasoningLevel(
+          agentDraft.providerKind,
+          agentDraft.model,
+          agentDraft.reasoningLevel,
+        ),
+      });
+      setAgents((current) =>
+        current.map((agent) => (agent.id === agentResponse.agent.id ? agentResponse.agent : agent)),
+      );
+      const soulResponse = await saveAgentSoul(agentId, {
+        content: agentSoulDraft,
+      });
+      const heartbeatResponse = await saveAgentHeartbeat(agentId, {
+        enabled: agentHeartbeatDraft.enabled,
+        intervalMinutes: parsedIntervalMinutes,
+        instructions: agentHeartbeatDraft.instructions,
+      });
+      if (activeAgentIdRef.current === agentId) {
+        setActiveAgent(agentResponse.agent);
+        setAgentDraft(createAgentDraft(agentResponse.agent));
+        setAgentSoul(soulResponse.soul);
+        setAgentSoulDraft(soulResponse.soul.content);
+        setAgentHeartbeat(heartbeatResponse.heartbeat);
+        setAgentHeartbeatDraft(createAgentHeartbeatDraft(heartbeatResponse.heartbeat));
+        setAppNotice("에이전트 설정을 저장했습니다.");
+      }
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "에이전트 설정 저장에 실패했습니다.");
+    } finally {
+      setSavingAgent(false);
+    }
+  }
+
+  async function handleSaveStandingOrders() {
+    if (!activeAgentId) {
+      setAppNotice("Please select an agent first.");
+      return;
+    }
+
+    const agentId = activeAgentId;
+    setSavingStandingOrders(true);
+    try {
+      const response = await saveAgentStandingOrders(agentId, {
+        content: standingOrdersDraft,
+      });
+      if (activeAgentIdRef.current === agentId) {
+        setStandingOrders(response.standingOrders);
+        setStandingOrdersDraft(response.standingOrders.content);
+        setAppNotice("Standing orders saved.");
+      }
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Failed to save standing orders.");
+    } finally {
+      setSavingStandingOrders(false);
+    }
+  }
+
+  async function handleDeleteAgent(agentId: string) {
+    if (agentId === "default-agent") {
+      setAppNotice("기본 에이전트는 삭제할 수 없습니다.");
+      return;
+    }
+
+    setDeletingAgentId(agentId);
+    try {
+      await deleteAgent(agentId);
+      const remaining = agents.filter((agent) => agent.id !== agentId);
+      const nextAgentId =
+        activeAgentId === agentId
+          ? remaining.find((agent) => agent.id === "default-agent")?.id ?? remaining[0]?.id ?? null
+          : activeAgentId;
+
+      setAgents(remaining);
+      if (nextAgentId !== activeAgentId) {
+        setActiveAgentId(nextAgentId);
+      }
+      setAgentSettingsOpen(false);
+      setAppNotice("에이전트를 삭제했습니다.");
+      await refreshAgents(nextAgentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "에이전트 삭제에 실패했습니다.");
+    } finally {
+      setDeletingAgentId(null);
+    }
+  }
+
+  function requestDeleteAgent(agentId: string) {
+    const agent = agents.find((item) => item.id === agentId) ?? null;
+    if (!agent) {
+      setAppNotice("삭제할 에이전트를 찾을 수 없습니다.");
+      return;
+    }
+
+    if (agent.id === "default-agent") {
+      setAppNotice("기본 에이전트는 삭제할 수 없습니다.");
+      return;
+    }
+
+    const confirmed =
+      typeof window === "undefined" ||
+      typeof window.confirm !== "function" ||
+      window.confirm(`"${agent.name}" 에이전트를 삭제할까요? 이 에이전트의 세션과 작업도 함께 정리됩니다.`);
+
+    if (!confirmed) {
+      return;
+    }
+
+    void handleDeleteAgent(agentId);
+  }
+
   async function handleStartBackgroundTask() {
     if (!activeAgentId || !activeConversation || !composerText.trim()) {
       setAppNotice("백그라운드 태스크로 실행할 내용을 입력하세요.");
       return;
     }
 
+    const agentId = activeAgentId;
+    const conversation = activeConversation;
     const prompt = composerText.trim();
     setComposerText("");
     try {
-      const response = await createAgentTask(activeAgentId, {
-        conversationId: activeConversation.id,
+      const response = await createAgentTask(agentId, {
+        conversationId: conversation.id,
         title: prompt.slice(0, 80),
         prompt,
-        providerKind: activeConversation.providerKind,
-        model: activeConversation.model,
-        reasoningLevel: activeConversation.reasoningLevel,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
       });
+      if (
+        activeAgentIdRef.current !== agentId ||
+        activeConversationIdRef.current !== conversation.id
+      ) {
+        return;
+      }
       setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
       setSelectedTaskId(response.task.id);
       setAppNotice("백그라운드 태스크를 시작했습니다.");
-      void refreshAgentTasks(activeAgentId);
+      void refreshAgentTasks(agentId);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "백그라운드 태스크를 시작하지 못했습니다.");
     }
@@ -980,16 +1588,157 @@ export default function App() {
       return;
     }
 
+    const agentId = activeAgentId;
     try {
-      const response = await cancelAgentTask(activeAgentId, taskId);
+      const response = await cancelAgentTask(agentId, taskId);
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
       setTasks((current) =>
         current.map((task) => (task.id === response.task.id ? response.task : task)),
       );
       setAppNotice("백그라운드 작업을 취소했습니다.");
-      void refreshAgentTasks(activeAgentId);
-      void refreshTaskEvents(activeAgentId, taskId);
+      void refreshAgentTasks(agentId);
+      void refreshTaskEvents(agentId, taskId);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "백그라운드 작업을 취소하지 못했습니다.");
+    }
+  }
+
+  async function handleMemorySearch(query: string) {
+    if (!activeAgentId) {
+      return;
+    }
+
+    await refreshMemorySearch(activeAgentId, query);
+  }
+
+  async function handleCreateSubagentSession(payload: { title?: string; prompt: string }) {
+    if (!activeConversation || !activeAgentId) {
+      setAppNotice("Please select a conversation first.");
+      return;
+    }
+
+    const conversation = activeConversation;
+    const agentId = activeAgentId;
+    try {
+      const response = await createSubagentSession(conversation.id, {
+        title: payload.title,
+        prompt: payload.prompt,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+      });
+      if (activeConversationIdRef.current !== conversation.id || activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setSubagentSessions((current) =>
+        [response.session, ...current.filter((session) => session.id !== response.session.id)].sort(
+          (left, right) => right.updatedAt - left.updatedAt,
+        ),
+      );
+      setConversations((current) => mergeConversationList(current, response.session));
+      setAppNotice("Sub-agent session created.");
+      void refreshSubagentSessions(conversation.id);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Failed to create a sub-agent session.");
+    }
+  }
+
+  async function handleCancelSubagentSession(sessionId: string) {
+    try {
+      await cancelSubagentSession(sessionId);
+      if (activeConversationIdRef.current) {
+        void refreshSubagentSessions(activeConversationIdRef.current);
+      }
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Failed to cancel the sub-agent session.");
+    }
+  }
+
+  async function handleCreateTaskFlow(payload: { title: string; prompt: string }) {
+    if (!activeAgentId) {
+      setAppNotice("Please select an agent first.");
+      return;
+    }
+
+    const agentId = activeAgentId;
+    try {
+      const response = await createTaskFlow(agentId, {
+        conversationId: activeConversationId ?? null,
+        title: payload.title,
+        steps: [
+          {
+            stepKey: "step-1",
+            title: payload.title,
+            prompt: payload.prompt,
+          },
+        ],
+      });
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setTaskFlows((current) =>
+        [response.flow, ...current.filter((flow) => flow.id !== response.flow.id)].sort(
+          (left, right) => right.updatedAt - left.updatedAt,
+        ),
+      );
+      setSelectedTaskFlowId(response.flow.id);
+      setSelectedTaskFlow({ flow: response.flow, steps: response.steps });
+      setAppNotice("Task flow created.");
+      void refreshTaskFlows(agentId, response.flow.id);
+      void refreshTaskFlowDetail(agentId, response.flow.id);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Failed to create a task flow.");
+    }
+  }
+
+  async function handleCancelTaskFlow(flowId: string) {
+    if (!activeAgentId) {
+      return;
+    }
+
+    const agentId = activeAgentId;
+    try {
+      await cancelTaskFlow(flowId);
+      if (activeAgentIdRef.current === agentId) {
+        if (selectedTaskFlowIdRef.current === flowId) {
+          setSelectedTaskFlow(null);
+        }
+        void refreshTaskFlows(agentId, selectedTaskFlowIdRef.current === flowId ? null : selectedTaskFlowIdRef.current);
+      }
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Failed to cancel the task flow.");
+    }
+  }
+
+  function handleSelectTaskFlow(flowId: string) {
+    setSelectedTaskFlowId(flowId);
+  }
+
+  async function handleTriggerHeartbeat() {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+
+    const agentId = activeAgentId;
+    try {
+      const response = await triggerAgentHeartbeat(agentId);
+      const nextLog = response.log ?? response.heartbeatLog ?? null;
+      if (response.heartbeat && activeAgentIdRef.current === agentId) {
+        setAgentHeartbeat(response.heartbeat);
+      }
+      if (nextLog && activeAgentIdRef.current === agentId) {
+        setHeartbeatLogs((current) => [nextLog, ...current.filter((log) => log.id !== nextLog.id)]);
+      }
+      if (activeAgentIdRef.current === agentId) {
+        setAppNotice(response.message ?? "Heartbeat를 수동으로 실행했습니다.");
+      }
+      void refreshAgentHeartbeat(agentId);
+      void refreshHeartbeatLogs(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Heartbeat 실행에 실패했습니다.");
     }
   }
 
@@ -1190,16 +1939,14 @@ export default function App() {
         agents={agents}
         activeConversationId={activeConversationId}
         conversations={conversations}
-        onCreateAgent={() => {
-          void handleCreateAgent();
-        }}
         onCreateConversation={() => {
           void createConversationThread(activeConversation?.providerKind, activeAgentId);
         }}
         onDeleteConversation={(conversationId) => {
           void handleDeleteConversation(conversationId);
         }}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenAgentSettings={handleOpenAgentSettings}
+        onOpenSettings={handleOpenProviderSettings}
         onSelectAgent={(agentId) => {
           void handleSelectAgent(agentId);
         }}
@@ -1243,13 +1990,15 @@ export default function App() {
               modelsLoading={activeModelsLoading}
               provider={activeProvider}
             />
-            <button className="ghost-button" onClick={() => setSettingsOpen(true)} type="button">
+            <button className="ghost-button" onClick={handleOpenProviderSettings} type="button">
               프로바이더
             </button>
           </div>
         </header>
 
-        <section className="chat-panel__canvas">
+        <section
+          className={`chat-panel__canvas ${activeSection === "workspace" ? "is-workspace" : ""}`}
+        >
           <div className="chat-panel__intro">
             <p className="eyebrow">{activeSection === "chat" ? "대화" : "워크스페이스"}</p>
             <h1>{activeConversation?.title ?? "새 채팅"}</h1>
@@ -1278,7 +2027,6 @@ export default function App() {
             <ChatView
               changedFiles={changedFiles}
               error={chatError}
-              liveEvents={liveEvents}
               loading={streaming}
               messages={messages}
               pendingAssistantText={pendingAssistantText}
@@ -1287,9 +2035,33 @@ export default function App() {
             <WorkspaceView
               file={workspaceFile}
               loading={workspaceLoading}
+              heartbeat={agentHeartbeat}
+              heartbeatLogs={heartbeatLogs}
+              liveEvents={liveEvents}
               memory={agentMemory}
+              memorySearchLoading={memorySearchLoading}
+              memorySearchResults={memorySearchResults}
+              messages={messages}
               onCancelTask={(taskId) => {
                 void handleCancelTask(taskId);
+              }}
+              onCancelSubagentSession={(sessionId) => {
+                void handleCancelSubagentSession(sessionId);
+              }}
+              onCancelTaskFlow={(flowId) => {
+                void handleCancelTaskFlow(flowId);
+              }}
+              onCreateSubagentSession={(payload) => {
+                void handleCreateSubagentSession(payload);
+              }}
+              onCreateTaskFlow={(payload) => {
+                void handleCreateTaskFlow(payload);
+              }}
+              onMemorySearch={(query) => {
+                void handleMemorySearch(query);
+              }}
+              onTriggerHeartbeat={() => {
+                void handleTriggerHeartbeat();
               }}
               onScopeChange={(scope) => {
                 setWorkspaceScope(scope);
@@ -1298,12 +2070,15 @@ export default function App() {
               onSelectFile={(path) => {
                 void openWorkspaceFile(path);
               }}
-              onSelectRun={(runId) => {
-                manualRunSelectionRef.current = true;
-                setSelectedRunId(runId);
+              onSelectSubagentSession={(sessionId) => {
+                setActiveSection("chat");
+                setActiveConversationId(sessionId);
               }}
               onSelectTask={(taskId) => {
                 setSelectedTaskId(taskId);
+              }}
+              onSelectTaskFlow={(flowId) => {
+                handleSelectTaskFlow(flowId);
               }}
               onStartTask={() => {
                 void handleStartBackgroundTask();
@@ -1312,8 +2087,14 @@ export default function App() {
               runs={workspaceRuns}
               scope={workspaceScope}
               selectedRunId={selectedRunId}
+              selectedTaskFlow={selectedTaskFlow}
+              platformMetadata={platformMetadata}
+              platformMetadataLoading={platformMetadataLoading}
+              pendingAssistantText={pendingAssistantText}
+              subagentSessions={subagentSessions}
               selectedTaskId={selectedTaskId}
               taskEvents={taskEvents}
+              taskFlows={taskFlows}
               tasks={tasks}
               tree={workspaceTree}
             />
@@ -1339,7 +2120,7 @@ export default function App() {
                 ),
               });
             }}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={handleOpenProviderSettings}
             onReasoningChange={(reasoningLevel) => {
               void updateConversation({ reasoningLevel });
             }}
@@ -1349,9 +2130,44 @@ export default function App() {
             providerKind={activeConversation.providerKind}
             providers={providers}
             reasoningLevel={activeConversation.reasoningLevel}
+            section={activeSection}
           />
         ) : null}
       </main>
+
+      <AgentSettingsDialog
+        activeAgentId={activeAgentId}
+        agents={agents}
+        deletingAgentId={deletingAgentId}
+        draft={agentDraft}
+        heartbeat={agentHeartbeat}
+        heartbeatDraft={agentHeartbeatDraft}
+        modelsByProvider={modelsByProvider}
+        notice={appNotice}
+        onClose={() => setAgentSettingsOpen(false)}
+        onCreate={() => {
+          void handleCreateAgent();
+        }}
+        onDelete={requestDeleteAgent}
+        onDraftChange={setAgentDraft}
+        onHeartbeatDraftChange={setAgentHeartbeatDraft}
+        onSoulDraftChange={setAgentSoulDraft}
+        onStandingOrdersDraftChange={setStandingOrdersDraft}
+        soul={agentSoul}
+        soulDraft={agentSoulDraft}
+        standingOrders={standingOrders}
+        standingOrdersDraft={standingOrdersDraft}
+        onSave={() => {
+          void handleSaveAgentDefaults();
+        }}
+        onSaveStandingOrders={() => {
+          void handleSaveStandingOrders();
+        }}
+        open={agentSettingsOpen}
+        providers={providers}
+        saving={savingAgent}
+        savingStandingOrders={savingStandingOrders}
+      />
 
       <ProviderSettingsDialog
         drafts={providerDrafts}

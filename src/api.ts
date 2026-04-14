@@ -1,17 +1,29 @@
 import type {
   AgentMemoryRecord,
   AgentRecord,
+  AgentSkillSummary,
+  AgentHeartbeatRecord,
   ConversationRecord,
+  HeartbeatLogRecord,
+  AgentSoulRecord,
+  MemorySearchResult,
   MessageRecord,
+  PlatformMetadata,
+  PluginManifest,
   ProviderKind,
   ProviderSummary,
   ReasoningLevel,
+  StandingOrdersRecord,
   StreamEventPayloadMap,
+  ToolDescriptor,
+  TaskFlowRecord,
+  TaskFlowStepRecord,
   WorkspaceFileRecord,
   WorkspaceRunEventRecord,
   WorkspaceRunRecord,
   WorkspaceScope,
   WorkspaceTreeNode,
+  ChannelSummary,
   TaskEventRecord,
   TaskRecord,
 } from "./types";
@@ -74,6 +86,50 @@ export async function saveAgent(payload: {
   });
 }
 
+export async function deleteAgent(agentId: string) {
+  return apiRequest<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function listPlugins(signal?: AbortSignal) {
+  return apiRequest<{ plugins: PluginManifest[] }>("/api/plugins", { signal });
+}
+
+export async function listTools(signal?: AbortSignal) {
+  return apiRequest<{ tools: ToolDescriptor[] }>("/api/tools", { signal });
+}
+
+export async function listChannels(signal?: AbortSignal) {
+  return apiRequest<{ channels: ChannelSummary[] }>("/api/channels", { signal });
+}
+
+export async function listAgentSkills(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ agentId: string; skills: AgentSkillSummary[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/skills`,
+    { signal },
+  );
+}
+
+export async function listPlatformMetadata(
+  agentId?: string | null,
+  signal?: AbortSignal,
+): Promise<PlatformMetadata> {
+  const [pluginsResponse, toolsResponse, channelsResponse, agentSkillsResponse] = await Promise.all([
+    listPlugins(signal),
+    listTools(signal),
+    listChannels(signal),
+    agentId ? listAgentSkills(agentId, signal) : Promise.resolve<{ agentId: string; skills: AgentSkillSummary[] } | null>(null),
+  ]);
+
+  return {
+    plugins: pluginsResponse.plugins,
+    tools: toolsResponse.tools,
+    channels: channelsResponse.channels,
+    agentSkills: agentSkillsResponse?.skills ?? [],
+  };
+}
+
 export async function getAgentMemory(agentId: string, signal?: AbortSignal) {
   return apiRequest<{ memory: AgentMemoryRecord }>(
     `/api/agents/${encodeURIComponent(agentId)}/memory`,
@@ -86,6 +142,93 @@ export async function writeAgentMemory(agentId: string, payload: { content: stri
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export async function getAgentSoul(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ soul: AgentSoulRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/soul`,
+    { signal },
+  );
+}
+
+export async function saveAgentSoul(agentId: string, payload: { content: string }) {
+  return apiRequest<{ soul: AgentSoulRecord }>(`/api/agents/${encodeURIComponent(agentId)}/soul`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getAgentStandingOrders(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ standingOrders: StandingOrdersRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/standing-orders`,
+    { signal },
+  );
+}
+
+export async function saveAgentStandingOrders(agentId: string, payload: { content: string }) {
+  return apiRequest<{ standingOrders: StandingOrdersRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/standing-orders`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function searchAgentMemory(
+  agentId: string,
+  params: { query: string; maxResults?: number },
+  signal?: AbortSignal,
+) {
+  const searchParams = new URLSearchParams({ query: params.query });
+  if (typeof params.maxResults === "number") {
+    searchParams.set("maxResults", String(params.maxResults));
+  }
+  return apiRequest<{ results: MemorySearchResult[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/memory/search?${searchParams.toString()}`,
+    { signal },
+  );
+}
+
+export async function getAgentHeartbeat(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ heartbeat: AgentHeartbeatRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/heartbeat`,
+    { signal },
+  );
+}
+
+export async function saveAgentHeartbeat(
+  agentId: string,
+  payload: { enabled: boolean; intervalMinutes: number; instructions: string },
+) {
+  return apiRequest<{ heartbeat: AgentHeartbeatRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/heartbeat`,
+    {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function triggerAgentHeartbeat(agentId: string) {
+  return apiRequest<{
+    ok?: boolean;
+    message?: string;
+    heartbeat?: AgentHeartbeatRecord;
+    task?: TaskRecord;
+    conversation?: ConversationRecord;
+    log?: HeartbeatLogRecord;
+    heartbeatLog?: HeartbeatLogRecord;
+  }>(`/api/agents/${encodeURIComponent(agentId)}/heartbeat/trigger`, {
+    method: "POST",
+  });
+}
+
+export async function listHeartbeatLogs(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ logs: HeartbeatLogRecord[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/heartbeat/logs`,
+    { signal },
+  );
 }
 
 export async function listAgentTasks(agentId: string, signal?: AbortSignal) {
@@ -118,6 +261,81 @@ export async function cancelAgentTask(agentId: string, taskId: string) {
     `/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
     { method: "POST" },
   );
+}
+
+export async function listSubagentSessions(sessionId: string, signal?: AbortSignal) {
+  return apiRequest<{ sessions: ConversationRecord[] }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/subagents`,
+    { signal },
+  );
+}
+
+export async function createSubagentSession(
+  sessionId: string,
+  payload: {
+    title?: string;
+    prompt: string;
+    providerKind?: ProviderKind;
+    model?: string;
+    reasoningLevel?: ReasoningLevel;
+  },
+) {
+  return apiRequest<{ session: ConversationRecord; task: TaskRecord }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/subagents`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function cancelSubagentSession(sessionId: string) {
+  return apiRequest<{ ok: boolean; task?: TaskRecord | null }>(
+    `/api/subagents/${encodeURIComponent(sessionId)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export async function listTaskFlows(agentId: string, signal?: AbortSignal) {
+  return apiRequest<{ flows: TaskFlowRecord[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/flows`,
+    { signal },
+  );
+}
+
+export async function createTaskFlow(
+  agentId: string,
+  payload: {
+    conversationId?: string | null;
+    title: string;
+    steps: Array<{
+      stepKey: string;
+      title: string;
+      prompt: string;
+      dependencyStepKey?: string | null;
+    }>;
+  },
+) {
+  return apiRequest<{ flow: TaskFlowRecord; steps: TaskFlowStepRecord[] }>(
+    `/api/agents/${encodeURIComponent(agentId)}/flows`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function getTaskFlow(flowId: string, signal?: AbortSignal) {
+  return apiRequest<{ flow: TaskFlowRecord; steps: TaskFlowStepRecord[] }>(
+    `/api/flows/${encodeURIComponent(flowId)}`,
+    { signal },
+  );
+}
+
+export async function cancelTaskFlow(flowId: string) {
+  return apiRequest<{ flow: TaskFlowRecord | null }>(`/api/flows/${encodeURIComponent(flowId)}/cancel`, {
+    method: "POST",
+  });
 }
 
 export async function listTaskEvents(agentId: string, taskId: string, signal?: AbortSignal) {

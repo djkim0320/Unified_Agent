@@ -8,7 +8,13 @@ import type {
   ProviderSecret,
   ReasoningLevel,
   ToolCall,
+  ToolConcurrencyClass,
   ToolPermission,
+  ToolRiskLevel,
+  TaskKind,
+  ConversationRecord,
+  TaskFlowRecord,
+  TaskFlowStepRecord,
 } from "../types.js";
 
 export interface ToolDescriptor {
@@ -17,11 +23,27 @@ export interface ToolDescriptor {
   permission: ToolPermission;
   schema: z.ZodType<Record<string, unknown>>;
   example: string;
+  risk?: ToolRiskLevel;
+  costHint?: "cheap" | "moderate" | "expensive";
+  concurrencyClass?: ToolConcurrencyClass;
+  batchable?: boolean;
+  rolePolicy?: {
+    allowPrimary?: boolean;
+    allowSubagent?: boolean;
+    maxNestingDepth?: number | null;
+  };
+  audit?: {
+    category?: string;
+    safeByDefault?: boolean;
+  };
   execute: (params: {
     arguments: Record<string, unknown>;
     agentId: string;
     conversationId: string;
     runId: string;
+    currentTaskId?: string | null;
+    nestingDepth: number;
+    isHeartbeatRun?: boolean;
     workspace: ReturnType<typeof createWorkspaceManager>;
     browserRuntime: ReturnType<typeof createBrowserRuntime>;
     memoryManager: ReturnType<typeof createMemoryManager>;
@@ -39,10 +61,51 @@ export interface ToolDescriptor {
         providerKind: ProviderKind;
         model: string;
         reasoningLevel: ReasoningLevel;
+        taskKind?: TaskKind;
+        parentTaskId?: string | null;
+        nestingDepth?: number;
+        scheduledFor?: number | null;
+        startImmediately?: boolean;
+        taskFlowId?: string | null;
+        flowStepKey?: string | null;
+        originRunId?: string | null;
       }) => Promise<{ id: string }>;
+    };
+    sessionManager?: {
+      spawnSubagentSession: (input: {
+        agentId: string;
+        parentConversationId: string;
+        parentRunId: string;
+        prompt: string;
+        title?: string;
+        providerKind: ProviderKind;
+        model: string;
+        reasoningLevel: ReasoningLevel;
+      }) => Promise<{
+        session: ConversationRecord;
+        task: { id: string };
+      }>;
+    };
+    flowManager?: {
+      createFlow: (input: {
+        agentId: string;
+        conversationId: string;
+        title: string;
+        originRunId?: string | null;
+        steps: Array<{
+          stepKey: string;
+          title: string;
+          prompt: string;
+          dependencyStepKey?: string | null;
+        }>;
+      }) => Promise<{
+        flow: TaskFlowRecord;
+        steps: TaskFlowStepRecord[];
+      }>;
     };
     reasoningLevel: ReasoningLevel;
     isDetachedTask?: boolean;
+    isSubagentRun?: boolean;
   }) => Promise<Record<string, unknown>>;
 }
 
@@ -61,6 +124,28 @@ export function createToolRegistry() {
     return [...tools.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
 
+  function listAllowed(context?: { isSubagent?: boolean; nestingDepth?: number }) {
+    return list().filter((tool) => {
+      const policy = tool.rolePolicy;
+      if (!policy) {
+        return true;
+      }
+      if (context?.isSubagent && policy.allowSubagent === false) {
+        return false;
+      }
+      if (!context?.isSubagent && policy.allowPrimary === false) {
+        return false;
+      }
+      if (
+        typeof policy.maxNestingDepth === "number" &&
+        (context?.nestingDepth ?? 0) > policy.maxNestingDepth
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
+
   async function execute(
     toolCall: ToolCall,
     context: Omit<Parameters<ToolDescriptor["execute"]>[0], "arguments">,
@@ -68,6 +153,24 @@ export function createToolRegistry() {
     const descriptor = get(toolCall.name);
     if (!descriptor) {
       throw new Error(`Unknown tool: ${toolCall.name}`);
+    }
+    if (
+      descriptor.rolePolicy?.allowSubagent === false &&
+      Boolean((context as { isSubagentRun?: boolean }).isSubagentRun)
+    ) {
+      throw new Error(`Tool ${toolCall.name} is not available inside sub-agent runs.`);
+    }
+    if (
+      descriptor.rolePolicy?.allowPrimary === false &&
+      !Boolean((context as { isSubagentRun?: boolean }).isSubagentRun)
+    ) {
+      throw new Error(`Tool ${toolCall.name} is not available in primary runs.`);
+    }
+    if (
+      typeof descriptor.rolePolicy?.maxNestingDepth === "number" &&
+      (context.nestingDepth ?? 0) > descriptor.rolePolicy.maxNestingDepth
+    ) {
+      throw new Error(`Tool ${toolCall.name} exceeds the allowed nesting depth.`);
     }
 
     const args = descriptor.schema.parse(toolCall.arguments);
@@ -77,11 +180,11 @@ export function createToolRegistry() {
     });
   }
 
-  function buildPlannerGuide() {
-    return list()
+  function buildPlannerGuide(context?: { isSubagent?: boolean; nestingDepth?: number }) {
+    return listAllowed(context)
       .map(
         (tool) =>
-          `- ${tool.name} [${tool.permission}]: ${tool.description}\n  Example: ${tool.example}`,
+          `- ${tool.name} [${tool.permission}${tool.risk ? ` / risk:${tool.risk}` : ""}${tool.costHint ? ` / cost:${tool.costHint}` : ""}]: ${tool.description}\n  Example: ${tool.example}`,
       )
       .join("\n");
   }
@@ -90,6 +193,7 @@ export function createToolRegistry() {
     register,
     get,
     list,
+    listAllowed,
     execute,
     buildPlannerGuide,
   };

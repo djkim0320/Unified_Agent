@@ -35,6 +35,48 @@ afterEach(() => {
 });
 
 describe("workspace sandbox hardening", () => {
+  it("bootstraps soul and heartbeat files for each agent workspace", () => {
+    const { workspace } = createTestWorkspace();
+    const agentId = "agent-heartbeat";
+    workspace.createAgentWorkspace(agentId);
+
+    const soul = workspace.readAgentSoul(agentId);
+    expect(soul.path).toBe("SOUL.md");
+    expect(soul.content).toContain("# SOUL");
+
+    const heartbeat = workspace.readAgentHeartbeat(agentId);
+    expect(heartbeat.path).toBe("HEARTBEAT.md");
+    expect(heartbeat.enabled).toBe(false);
+    expect(heartbeat.intervalMinutes).toBe(60);
+    expect(heartbeat.lastRun).toBeNull();
+    expect(heartbeat.instructions).toContain("Describe what the agent should inspect");
+  });
+
+  it("round-trips heartbeat frontmatter and soul content", () => {
+    const { workspace } = createTestWorkspace();
+    const agentId = "agent-heartbeat-write";
+    workspace.createAgentWorkspace(agentId);
+
+    const soul = workspace.writeAgentSoul(agentId, "# SOUL\n\nCustom identity.");
+    expect(soul.content).toBe("# SOUL\n\nCustom identity.");
+
+    const heartbeat = workspace.writeAgentHeartbeat(agentId, {
+      enabled: true,
+      intervalMinutes: 15,
+      lastRun: "2026-04-13T00:00:00.000Z",
+      instructions: "Check inbox and summarize updates.",
+    });
+
+    expect(heartbeat.enabled).toBe(true);
+    expect(heartbeat.intervalMinutes).toBe(15);
+    expect(heartbeat.lastRun).toBe("2026-04-13T00:00:00.000Z");
+    expect(heartbeat.instructions).toBe("Check inbox and summarize updates.");
+    expect(heartbeat.parseError).toBeNull();
+    expect(fs.readFileSync(path.join(workspace.agentsDir, agentId, "HEARTBEAT.md"), "utf8")).toContain(
+      "enabled: true",
+    );
+  });
+
   it("rejects path traversal via .. segments", () => {
     const { workspace, addConversation } = createTestWorkspace();
     const conversationId = "conv-traversal";

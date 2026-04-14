@@ -1,28 +1,39 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createToolRegistry } from "./tool-registry.js";
-import type { AgentRecord } from "../types.js";
+import type {
+  AgentRecord,
+  AgentSkillSummary,
+  PluginManifest,
+  PluginSkillSummary,
+  ToolName,
+} from "../types.js";
 
 export interface LoadedSkill {
   id: string;
   name: string;
   source: "agent" | "shared" | "plugin";
+  pluginId: string | null;
   content: string;
 }
 
-export interface PluginManifest {
+export interface PluginSkillDefinition {
+  name: string;
+  content?: string;
+  file?: string;
+}
+
+export interface PluginDefinition {
   id: string;
   name: string;
   version: string;
-  skills?: Array<{
-    name: string;
-    content?: string;
-    file?: string;
-  }>;
+  description: string;
+  tools: ToolName[];
+  skills?: PluginSkillDefinition[];
 }
 
 export interface RegisteredPlugin {
-  manifest: PluginManifest;
+  manifest: PluginDefinition;
 }
 
 function readMarkdownFiles(directory: string, source: LoadedSkill["source"]) {
@@ -34,15 +45,52 @@ function readMarkdownFiles(directory: string, source: LoadedSkill["source"]) {
     .readdirSync(directory, { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
     .sort((left, right) => left.name.localeCompare(right.name))
-    .map((entry) => {
-      const fullPath = path.join(directory, entry.name);
-      return {
-        id: `${source}:${entry.name}`,
-        name: entry.name.replace(/\.md$/i, ""),
-        source,
-        content: fs.readFileSync(fullPath, "utf8"),
-      } satisfies LoadedSkill;
-    });
+        .map((entry) => {
+          const fullPath = path.join(directory, entry.name);
+          return {
+            id: `${source}:${entry.name}`,
+            name: entry.name.replace(/\.md$/i, ""),
+            source,
+            pluginId: null,
+            content: fs.readFileSync(fullPath, "utf8"),
+          } satisfies LoadedSkill;
+        });
+}
+
+function summarizeContent(content: string) {
+  const normalized = content.replace(/\r\n/g, "\n").trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const firstBlock = normalized.split(/\n\s*\n/)[0]?.trim() ?? normalized;
+  const firstLine = firstBlock.split("\n")[0]?.replace(/^#+\s*/, "").trim() ?? "";
+  const collapsed = (firstLine || firstBlock).replace(/\s+/g, " ");
+  if (!collapsed) {
+    return null;
+  }
+  return collapsed.length > 180 ? `${collapsed.slice(0, 177)}...` : collapsed;
+}
+
+function normalizePluginDefinition(manifest: Partial<PluginDefinition> & { id: string; name: string; version: string }): PluginDefinition {
+  return {
+    id: manifest.id,
+    name: manifest.name,
+    version: manifest.version,
+    description: typeof manifest.description === "string" ? manifest.description : "",
+    tools: Array.isArray(manifest.tools)
+      ? manifest.tools.filter((tool): tool is ToolName => typeof tool === "string" && tool.length > 0)
+      : [],
+    skills: Array.isArray(manifest.skills)
+      ? manifest.skills
+          .filter((skill): skill is PluginSkillDefinition => Boolean(skill && typeof skill.name === "string"))
+          .map((skill) => ({
+            name: skill.name,
+            content: typeof skill.content === "string" ? skill.content : undefined,
+            file: typeof skill.file === "string" ? skill.file : undefined,
+          }))
+      : [],
+  };
 }
 
 export function createPluginManager(params: {
@@ -70,7 +118,13 @@ export function createPluginManager(params: {
         continue;
       }
       try {
-        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as PluginManifest;
+        const manifest = normalizePluginDefinition(
+          JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Partial<PluginDefinition> & {
+            id: string;
+            name: string;
+            version: string;
+          },
+        );
         manifests.push({ manifest });
       } catch {
         // Ignore invalid local manifests so a broken plugin cannot break the whole app.
@@ -81,6 +135,33 @@ export function createPluginManager(params: {
 
   function listPlugins() {
     return [...(params.builtInPlugins ?? []), ...loadLocalPluginManifests()];
+  }
+
+  function listPluginSummaries() {
+    return listPlugins().map((plugin) => ({
+      id: plugin.manifest.id,
+      name: plugin.manifest.name,
+      version: plugin.manifest.version,
+      description: plugin.manifest.description,
+      tools: [...plugin.manifest.tools],
+      skills: (plugin.manifest.skills ?? [])
+        .map((skill): PluginSkillSummary | null => {
+          const content = skill.content ?? (skill.file
+            ? (() => {
+                const candidatePath = path.join(sharedPluginDir, plugin.manifest.id, skill.file);
+                return fs.existsSync(candidatePath) ? fs.readFileSync(candidatePath, "utf8") : null;
+              })()
+            : null);
+          if (!content) {
+            return null;
+          }
+          return {
+            name: skill.name,
+            summary: summarizeContent(content),
+          };
+        })
+        .filter((skill): skill is PluginSkillSummary => Boolean(skill)),
+    })) satisfies PluginManifest[];
   }
 
   function loadSkills(agent: AgentRecord) {
@@ -95,6 +176,7 @@ export function createPluginManager(params: {
               id: `plugin:${plugin.manifest.id}:${skill.name}`,
               name: skill.name,
               source: "plugin" as const,
+              pluginId: plugin.manifest.id,
               content: skill.content,
             },
           ];
@@ -111,6 +193,7 @@ export function createPluginManager(params: {
             id: `plugin:${plugin.manifest.id}:${skill.name}`,
             name: skill.name,
             source: "plugin" as const,
+            pluginId: plugin.manifest.id,
             content: fs.readFileSync(candidatePath, "utf8"),
           },
         ];
@@ -122,6 +205,16 @@ export function createPluginManager(params: {
       ...readMarkdownFiles(sharedSkillDir, "shared"),
       ...readMarkdownFiles(agentSkillDir, "agent"),
     ];
+  }
+
+  function listSkillSummaries(agent: AgentRecord): AgentSkillSummary[] {
+    return loadSkills(agent).map((skill) => ({
+      id: skill.id,
+      name: skill.name,
+      source: skill.source,
+      pluginId: skill.pluginId,
+      summary: summarizeContent(skill.content) ?? "No summary available.",
+    }));
   }
 
   function getPlanningSkillBlock(agent: AgentRecord) {
@@ -139,7 +232,9 @@ export function createPluginManager(params: {
     sharedSkillDir,
     sharedPluginDir,
     listPlugins,
+    listPluginSummaries,
     loadSkills,
+    listSkillSummaries,
     getPlanningSkillBlock,
   };
 }

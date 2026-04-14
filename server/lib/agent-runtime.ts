@@ -1,4 +1,6 @@
 import { ZodError, z } from "zod";
+import fs from "node:fs";
+import path from "node:path";
 import { searchDuckDuckGo } from "./duckduckgo.js";
 import { runWorkspaceCommand } from "./exec-command.js";
 import type { createMemoryManager } from "./memory-manager.js";
@@ -13,10 +15,14 @@ import type {
   AgentRecord,
   AgentStep,
   ChatMessage,
+  ConversationRecord,
   ProviderKind,
   ProviderSecret,
   ReasoningLevel,
   SearchBackendAvailability,
+  TaskFlowRecord,
+  TaskFlowStepRecord,
+  TaskKind,
   ToolCall,
   ToolName,
   WorkspaceRunEventRecord,
@@ -25,7 +31,16 @@ import type {
 } from "../types.js";
 
 const DEFAULT_MAX_STEPS = 8;
+const DEFAULT_AUTONOMOUS_MAX_STEPS = 30;
 const DEFAULT_RUN_TIMEOUT_MS = 120_000;
+const DEFAULT_AUTONOMOUS_RUN_TIMEOUT_MS = 600_000;
+const DEFAULT_SOUL_GUIDANCE = [
+  "SOUL guidance:",
+  "- Be autonomous, but never override safety, tool, or workspace boundary rules.",
+  "- Prefer completing the user's current goal with the fewest safe steps.",
+  "- When a detached or heartbeat run reaches its autonomous step limit, queue a continuation instead of failing outright.",
+  "- Keep follow-up work focused, concise, and grounded in the visible workspace state.",
+].join("\n");
 
 const ScopeSchema = z.enum(["sandbox", "shared", "root"]).default("sandbox");
 
@@ -110,6 +125,37 @@ const ToolArgumentSchemas: Record<ToolName, z.ZodType<Record<string, unknown>>> 
     content: z.string().min(1),
     target: z.enum(["durable", "daily"]).optional(),
   }),
+  spawn_subagent_session: z.object({
+    prompt: z.string().min(1),
+    title: z.string().min(1).optional(),
+    providerKind: z.enum(["openai", "anthropic", "gemini", "ollama", "openai-codex"]).optional(),
+    model: z.string().min(1).optional(),
+    reasoningLevel: z.enum(["minimal", "low", "medium", "high", "xhigh"]).optional(),
+  }),
+  spawn_task: z.object({
+    prompt: z.string().min(1),
+    title: z.string().min(1).optional(),
+  }),
+  schedule_task: z.object({
+    prompt: z.string().min(1),
+    title: z.string().min(1).optional(),
+      delayMs: z.number().int().min(1).max(7 * 24 * 60 * 60 * 1000).optional(),
+      scheduledFor: z.number().int().min(0).optional(),
+    }),
+  create_task_flow: z.object({
+    title: z.string().min(1),
+    steps: z
+      .array(
+        z.object({
+          stepKey: z.string().min(1),
+          title: z.string().min(1),
+          prompt: z.string().min(1),
+          dependencyStepKey: z.string().min(1).optional(),
+        }),
+      )
+      .min(1)
+      .max(8),
+  }),
 };
 
 export class AgentRunError extends Error {
@@ -130,18 +176,18 @@ function clipText(text: string, maxLength = 4000) {
 
 function localizedToolStatusLabel(toolName: ToolName) {
   if (toolName.startsWith("memory_")) {
-    return "메모리 작업 중";
+    return "\uBA54\uBAA8\uB9AC \uC791\uC5C5 \uC911";
   }
   if (toolName.includes("search")) {
-    return "검색 중";
+    return "\uAC80\uC0C9 \uC911";
   }
   if (toolName.startsWith("browser_")) {
-    return "브라우저 조사 중";
+    return "\uBE0C\uB77C\uC6B0\uC800 \uC870\uC0AC \uC911";
   }
   if (toolName === "exec_command") {
-    return "명령 실행 중";
+    return "\uBA85\uB839 \uC2E4\uD589 \uC911";
   }
-  return "파일 작업 중";
+  return "\uD30C\uC77C \uC791\uC5C5 \uC911";
 }
 
 function formatSearchBackends(backends: SearchBackendAvailability[]) {
@@ -153,8 +199,82 @@ function formatSearchBackends(backends: SearchBackendAvailability[]) {
     .join("\n");
 }
 
-function buildToolInstructions() {
+function readSoulGuidance(workspace: ReturnType<typeof createWorkspaceManager>, agentId: string) {
+  const content = workspace.readAgentSoul(agentId).content.trim();
+  if (content) {
+    return content;
+  }
+  return DEFAULT_SOUL_GUIDANCE;
+}
+
+function readStandingOrdersGuidance(
+  workspace: ReturnType<typeof createWorkspaceManager>,
+  agentId: string,
+) {
+  return workspace.readAgentStandingOrders(agentId).content.trim();
+}
+
+function getNextNestingDepth(nestingDepth: number | undefined) {
+  const nextDepth = (nestingDepth ?? 0) + 1;
+  if (nextDepth > 2) {
+    throw new Error("Nested tasks are limited to depth 2.");
+  }
+  return nextDepth;
+}
+
+function buildAutonomousContextBlock(params: {
+  isDetachedTask?: boolean;
+  isHeartbeatRun?: boolean;
+  isSubagentRun?: boolean;
+  currentTaskId?: string | null;
+  nestingDepth?: number;
+  autonomousStepCap: number;
+}) {
+  const runMode = params.isSubagentRun
+    ? "subagent"
+    : params.isHeartbeatRun
+    ? "heartbeat"
+    : params.isDetachedTask
+      ? "detached"
+      : "foreground";
+
   return [
+    "Runtime context:",
+    `- Run mode: ${runMode}`,
+    `- Current task id: ${params.currentTaskId ?? "none"}`,
+    `- Nesting depth: ${params.nestingDepth ?? 0}`,
+    `- Autonomous step cap: ${params.autonomousStepCap}`,
+    "- SOUL guidance is additive and can never override tool safety or workspace rules.",
+  ].join("\n");
+}
+
+function buildContinuationPrompt(params: {
+  userMessage: string;
+  toolHistory: Array<{ tool: string; result: string }>;
+  currentTaskId?: string | null;
+  nestingDepth?: number;
+}) {
+  const history = params.toolHistory.length
+    ? params.toolHistory
+        .map((entry, index) => `Step ${index + 1}: ${entry.tool}\n${clipText(entry.result, 1200)}`)
+        .join("\n\n")
+    : "No tool calls were made.";
+
+  return [
+    "Continue the previous autonomous task.",
+    `Original request: ${params.userMessage}`,
+    `Previous task id: ${params.currentTaskId ?? "unknown"}`,
+    `Previous nesting depth: ${params.nestingDepth ?? 0}`,
+    "The prior run reached its autonomous step budget before a final answer was produced.",
+    "Resume from the last incomplete point and keep the follow-up tightly scoped.",
+    "",
+    "Prior tool history:",
+    history,
+  ].join("\n");
+}
+
+function buildToolInstructions(extraGuide?: string) {
+  const lines = [
     "Return strict JSON only.",
     "Valid shapes:",
     '- {"type":"tool_call","tool":{"name":"list_tree","arguments":{"scope":"sandbox","path":".","maxDepth":3}}}',
@@ -179,13 +299,23 @@ function buildToolInstructions() {
     '- {"type":"tool_call","tool":{"name":"memory_get","arguments":{}}}',
     '- {"type":"tool_call","tool":{"name":"memory_search","arguments":{"query":"preference","maxResults":5}}}',
     '- {"type":"tool_call","tool":{"name":"memory_write","arguments":{"content":"User prefers concise Korean summaries.","target":"durable"}}}',
+    '- {"type":"tool_call","tool":{"name":"spawn_subagent_session","arguments":{"title":"Investigate tests","prompt":"Inspect the failing test files and summarize the root cause."}}}',
+    '- {"type":"tool_call","tool":{"name":"spawn_task","arguments":{"title":"Research follow-up","prompt":"Research the current repository state and summarize next steps."}}}',
+    '- {"type":"tool_call","tool":{"name":"schedule_task","arguments":{"title":"Later follow-up","prompt":"Check back after the current run finishes.","delayMs":600000}}}',
+    '- {"type":"tool_call","tool":{"name":"create_task_flow","arguments":{"title":"Ship patch","steps":[{"stepKey":"inspect","title":"Inspect repo","prompt":"Inspect the current code paths."},{"stepKey":"implement","title":"Implement fix","prompt":"Make the required code changes.","dependencyStepKey":"inspect"}]}}}',
     '- {"type":"final_answer"}',
     "Use only one tool per step.",
     "Do not invent tool results.",
     "Use exec_command only with a direct program plus args. Shells such as PowerShell/cmd/bash are disabled unless the user explicitly enables unsafe mode.",
     "Use memory_write only for durable preferences, decisions, and facts the user explicitly asks you to remember or that are clearly reusable later.",
     "Prefer provider_web_search or duckduckgo_search for ordinary search, web_fetch for a direct URL, and browser tools for pages that need rendering or interaction.",
-  ].join("\n");
+  ];
+
+  if (extraGuide?.trim()) {
+    lines.push("", "Registered tools:", extraGuide.trim());
+  }
+
+  return lines.join("\n");
 }
 
 function buildPlanningInstructions(params: {
@@ -194,6 +324,9 @@ function buildPlanningInstructions(params: {
   maxSteps: number;
   searchBackends: SearchBackendAvailability[];
   toolHistory: Array<{ tool: string; result: string }>;
+  soulBlock: string;
+  standingOrdersBlock?: string;
+  runtimeContext: string;
   memoryBlock?: string;
   skillsBlock?: string;
   toolGuide?: string;
@@ -217,6 +350,8 @@ function buildPlanningInstructions(params: {
     `Current planning step: ${params.stepIndex + 1} / ${params.maxSteps}`,
     "Workspace scope: use sandbox for conversation files and shared for intentionally shared files.",
     "",
+    params.runtimeContext,
+    "",
     "Available search backends:",
     formatSearchBackends(params.searchBackends),
     "",
@@ -235,10 +370,16 @@ function buildPlanningInstructions(params: {
     params.skillsBlock ? "Loaded skills:" : "",
     params.skillsBlock ?? "",
     "",
+    params.standingOrdersBlock ? "Standing orders:" : "",
+    params.standingOrdersBlock ?? "",
+    "",
+    params.soulBlock ? "SOUL guidance:" : "",
+    params.soulBlock ?? "",
+    "",
     "Previous tool results:",
     historyBlock,
     "",
-    params.toolGuide ?? buildToolInstructions(),
+    buildToolInstructions(params.toolGuide),
   ]
     .filter(Boolean)
     .join("\n");
@@ -248,6 +389,10 @@ function buildFinalInstructions(params: {
   guides: { agents: string; memory: string; user: string; tools: string };
   toolHistory: Array<{ tool: string; result: string }>;
   changedFiles: string[];
+  soulBlock: string;
+  standingOrdersBlock?: string;
+  runtimeContext: string;
+  continuationNote?: string;
 }) {
   const changes = params.changedFiles.length
     ? params.changedFiles.map((file) => `- ${file}`).join("\n")
@@ -264,8 +409,17 @@ function buildFinalInstructions(params: {
     "Summarize the work performed and the outcome.",
     "If files changed, mention them briefly.",
     "Do not claim actions that were not performed.",
+    params.continuationNote ? params.continuationNote : "",
+    "",
+    params.runtimeContext,
     "",
     params.guides.agents,
+    "",
+    params.standingOrdersBlock ? "Standing orders:" : "",
+    params.standingOrdersBlock ?? "",
+    "",
+    params.soulBlock ? "SOUL guidance:" : "",
+    params.soulBlock ?? "",
     "",
     "Tool history:",
     history,
@@ -392,15 +546,84 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       providerKind: ProviderKind;
       model: string;
       reasoningLevel: ReasoningLevel;
+      taskKind?: TaskKind;
+      parentTaskId?: string | null;
+      nestingDepth?: number;
+      scheduledFor?: number | null;
+      startImmediately?: boolean;
+      taskFlowId?: string | null;
+      flowStepKey?: string | null;
+      originRunId?: string | null;
     }) => Promise<{ id: string }>;
+  };
+  sessionManager?: {
+    spawnSubagentSession: (input: {
+      agentId: string;
+      parentConversationId: string;
+      parentRunId: string;
+      prompt: string;
+      title?: string;
+      providerKind: ProviderKind;
+      model: string;
+      reasoningLevel: ReasoningLevel;
+    }) => Promise<{
+      session: ConversationRecord;
+      task: { id: string };
+    }>;
+  };
+  flowManager?: {
+    createFlow: (input: {
+      agentId: string;
+      conversationId: string;
+      title: string;
+      originRunId?: string | null;
+      steps: Array<{
+        stepKey: string;
+        title: string;
+        prompt: string;
+        dependencyStepKey?: string | null;
+      }>;
+    }) => Promise<{
+      flow: TaskFlowRecord;
+      steps: TaskFlowStepRecord[];
+    }>;
   };
   store: {
     createWorkspaceRun: (input: {
       conversationId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
       providerKind: ProviderKind;
       model: string;
       userMessage: string;
+      phase?: "accepted" | "planning" | "tool_execution" | "synthesizing";
+      checkpoint?: {
+        stepIndex: number;
+        maxSteps: number;
+        userMessage: string;
+        toolHistory: Array<{ tool: string; result: string }>;
+        changedFiles: string[];
+        runMode: "foreground" | "detached" | "heartbeat" | "subagent";
+        lastToolName: string | null;
+      } | null;
+      resumeToken?: string | null;
     }) => { id: string };
+    patchWorkspaceRun?: (input: {
+      runId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
+      phase?: "accepted" | "planning" | "tool_execution" | "synthesizing" | "completed" | "failed" | "cancelled" | null;
+      checkpoint?: {
+        stepIndex: number;
+        maxSteps: number;
+        userMessage: string;
+        toolHistory: Array<{ tool: string; result: string }>;
+        changedFiles: string[];
+        runMode: "foreground" | "detached" | "heartbeat" | "subagent";
+        lastToolName: string | null;
+      } | null;
+      resumeToken?: string | null;
+    }) => unknown;
     appendWorkspaceRunEvent: (input: {
       runId: string;
       eventType: WorkspaceRunEventRecord["eventType"];
@@ -419,17 +642,55 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
   runTimeoutMs?: number;
   unsafeShellEnabled?: boolean;
   isDetachedTask?: boolean;
+  isHeartbeatRun?: boolean;
+  isSubagentRun?: boolean;
+  currentTaskId?: string | null;
+  nestingDepth?: number;
   conversationTitle?: string;
+  parentRunId?: string | null;
 }) {
+  const runMode: "foreground" | "detached" | "heartbeat" | "subagent" = params.isSubagentRun
+    ? "subagent"
+    : params.isHeartbeatRun
+      ? "heartbeat"
+      : params.isDetachedTask
+        ? "detached"
+        : "foreground";
+  const makeCheckpoint = (
+    stepIndex: number,
+    maxSteps: number,
+    toolHistory: Array<{ tool: string; result: string }>,
+    changedFiles: Iterable<string>,
+    lastToolName: string | null,
+  ) => ({
+    stepIndex,
+    maxSteps,
+    userMessage: params.userMessage,
+    toolHistory: toolHistory.map((entry) => ({ ...entry })),
+    changedFiles: [...changedFiles],
+    runMode,
+    lastToolName,
+  });
   const run = params.store.createWorkspaceRun({
     conversationId: params.conversationId,
+    taskId: params.currentTaskId ?? null,
+    parentRunId: params.parentRunId ?? null,
     providerKind: params.providerKind,
     model: params.model,
     userMessage: params.userMessage,
+    phase: "accepted",
+    checkpoint: makeCheckpoint(0, params.maxSteps ?? (params.isDetachedTask || params.isHeartbeatRun || params.isSubagentRun ? DEFAULT_AUTONOMOUS_MAX_STEPS : DEFAULT_MAX_STEPS), [], [], null),
+    resumeToken: null,
   });
-  const runSignal = combineRunSignal(params.signal, params.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS);
+  const isAutonomousRun = Boolean(params.isDetachedTask || params.isHeartbeatRun || params.isSubagentRun);
+  const runSignal = combineRunSignal(
+    params.signal,
+    params.runTimeoutMs ?? (isAutonomousRun ? DEFAULT_AUTONOMOUS_RUN_TIMEOUT_MS : DEFAULT_RUN_TIMEOUT_MS),
+  );
   const guides = params.workspace.readGuides();
   const agentId = params.agentId ?? "default-agent";
+  const soulBlock = readSoulGuidance(params.workspace, agentId);
+  const standingOrdersBlock = readStandingOrdersGuidance(params.workspace, agentId);
   params.workspace.createAgentWorkspace(agentId);
   params.workspace.createConversationWorkspace(params.conversationId);
   const memoryContext = params.memoryManager?.getPlanningContext({
@@ -467,11 +728,37 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
     },
   ];
 
-  const maxSteps = params.maxSteps ?? DEFAULT_MAX_STEPS;
+  const stepCap = isAutonomousRun ? DEFAULT_AUTONOMOUS_MAX_STEPS : DEFAULT_MAX_STEPS;
+  const requestedMaxSteps = params.maxSteps ?? stepCap;
+  const maxSteps = Math.min(requestedMaxSteps, stepCap);
   const toolHistory: Array<{ tool: string; result: string }> = [];
   const changedFiles = new Set<string>();
   let terminalState: Exclude<WorkspaceRunStatus, "running"> | null = null;
   let failureEventRecorded = false;
+  const runtimeContext = buildAutonomousContextBlock({
+    isDetachedTask: params.isDetachedTask,
+    isHeartbeatRun: params.isHeartbeatRun,
+    isSubagentRun: params.isSubagentRun,
+    currentTaskId: params.currentTaskId,
+    nestingDepth: params.nestingDepth,
+    autonomousStepCap: stepCap,
+  });
+  const patchRun = (input: {
+    phase?: "accepted" | "planning" | "tool_execution" | "synthesizing" | "completed" | "failed" | "cancelled" | null;
+    checkpoint?: ReturnType<typeof makeCheckpoint> | null;
+    taskId?: string | null;
+    parentRunId?: string | null;
+    resumeToken?: string | null;
+  }) => {
+    params.store.patchWorkspaceRun?.({
+      runId: run.id,
+      taskId: input.taskId ?? params.currentTaskId ?? null,
+      parentRunId: input.parentRunId ?? params.parentRunId ?? null,
+      phase: input.phase ?? null,
+      checkpoint: input.checkpoint ?? null,
+      resumeToken: input.resumeToken ?? null,
+    });
+  };
 
   const emit = (eventType: WorkspaceRunEventRecord["eventType"], payload: Record<string, unknown>) => {
     params.store.appendWorkspaceRunEvent({
@@ -501,15 +788,25 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
         throw runSignal.signal.reason ?? createAbortError();
       }
 
+      patchRun({
+        phase: "planning",
+        checkpoint: makeCheckpoint(stepIndex, maxSteps, toolHistory, changedFiles, null),
+      });
       const instructions = buildPlanningInstructions({
         guides,
         stepIndex,
         maxSteps,
         searchBackends,
         toolHistory,
+        soulBlock,
+        standingOrdersBlock,
+        runtimeContext,
         memoryBlock: memoryContext?.promptBlock,
         skillsBlock: skillBlock ?? undefined,
-        toolGuide: params.toolRegistry?.buildPlannerGuide(),
+        toolGuide: params.toolRegistry?.buildPlannerGuide({
+          isSubagent: params.isSubagentRun,
+          nestingDepth: params.nestingDepth ?? 0,
+        }),
       });
 
       let step: AgentStep;
@@ -536,6 +833,22 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
           },
         });
       } catch (error) {
+        if (toolHistory.length > 0 && !runSignal.signal.aborted && !isAbortError(error)) {
+          const payload = {
+            message:
+              "Planner response stayed invalid after tool execution. Falling back to final answer synthesis.",
+            phase: "planning_fallback_final",
+            reason: error instanceof Error ? error.message : "Invalid planner response.",
+          };
+          emit("status", payload);
+          params.sendEvent("status", {
+            ...payload,
+            runId: run.id,
+          });
+          reachedFinalStep = true;
+          break;
+        }
+
         const message = error instanceof Error ? error.message : "Planner returned invalid JSON.";
         emit("error", { error: message, phase: "planning" });
         failureEventRecorded = true;
@@ -558,6 +871,10 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
         tool: step.tool.name,
         arguments: step.tool.arguments,
         runId: run.id,
+      });
+      patchRun({
+        phase: "tool_execution",
+        checkpoint: makeCheckpoint(stepIndex, maxSteps, toolHistory, changedFiles, step.tool.name),
       });
 
       let result: Record<string, unknown>;
@@ -598,8 +915,14 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
               signal: runSignal.signal,
               unsafeShellEnabled: params.unsafeShellEnabled,
               taskManager: params.taskManager,
+              sessionManager: params.sessionManager,
+              flowManager: params.flowManager,
               reasoningLevel: params.reasoningLevel,
               isDetachedTask: params.isDetachedTask,
+              isHeartbeatRun: params.isHeartbeatRun,
+              isSubagentRun: params.isSubagentRun,
+              currentTaskId: params.currentTaskId,
+              nestingDepth: params.nestingDepth ?? 0,
             })
           : await executeTool({
               toolCall: step.tool,
@@ -608,11 +931,42 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
               runId: run.id,
               workspace: params.workspace,
               browserRuntime: params.browserRuntime,
+              memoryManager: params.memoryManager ?? ({
+                getSnapshot() {
+                  throw new Error("Memory manager is unavailable.");
+                },
+                getPlanningContext() {
+                  return {
+                    snapshot: null,
+                    promptBlock: "",
+                  };
+                },
+                search() {
+                  return [];
+                },
+                write() {
+                  throw new Error("Memory manager is unavailable.");
+                },
+                flushSessionSummary() {
+                  return null;
+                },
+                captureRememberRequest() {
+                  return null;
+                },
+              } as unknown as ReturnType<typeof createMemoryManager>),
               adapter: params.adapter,
               secret: params.secret,
               model: params.model,
+              reasoningLevel: params.reasoningLevel,
               signal: runSignal.signal,
               unsafeShellEnabled: params.unsafeShellEnabled,
+              currentTaskId: params.currentTaskId,
+              nestingDepth: params.nestingDepth ?? 0,
+              isHeartbeatRun: params.isHeartbeatRun,
+              isSubagentRun: params.isSubagentRun,
+              taskManager: params.taskManager,
+              sessionManager: params.sessionManager,
+              flowManager: params.flowManager,
             });
       } catch (error) {
         const message = validationMessage(error);
@@ -647,10 +1001,55 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
         tool: step.tool.name,
         result: buildToolSummary(step.tool, compactResult),
       });
+      patchRun({
+        phase: "planning",
+        checkpoint: makeCheckpoint(stepIndex + 1, maxSteps, toolHistory, changedFiles, step.tool.name),
+      });
     }
 
+    let continuationNote = "";
     if (!reachedFinalStep) {
-      throw new AgentRunError(`Agent stopped after reaching the ${maxSteps}-step limit.`, "failed", run.id);
+      if (params.isDetachedTask || params.isHeartbeatRun) {
+        const nextDepth = (params.nestingDepth ?? 0) + 1;
+        if (params.taskManager && params.currentTaskId) {
+          if (nextDepth <= 2) {
+            const continuationTask = await params.taskManager.enqueueDetachedTask({
+              agentId,
+              conversationId: params.conversationId,
+              prompt: buildContinuationPrompt({
+                userMessage: params.userMessage,
+                toolHistory,
+                currentTaskId: params.currentTaskId,
+                nestingDepth: params.nestingDepth,
+              }),
+              title: params.conversationTitle ?? (params.userMessage.trim().slice(0, 60) || "Continuation"),
+              providerKind: params.providerKind,
+              model: params.model,
+              reasoningLevel: params.reasoningLevel,
+              taskKind: "continuation",
+              parentTaskId: params.currentTaskId,
+              nestingDepth: nextDepth,
+              startImmediately: true,
+            });
+            continuationNote = `A continuation task was queued (${continuationTask.id}) because the autonomous step budget was reached.`;
+            emit("status", {
+              message: "Autonomous step budget reached. Queuing continuation.",
+              phase: "continuation_scheduled",
+              taskId: continuationTask.id,
+            });
+            params.sendEvent("status", {
+              message: "Autonomous step budget reached. Queuing continuation.",
+              phase: "continuation_scheduled",
+              taskId: continuationTask.id,
+              runId: run.id,
+            });
+          }
+        }
+      }
+
+      if (!continuationNote) {
+        throw new AgentRunError(`Agent stopped after reaching the ${maxSteps}-step limit.`, "failed", run.id);
+      }
     }
 
     if (runSignal.signal.aborted) {
@@ -661,6 +1060,14 @@ export async function runAgentTurn<K extends ProviderKind>(params: {
       guides,
       toolHistory,
       changedFiles: [...changedFiles].sort(),
+      soulBlock,
+      standingOrdersBlock,
+      runtimeContext,
+      continuationNote,
+    });
+    patchRun({
+      phase: "synthesizing",
+      checkpoint: makeCheckpoint(maxSteps, maxSteps, toolHistory, changedFiles, null),
     });
 
     let assistantText = "";
@@ -743,11 +1150,68 @@ async function executeTool<K extends ProviderKind>(params: {
   runId: string;
   workspace: ReturnType<typeof createWorkspaceManager>;
   browserRuntime: ReturnType<typeof createBrowserRuntime>;
+  memoryManager: ReturnType<typeof createMemoryManager>;
   adapter: ProviderAdapter<K>;
   secret: ProviderSecret<K>;
   model: string;
+  reasoningLevel: ReasoningLevel;
   signal: AbortSignal;
   unsafeShellEnabled?: boolean;
+  currentTaskId?: string | null;
+  nestingDepth: number;
+  isHeartbeatRun?: boolean;
+  isSubagentRun?: boolean;
+  taskManager?: {
+    enqueueDetachedTask: (input: {
+      agentId: string;
+      conversationId: string;
+      prompt: string;
+      title?: string;
+      providerKind: ProviderKind;
+      model: string;
+      reasoningLevel: ReasoningLevel;
+      taskKind?: TaskKind;
+      parentTaskId?: string | null;
+      nestingDepth?: number;
+      scheduledFor?: number | null;
+      startImmediately?: boolean;
+      taskFlowId?: string | null;
+      flowStepKey?: string | null;
+      originRunId?: string | null;
+    }) => Promise<{ id: string }>;
+  };
+  sessionManager?: {
+    spawnSubagentSession: (input: {
+      agentId: string;
+      parentConversationId: string;
+      parentRunId: string;
+      prompt: string;
+      title?: string;
+      providerKind: ProviderKind;
+      model: string;
+      reasoningLevel: ReasoningLevel;
+    }) => Promise<{
+      session: { id: string; title: string; providerKind: ProviderKind; model: string; reasoningLevel: ReasoningLevel };
+      task: { id: string };
+    }>;
+  };
+  flowManager?: {
+    createFlow: (input: {
+      agentId: string;
+      conversationId: string;
+      title: string;
+      originRunId?: string | null;
+      steps: Array<{
+        stepKey: string;
+        title: string;
+        prompt: string;
+        dependencyStepKey?: string | null;
+      }>;
+    }) => Promise<{
+      flow: { id: string; title: string; status: string };
+      steps: Array<{ id: string; stepKey: string; title: string; status: string }>;
+    }>;
+  };
 }) {
   const parser = ToolArgumentSchemas[params.toolCall.name];
   const args = parser.parse(params.toolCall.arguments);
@@ -949,15 +1413,15 @@ async function executeTool<K extends ProviderKind>(params: {
     case "memory_search": {
       return {
         query: args.query,
-        results: params.workspace.searchAgentMemory({
-          agentId: params.agentId,
-          query: args.query as string,
-          maxResults: typeof args.maxResults === "number" ? args.maxResults : undefined,
-        }),
+        results: params.memoryManager.search(
+          params.agentId,
+          args.query as string,
+          typeof args.maxResults === "number" ? args.maxResults : undefined,
+        ),
       };
     }
     case "memory_write": {
-      const memory = params.workspace.appendAgentMemory({
+      const memory = params.memoryManager.write({
         agentId: params.agentId,
         content: args.content as string,
         target: args.target === "daily" ? "daily" : "durable",
@@ -966,6 +1430,120 @@ async function executeTool<K extends ProviderKind>(params: {
         agentId: params.agentId,
         target: args.target === "daily" ? "daily" : "durable",
         memory,
+      };
+    }
+    case "spawn_subagent_session": {
+      if (!params.sessionManager) {
+        throw new Error("Sub-agent session manager is unavailable.");
+      }
+      if (!params.runId) {
+        throw new Error("Sub-agent sessions require an active run.");
+      }
+      const child = await params.sessionManager.spawnSubagentSession({
+        agentId: params.agentId,
+        parentConversationId: params.conversationId,
+        parentRunId: params.runId,
+        prompt: args.prompt as string,
+        title: typeof args.title === "string" ? args.title : undefined,
+        providerKind: (args.providerKind as ProviderKind | undefined) ?? params.adapter.kind,
+        model: typeof args.model === "string" ? (args.model as string) : params.model,
+        reasoningLevel:
+          (args.reasoningLevel as ReasoningLevel | undefined) ?? params.reasoningLevel,
+      });
+      return {
+        sessionId: child.session.id,
+        taskId: child.task.id,
+        title: child.session.title,
+        providerKind: child.session.providerKind,
+        model: child.session.model,
+        reasoningLevel: child.session.reasoningLevel,
+      };
+    }
+    case "spawn_task": {
+      if (!params.taskManager) {
+        throw new Error("Task manager is unavailable.");
+      }
+      const nextDepth = getNextNestingDepth(params.nestingDepth);
+      const task = await params.taskManager.enqueueDetachedTask({
+        agentId: params.agentId,
+        conversationId: params.conversationId,
+        prompt: args.prompt as string,
+        title: typeof args.title === "string" ? args.title : undefined,
+        providerKind: params.adapter.kind,
+        model: params.model,
+        reasoningLevel: params.reasoningLevel,
+        taskKind: "detached",
+        parentTaskId: params.currentTaskId ?? null,
+        nestingDepth: nextDepth,
+      });
+      return {
+        taskId: task.id,
+        status: "queued",
+      };
+    }
+    case "schedule_task": {
+      if (!params.taskManager) {
+        throw new Error("Task manager is unavailable.");
+      }
+      const nextDepth = getNextNestingDepth(params.nestingDepth);
+      const scheduledFor =
+        typeof args.scheduledFor === "number"
+          ? args.scheduledFor
+          : typeof args.delayMs === "number"
+            ? Date.now() + args.delayMs
+            : null;
+      if (scheduledFor == null) {
+        throw new Error("schedule_task requires delayMs or scheduledFor.");
+      }
+      const task = await params.taskManager.enqueueDetachedTask({
+        agentId: params.agentId,
+        conversationId: params.conversationId,
+        prompt: args.prompt as string,
+        title: typeof args.title === "string" ? args.title : undefined,
+        providerKind: params.adapter.kind,
+        model: params.model,
+        reasoningLevel: params.reasoningLevel,
+        taskKind: "scheduled",
+        parentTaskId: params.currentTaskId ?? null,
+        nestingDepth: nextDepth,
+        scheduledFor,
+        startImmediately: false,
+      });
+      return {
+        taskId: task.id,
+        status: "queued",
+        scheduledFor,
+      };
+    }
+    case "create_task_flow": {
+      if (!params.flowManager) {
+        throw new Error("Task flow manager is unavailable.");
+      }
+      const created = await params.flowManager.createFlow({
+        agentId: params.agentId,
+        conversationId: params.conversationId,
+        title: args.title as string,
+        originRunId: params.runId,
+        steps: (args.steps as Array<{
+          stepKey: string;
+          title: string;
+          prompt: string;
+          dependencyStepKey?: string;
+        }>).map((step) => ({
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: step.prompt,
+          dependencyStepKey: step.dependencyStepKey ?? null,
+        })),
+      });
+      return {
+        flowId: created.flow.id,
+        status: created.flow.status,
+        steps: created.steps.map((step) => ({
+          id: step.id,
+          stepKey: step.stepKey,
+          status: step.status,
+        })),
       };
     }
     default:

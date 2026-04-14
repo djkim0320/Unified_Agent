@@ -5,39 +5,61 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import * as api from "./api";
 import type {
+  AgentHeartbeatRecord,
   AgentRecord,
+  AgentSoulRecord,
   ConversationRecord,
+  HeartbeatLogRecord,
+  PlatformMetadata,
   ProviderSummary,
-  TaskRecord,
+  TaskFlowRecord,
+  TaskFlowStepRecord,
+  WorkspaceRunEventRecord,
   WorkspaceRunRecord,
-  WorkspaceScope,
-  WorkspaceTreeNode,
 } from "./types";
 
 vi.mock("./api", () => ({
   cancelAgentTask: vi.fn(),
+  cancelSubagentSession: vi.fn(),
+  cancelTaskFlow: vi.fn(),
   createAgentTask: vi.fn(),
+  createSubagentSession: vi.fn(),
+  createTaskFlow: vi.fn(),
+  deleteAgent: vi.fn(),
   deleteConversation: vi.fn(),
+  getAgentHeartbeat: vi.fn(),
   getAgentMemory: vi.fn(),
+  getAgentSoul: vi.fn(),
+  getAgentStandingOrders: vi.fn(),
   getConversationMessages: vi.fn(),
+  getTaskFlow: vi.fn(),
   getWorkspaceFile: vi.fn(),
   getWorkspaceTree: vi.fn(),
   importCodexCliAuth: vi.fn(),
   listAgentTasks: vi.fn(),
   listAgents: vi.fn(),
   listConversations: vi.fn(),
+  listHeartbeatLogs: vi.fn(),
   listModels: vi.fn(),
+  listPlatformMetadata: vi.fn(),
   listProviders: vi.fn(),
+  listSubagentSessions: vi.fn(),
   listTaskEvents: vi.fn(),
+  listTaskFlows: vi.fn(),
   listWorkspaceRunEvents: vi.fn(),
   listWorkspaceRuns: vi.fn(),
   logoutCodex: vi.fn(),
   saveAgent: vi.fn(),
+  saveAgentHeartbeat: vi.fn(),
+  saveAgentSoul: vi.fn(),
+  saveAgentStandingOrders: vi.fn(),
   saveConversation: vi.fn(),
   saveProviderAccount: vi.fn(),
+  searchAgentMemory: vi.fn(),
   startCodexOAuth: vi.fn(),
   streamChat: vi.fn(),
   testProvider: vi.fn(),
+  triggerAgentHeartbeat: vi.fn(),
 }));
 
 const providers: ProviderSummary[] = [
@@ -93,9 +115,34 @@ const providers: ProviderSummary[] = [
   },
 ];
 
+const platformMetadata: PlatformMetadata = {
+  plugins: [],
+  tools: [
+    {
+      name: "list_tree",
+      description: "List files.",
+      permission: "workspace",
+      risk: "low",
+      costHint: null,
+      concurrencyClass: "single",
+      batchable: true,
+      rolePolicy: null,
+    },
+  ],
+  channels: [
+    {
+      kind: "webchat",
+      label: "Web Chat",
+      enabled: true,
+      note: "Primary local UI channel.",
+    },
+  ],
+  agentSkills: [],
+};
+
 const defaultAgent: AgentRecord = {
   id: "default-agent",
-  name: "기본 에이전트",
+  name: "Default Agent",
   providerKind: "openai",
   model: "gpt-5.4",
   reasoningLevel: "high",
@@ -103,21 +150,46 @@ const defaultAgent: AgentRecord = {
   updatedAt: 1,
 };
 
-const researchAgent: AgentRecord = {
-  id: "research-agent",
-  name: "리서치 에이전트",
-  providerKind: "anthropic",
-  model: "claude-sonnet-4-6",
-  reasoningLevel: "medium",
-  createdAt: 2,
-  updatedAt: 2,
+const defaultAgentSoul: AgentSoulRecord = {
+  path: "SOUL.md",
+  content: "Be thoughtful, concise, and helpful.",
 };
+
+const defaultAgentHeartbeat: AgentHeartbeatRecord = {
+  path: "HEARTBEAT.md",
+  content: "enabled: true",
+  enabled: true,
+  intervalMinutes: 30,
+  lastRun: "2026-04-13T00:00:00.000Z",
+  instructions: "Check in on the active session.",
+  parseError: null,
+};
+
+const defaultHeartbeatLogs: HeartbeatLogRecord[] = [
+  {
+    id: "heartbeat-log-default",
+    agentId: defaultAgent.id,
+    conversationId: "11111111-1111-4111-8111-111111111111",
+    taskId: null,
+    triggerSource: "scheduler",
+    status: "completed",
+    summary: "Heartbeat completed successfully.",
+    errorText: null,
+    triggeredAt: 10,
+    startedAt: 11,
+    completedAt: 12,
+    updatedAt: 12,
+  },
+];
 
 const firstConversation: ConversationRecord = {
   id: "11111111-1111-4111-8111-111111111111",
   agentId: defaultAgent.id,
   channelKind: "webchat",
-  title: "첫 세션",
+  sessionKind: "webchat",
+  parentConversationId: null,
+  ownerRunId: null,
+  title: "Main session",
   providerKind: "openai",
   model: "gpt-5.4",
   reasoningLevel: "high",
@@ -125,106 +197,134 @@ const firstConversation: ConversationRecord = {
   updatedAt: 2,
 };
 
-const researchConversation: ConversationRecord = {
-  id: "22222222-2222-4222-8222-222222222222",
-  agentId: researchAgent.id,
-  channelKind: "webchat",
-  title: "리서치 세션",
-  providerKind: "anthropic",
-  model: "claude-sonnet-4-6",
-  reasoningLevel: "medium",
-  createdAt: 3,
-  updatedAt: 4,
-};
-
-const run1: WorkspaceRunRecord = {
-  id: "run-1",
+const latestRun: WorkspaceRunRecord = {
+  id: "run-latest",
   conversationId: firstConversation.id,
   taskId: null,
+  parentRunId: null,
+  phase: "foreground",
+  checkpoint: null,
+  resumeToken: null,
   providerKind: "openai",
   model: "gpt-5.4",
-  userMessage: "첫 실행",
+  userMessage: "Create the file.",
   status: "completed",
-  createdAt: 10,
-  updatedAt: 10,
+  createdAt: 30,
+  updatedAt: 31,
 };
 
-const run2: WorkspaceRunRecord = {
-  id: "run-2",
-  conversationId: firstConversation.id,
-  taskId: null,
-  providerKind: "openai",
-  model: "gpt-5.4",
-  userMessage: "두 번째 실행",
-  status: "completed",
-  createdAt: 11,
-  updatedAt: 11,
-};
+const latestRunEvents: WorkspaceRunEventRecord[] = [
+  {
+    id: "run-event-tool-call",
+    runId: latestRun.id,
+    eventType: "tool_call",
+    payload: { toolName: "write_file", path: "README.md" },
+    createdAt: 31,
+  },
+];
 
-const runningTask: TaskRecord = {
-  id: "task-running",
+const selectedFlowSteps: TaskFlowStepRecord[] = [
+  {
+    id: "step-1",
+    flowId: "flow-1",
+    stepKey: "step-1",
+    title: "Step 1",
+    prompt: "Do the thing",
+    dependencyStepKey: null,
+    status: "queued",
+    taskId: null,
+    createdAt: 1,
+    updatedAt: 1,
+  },
+];
+
+const selectedFlow: TaskFlowRecord = {
+  id: "flow-1",
   agentId: defaultAgent.id,
   conversationId: firstConversation.id,
-  runId: null,
-  title: "Background task",
-  prompt: "do work",
-  providerKind: "openai",
-  model: "gpt-5.4",
-  reasoningLevel: "high",
+  title: "Research flow",
   status: "running",
-  resultText: null,
-  createdAt: 10,
-  startedAt: 10,
-  completedAt: null,
-  scheduledFor: null,
-  updatedAt: 10,
+  createdAt: 1,
+  updatedAt: 2,
 };
-
-function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
-  return {
-    id: "task-1",
-    agentId: defaultAgent.id,
-    conversationId: firstConversation.id,
-    runId: null,
-    title: "백그라운드 작업",
-    prompt: "조사해줘",
-    providerKind: "openai",
-    model: "gpt-5.4",
-    reasoningLevel: "high",
-    status: "queued",
-    resultText: null,
-    createdAt: 10,
-    startedAt: null,
-    completedAt: null,
-    scheduledFor: null,
-    updatedAt: 10,
-    ...overrides,
-  };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
-}
 
 function mockDefaults() {
   vi.mocked(api.listAgents).mockResolvedValue({ agents: [defaultAgent] });
   vi.mocked(api.listProviders).mockResolvedValue({ providers });
-  vi.mocked(api.listModels).mockImplementation(async (kind) => ({
-    models:
-      kind === "anthropic"
-        ? ["claude-sonnet-4-6", "claude-opus-4-6"]
-        : ["gpt-5.4", "gpt-5.4-mini"],
-  }));
+  vi.mocked(api.listPlatformMetadata).mockResolvedValue(platformMetadata);
+  vi.mocked(api.listModels).mockResolvedValue({ models: ["gpt-5.4"] });
   vi.mocked(api.listConversations).mockResolvedValue({ conversations: [firstConversation] });
   vi.mocked(api.getConversationMessages).mockResolvedValue({
     conversation: firstConversation,
     messages: [],
   });
+  vi.mocked(api.saveAgent).mockResolvedValue({ agent: defaultAgent });
+  vi.mocked(api.saveAgentSoul).mockResolvedValue({ soul: defaultAgentSoul });
+  vi.mocked(api.saveAgentHeartbeat).mockResolvedValue({ heartbeat: defaultAgentHeartbeat });
+  vi.mocked(api.saveAgentStandingOrders).mockResolvedValue({
+    standingOrders: { path: "standing-orders.md", content: "# orders" },
+  });
   vi.mocked(api.saveConversation).mockResolvedValue({ conversation: firstConversation });
+  vi.mocked(api.getAgentStandingOrders).mockResolvedValue({
+    standingOrders: { path: "standing-orders.md", content: "# orders" },
+  });
+  vi.mocked(api.getAgentMemory).mockResolvedValue({
+    memory: {
+      agentId: defaultAgent.id,
+      durableMemoryPath: "MEMORY.md",
+      durableMemory: "# MEMORY\n",
+      dailyMemoryPath: "memory/2026-04-11.md",
+      dailyMemory: "# 2026-04-11\n",
+    },
+  });
+  vi.mocked(api.searchAgentMemory).mockResolvedValue({ results: [] });
+  vi.mocked(api.listSubagentSessions).mockResolvedValue({ sessions: [] });
+  vi.mocked(api.createSubagentSession).mockResolvedValue({
+    session: {
+      ...firstConversation,
+      id: "sub-session-1",
+      title: "Sub-agent session",
+      parentConversationId: firstConversation.id,
+      ownerRunId: latestRun.id,
+    },
+    task: {
+      id: "task-sub-1",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: null,
+      taskKind: "detached",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "Sub-agent session",
+      prompt: "help me",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      status: "queued",
+      resultText: null,
+      createdAt: 1,
+      startedAt: null,
+      completedAt: null,
+      scheduledFor: null,
+      updatedAt: 1,
+    },
+  });
+  vi.mocked(api.cancelSubagentSession).mockResolvedValue({ ok: true, task: null });
+  vi.mocked(api.listTaskFlows).mockResolvedValue({ flows: [selectedFlow] });
+  vi.mocked(api.getTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
+  vi.mocked(api.createTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
+  vi.mocked(api.cancelTaskFlow).mockResolvedValue({ flow: null });
+  vi.mocked(api.listHeartbeatLogs).mockResolvedValue({ logs: defaultHeartbeatLogs });
+  vi.mocked(api.triggerAgentHeartbeat).mockResolvedValue({
+    message: "Heartbeat ran.",
+    heartbeat: defaultAgentHeartbeat,
+    heartbeatLog: defaultHeartbeatLogs[0],
+  });
+  vi.mocked(api.listWorkspaceRuns).mockResolvedValue({ runs: [latestRun] });
+  vi.mocked(api.listWorkspaceRunEvents).mockResolvedValue({ events: latestRunEvents });
   vi.mocked(api.getWorkspaceTree).mockResolvedValue({ scope: "sandbox", path: ".", tree: [] });
   vi.mocked(api.getWorkspaceFile).mockResolvedValue({
     file: {
@@ -236,24 +336,57 @@ function mockDefaults() {
       encoding: "utf-8",
     },
   });
-  vi.mocked(api.listWorkspaceRuns).mockResolvedValue({ runs: [] });
-  vi.mocked(api.listWorkspaceRunEvents).mockResolvedValue({ events: [] });
   vi.mocked(api.listAgentTasks).mockResolvedValue({ tasks: [] });
   vi.mocked(api.listTaskEvents).mockResolvedValue({ events: [] });
-  vi.mocked(api.getAgentMemory).mockResolvedValue({
-    memory: {
+  vi.mocked(api.createAgentTask).mockResolvedValue({
+    task: {
+      id: "task-running",
       agentId: defaultAgent.id,
-      durableMemoryPath: "MEMORY.md",
-      durableMemory: "# MEMORY\n",
-      dailyMemoryPath: "memory/2026-04-11.md",
-      dailyMemory: "# 2026-04-11\n",
+      conversationId: firstConversation.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: null,
+      taskKind: "detached",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "Task",
+      prompt: "do work",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      status: "running",
+      resultText: null,
+      createdAt: 10,
+      startedAt: 10,
+      completedAt: null,
+      scheduledFor: null,
+      updatedAt: 10,
     },
   });
   vi.mocked(api.cancelAgentTask).mockResolvedValue({
     task: {
-      ...runningTask,
+      id: "task-running",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: null,
+      taskKind: "detached",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "Task",
+      prompt: "do work",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
       status: "cancelled",
+      resultText: null,
+      createdAt: 10,
+      startedAt: 10,
       completedAt: 12,
+      scheduledFor: null,
       updatedAt: 12,
     },
   });
@@ -266,14 +399,7 @@ function getShell(container: HTMLElement) {
   return within(shell as HTMLElement);
 }
 
-function getConversationButton(shell: ReturnType<typeof within>, title: string) {
-  const titleNode = shell.getByText(title);
-  const button = titleNode.closest("button");
-  expect(button).not.toBeNull();
-  return button as HTMLButtonElement;
-}
-
-describe("App agent platform UI", () => {
+describe("App frontend", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockDefaults();
@@ -283,143 +409,60 @@ describe("App agent platform UI", () => {
     vi.clearAllMocks();
   });
 
-  it("shows Korean UI and grouped model options", async () => {
+  it("renders the workspace control-plane cards", async () => {
     const { container } = render(<App />);
-    const user = userEvent.setup();
     const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await shell.findByRole("heading", { name: firstConversation.title });
+    const tabs = container.querySelectorAll<HTMLButtonElement>(".chat-panel__tab");
+    await user.click(tabs[1]!);
+
+    expect(await shell.findByText("Memory search")).toBeInTheDocument();
+    expect(await shell.findByText("Sub-agent sessions")).toBeInTheDocument();
+    expect(await shell.findByText("Task flows")).toBeInTheDocument();
+  });
+
+  it("opens the standing orders tab in agent settings", async () => {
+    const { container } = render(<App />);
+    const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await shell.findByRole("heading", { name: firstConversation.title });
+    await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
+
+    const dialog = await waitFor(() => {
+      const node = container.querySelector('[role="dialog"]');
+      expect(node).not.toBeNull();
+      return node as HTMLElement;
+    });
+
+    await user.click(within(dialog).getByRole("button", { name: "Standing Orders" }));
+    expect(within(dialog).getByRole("heading", { name: "Standing Orders" })).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Standing orders content")).toBeInTheDocument();
+  });
+
+  it("saves standing orders from the agent settings dialog", async () => {
+    const { container } = render(<App />);
+    const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await shell.findByRole("heading", { name: firstConversation.title });
+    await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
+
+    const dialog = await waitFor(() => {
+      const node = container.querySelector('[role="dialog"]');
+      expect(node).not.toBeNull();
+      return node as HTMLElement;
+    });
+
+    await user.click(within(dialog).getByRole("button", { name: "Standing Orders" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save standing orders" }));
 
     await waitFor(() => {
-      expect(api.getConversationMessages).toHaveBeenCalled();
-    });
-    expect(shell.getByText("마인드풀 워크스페이스")).toBeInTheDocument();
-    expect(await shell.findByRole("heading", { name: firstConversation.title })).toBeInTheDocument();
-
-    await user.click(shell.getByRole("button", { name: /모델 선택/ }));
-
-    expect(shell.getAllByText("OpenAI").length).toBeGreaterThan(0);
-    expect(shell.getAllByText("Anthropic").length).toBeGreaterThan(0);
-    expect((await shell.findAllByRole("option", { name: /GPT-5\.4 Mini/ })).length).toBeGreaterThan(0);
-    expect(shell.getByText("연결됨")).toBeInTheDocument();
-  });
-
-  it("clears workspace state when switching conversations", async () => {
-    const treeB = deferred<{ scope: WorkspaceScope; path: string; tree: WorkspaceTreeNode[] }>();
-
-    vi.mocked(api.listConversations).mockResolvedValue({
-      conversations: [firstConversation, { ...firstConversation, id: "33333333-3333-4333-8333-333333333333", title: "두 번째 세션" }],
-    });
-    vi.mocked(api.getConversationMessages).mockImplementation(async (conversationId) => ({
-      conversation: conversationId === firstConversation.id ? firstConversation : { ...firstConversation, id: "33333333-3333-4333-8333-333333333333", title: "두 번째 세션" },
-      messages: [],
-    }));
-    vi.mocked(api.getWorkspaceTree).mockImplementation(async ({ conversationId }) => {
-      if (conversationId === firstConversation.id) {
-        return {
-          scope: "sandbox",
-          path: ".",
-          tree: [{ name: "a.txt", path: "a.txt", kind: "file", size: 1 }],
-        };
-      }
-      return treeB.promise;
-    });
-    vi.mocked(api.listWorkspaceRuns).mockImplementation(async (conversationId) => ({
-      runs: conversationId === firstConversation.id ? [run1] : [],
-    }));
-
-    const { container } = render(<App />);
-    const user = userEvent.setup();
-    const shell = getShell(container);
-
-    await user.click(shell.getByRole("button", { name: "워크스페이스" }));
-    expect(await shell.findByRole("button", { name: "a.txt" })).toBeInTheDocument();
-    expect(await shell.findByRole("button", { name: /첫 실행/ })).toHaveAttribute("aria-pressed", "true");
-
-    await user.click(getConversationButton(shell, "두 번째 세션"));
-    expect(shell.queryByRole("button", { name: "a.txt" })).not.toBeInTheDocument();
-
-    treeB.resolve({
-      scope: "sandbox",
-      path: ".",
-      tree: [{ name: "b.txt", path: "b.txt", kind: "file", size: 1 }],
-    });
-
-    expect(await shell.findByRole("button", { name: "b.txt" })).toBeInTheDocument();
-  });
-
-  it("switches agent-scoped sessions, tasks, and memory together", async () => {
-    const researchTask = makeTask({
-      id: "research-task",
-      agentId: researchAgent.id,
-      conversationId: researchConversation.id,
-      title: "리서치 작업",
-      prompt: "collect notes",
-      providerKind: "anthropic",
-      model: "claude-sonnet-4-6",
-      reasoningLevel: "medium",
-    });
-
-    vi.mocked(api.listAgents).mockResolvedValue({ agents: [defaultAgent, researchAgent] });
-    vi.mocked(api.listConversations).mockImplementation(async (_signal, agentId) => ({
-      conversations: agentId === researchAgent.id ? [researchConversation] : [firstConversation],
-    }));
-    vi.mocked(api.getConversationMessages).mockImplementation(async (conversationId) => ({
-      conversation: conversationId === researchConversation.id ? researchConversation : firstConversation,
-      messages: [],
-    }));
-    vi.mocked(api.listAgentTasks).mockImplementation(async (agentId) => ({
-      tasks: agentId === researchAgent.id ? [researchTask] : [],
-    }));
-    vi.mocked(api.getAgentMemory).mockImplementation(async (agentId) => ({
-      memory: {
-        agentId,
-        durableMemoryPath: "MEMORY.md",
-        durableMemory: agentId === researchAgent.id ? "Research preferences" : "Default memory",
-        dailyMemoryPath: "memory/2026-04-11.md",
-        dailyMemory: "",
-      },
-    }));
-
-    const { container } = render(<App />);
-    const user = userEvent.setup();
-    const shell = getShell(container);
-
-    await shell.findByRole("option", { name: researchAgent.name });
-    await user.selectOptions(shell.getByRole("combobox"), researchAgent.id);
-    await user.click(shell.getByRole("button", { name: "워크스페이스" }));
-
-    expect(await shell.findByRole("heading", { name: "리서치 세션" })).toBeInTheDocument();
-    expect(await shell.findByText("리서치 작업")).toBeInTheDocument();
-    expect(await shell.findByText("Research preferences")).toBeInTheDocument();
-    expect(shell.queryByText(firstConversation.title)).not.toBeInTheDocument();
-  });
-
-  it("shows selected task events and cancels a running task", async () => {
-    vi.mocked(api.listAgentTasks).mockResolvedValue({ tasks: [runningTask] });
-    vi.mocked(api.listTaskEvents).mockResolvedValue({
-      events: [
-        {
-          id: "task-event-1",
-          taskId: runningTask.id,
-          eventType: "running",
-          payload: { note: "started" },
-          createdAt: 11,
-        },
-      ],
-    });
-
-    const { container } = render(<App />);
-    const user = userEvent.setup();
-    const shell = getShell(container);
-
-    await user.click(shell.getByRole("button", { name: "워크스페이스" }));
-    await user.click(await shell.findByRole("button", { name: /Background task/ }));
-
-    expect(await shell.findByText(/started/)).toBeInTheDocument();
-
-    await user.click(shell.getByRole("button", { name: "취소" }));
-
-    await waitFor(() => {
-      expect(api.cancelAgentTask).toHaveBeenCalledWith(defaultAgent.id, runningTask.id);
+      expect(api.saveAgentStandingOrders).toHaveBeenCalledWith(defaultAgent.id, {
+        content: "# orders",
+      });
     });
   });
 });

@@ -45,11 +45,18 @@ function createHarness() {
     eventType: WorkspaceRunEventRecord["eventType"];
     payload: Record<string, unknown>;
   }> = [];
+  const runCreations: Array<Record<string, unknown>> = [];
+  const runPatches: Array<Record<string, unknown>> = [];
   const sseEvents: Array<{ eventName: string; payload: Record<string, unknown> }> = [];
 
   const store = {
-    createWorkspaceRun() {
+    createWorkspaceRun(input: Record<string, unknown>) {
+      runCreations.push(input);
       return { id: "run-1" };
+    },
+    patchWorkspaceRun(input: Record<string, unknown>) {
+      runPatches.push(input);
+      return input;
     },
     appendWorkspaceRunEvent(input: {
       runId: string;
@@ -121,6 +128,8 @@ function createHarness() {
     workspace,
     browserRuntime: browserRuntime as never,
     store,
+    runCreations,
+    runPatches,
     events,
     finalizations,
     sseEvents,
@@ -150,6 +159,8 @@ function createAdapter(
     | { kind: "error"; error: Error }
   >,
   streamImpl?: (params: { onText: (chunk: string) => void; signal?: AbortSignal }) => Promise<void>,
+  planSpy?: (params: { instructions: string }) => void,
+  streamSpy?: (params: { instructions: string }) => void,
 ) {
   let index = 0;
   return {
@@ -162,7 +173,8 @@ function createAdapter(
     async testConnection() {
       return { ok: true, message: "ok" };
     },
-    async planToolStep() {
+    async planToolStep(params: { instructions: string }) {
+      planSpy?.(params);
       const next = steps[index] ?? steps[steps.length - 1];
       index += 1;
       if (next.kind === "error") {
@@ -170,7 +182,12 @@ function createAdapter(
       }
       return next.value;
     },
-    async streamFinalAnswer(params: { onText: (chunk: string) => void; signal?: AbortSignal }) {
+    async streamFinalAnswer(params: {
+      onText: (chunk: string) => void;
+      signal?: AbortSignal;
+      instructions: string;
+    }) {
+      streamSpy?.({ instructions: params.instructions });
       if (streamImpl) {
         await streamImpl(params);
         return;
@@ -274,6 +291,57 @@ describe("runAgentTurn", () => {
       status: "failed",
       eventType: "run_failed",
     });
+  });
+
+  it("falls back to final answer streaming when planner breaks after a successful tool step", async () => {
+    const harness = createHarness();
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "write_file",
+            arguments: {
+              scope: "sandbox",
+              path: "hello.ts",
+              content: "export const ok = true;\n",
+            },
+          },
+        },
+      },
+      {
+        kind: "error",
+        error: new Error("planner response was not valid JSON"),
+      },
+      {
+        kind: "error",
+        error: new Error("planner response was not valid JSON"),
+      },
+    ]);
+
+    const result = await runAgentTurn({
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      ...harness.baseParams,
+    });
+
+    expect(result.assistantText).toBe("완료");
+    expect(result.changedFiles).toEqual(["hello.ts"]);
+    expect(harness.finalizations[0]).toMatchObject({
+      status: "completed",
+      eventType: "run_complete",
+    });
+    expect(harness.sseEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventName: "status",
+          payload: expect.objectContaining({
+            phase: "planning_fallback_final",
+          }),
+        }),
+      ]),
+    );
   });
 
   it("surfaces invalid tool arguments as explicit error events", async () => {
@@ -441,6 +509,264 @@ describe("runAgentTurn", () => {
     );
   });
 
+  it("keeps strict JSON instructions when a tool registry is active", async () => {
+    const harness = createHarness();
+    const instructionCalls: string[] = [];
+    const finalInstructionCalls: string[] = [];
+    const adapter = createAdapter(
+      [
+        {
+          kind: "step",
+          value: { type: "final_answer" },
+        },
+      ],
+      undefined,
+      ({ instructions }) => {
+        instructionCalls.push(instructions);
+      },
+      ({ instructions }) => {
+        finalInstructionCalls.push(instructions);
+      },
+    );
+    const toolRegistry = createToolRegistry();
+    registerCoreTools(toolRegistry);
+
+    await runAgentTurn({
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      toolRegistry,
+      ...harness.baseParams,
+    });
+
+    expect(instructionCalls[0]).toContain("Return strict JSON only.");
+    expect(instructionCalls[0]).toContain("Registered tools:");
+    expect(instructionCalls[0]).toContain("list_tree");
+    expect(instructionCalls[0]).toContain("exec_command");
+    expect(finalInstructionCalls[0]).toContain("SOUL guidance:");
+    expect(finalInstructionCalls[0]).toContain("Runtime context:");
+    expect(finalInstructionCalls[0]).toContain("Run mode: foreground");
+  });
+
+  it("injects standing orders and persists run phases with checkpoints", async () => {
+    const harness = createHarness();
+    const agent: AgentRecord = {
+      id: "agent-1",
+      name: "Standing Orders Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    harness.workspace.writeAgentStandingOrders(
+      agent.id,
+      "# Standing Orders\n\n- Keep replies concise.\n- Prefer Korean.",
+    );
+
+    const planInstructions: string[] = [];
+    const adapter = createAdapter(
+      [
+        {
+          kind: "step",
+          value: { type: "final_answer" },
+        },
+      ],
+      undefined,
+      ({ instructions }) => {
+        planInstructions.push(instructions);
+      },
+    );
+
+    await runAgentTurn({
+      agent,
+      agentId: agent.id,
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      ...harness.baseParams,
+    });
+
+    expect(harness.runCreations[0]).toEqual(
+      expect.objectContaining({
+        phase: "accepted",
+        checkpoint: expect.objectContaining({
+          stepIndex: 0,
+          maxSteps: 8,
+          runMode: "foreground",
+        }),
+      }),
+    );
+    expect(harness.runPatches).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "planning",
+          checkpoint: expect.objectContaining({
+            stepIndex: 0,
+            lastToolName: null,
+          }),
+        }),
+        expect.objectContaining({
+          phase: "synthesizing",
+          checkpoint: expect.objectContaining({
+            stepIndex: 8,
+            lastToolName: null,
+          }),
+        }),
+      ]),
+    );
+    expect(planInstructions[0]).toContain("Standing orders:");
+    expect(planInstructions[0]).toContain("Prefer Korean");
+  });
+
+  it("queues a continuation task for detached runs when the autonomous step budget is exhausted", async () => {
+    const harness = createHarness();
+    const enqueuedTasks: Array<Record<string, unknown>> = [];
+    const taskManager = {
+      async enqueueDetachedTask(input: Record<string, unknown>) {
+        enqueuedTasks.push(input);
+        return { id: "continuation-task" };
+      },
+    };
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "list_tree",
+            arguments: {
+              scope: "sandbox",
+            },
+          },
+        },
+      },
+    ]);
+
+    const result = await runAgentTurn({
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      taskManager: taskManager as never,
+      isDetachedTask: true,
+      currentTaskId: "task-1",
+      nestingDepth: 0,
+      maxSteps: 1,
+      ...harness.baseParams,
+    });
+
+    expect(result.assistantText).toBe("완료");
+    expect(enqueuedTasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          taskKind: "continuation",
+          parentTaskId: "task-1",
+          nestingDepth: 1,
+          startImmediately: true,
+        }),
+      ]),
+    );
+    expect(harness.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "status",
+          payload: expect.objectContaining({
+            phase: "continuation_scheduled",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("limits spawn_task nesting depth to two levels", async () => {
+    const harness = createHarness();
+    const taskManager = {
+      async enqueueDetachedTask() {
+        return { id: "task-next" };
+      },
+    };
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "spawn_task",
+            arguments: {
+              prompt: "Do follow-up work",
+            },
+          },
+        },
+      },
+    ]);
+    const toolRegistry = createToolRegistry();
+    registerCoreTools(toolRegistry);
+
+    await expect(
+      runAgentTurn({
+        adapter: adapter as never,
+        secret: { apiKey: "test" } as never,
+        toolRegistry,
+        taskManager: taskManager as never,
+        isDetachedTask: true,
+        currentTaskId: "task-parent",
+        nestingDepth: 2,
+        ...harness.baseParams,
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+    } satisfies Partial<AgentRunError>);
+  });
+
+  it("schedules delayed tasks with schedule_task", async () => {
+    const harness = createHarness();
+    const enqueueDetachedTask = vi.fn(async (input: Record<string, unknown>) => ({
+      id: "scheduled-task",
+      input,
+    }));
+    const taskManager = {
+      enqueueDetachedTask,
+    };
+    const adapter = createAdapter([
+      {
+        kind: "step",
+        value: {
+          type: "tool_call",
+          tool: {
+            name: "schedule_task",
+            arguments: {
+              title: "Follow up later",
+              prompt: "Check back after a little while.",
+              delayMs: 60000,
+            },
+          },
+        },
+      },
+      {
+        kind: "step",
+        value: { type: "final_answer" },
+      },
+    ]);
+    const toolRegistry = createToolRegistry();
+    registerCoreTools(toolRegistry);
+
+    await runAgentTurn({
+      adapter: adapter as never,
+      secret: { apiKey: "test" } as never,
+      toolRegistry,
+      taskManager: taskManager as never,
+      ...harness.baseParams,
+    });
+
+    const call = enqueueDetachedTask.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(call).toEqual(
+      expect.objectContaining({
+        taskKind: "scheduled",
+        startImmediately: false,
+        parentTaskId: null,
+        nestingDepth: 1,
+      }),
+    );
+    expect(typeof call?.scheduledFor).toBe("number");
+  });
+
   it("rejects exec_command cwd values that escape the sandbox", async () => {
     const harness = createHarness();
     const adapter = createAdapter([
@@ -507,7 +833,9 @@ describe("runAgentTurn", () => {
 
     const toolRegistry = createToolRegistry();
     registerCoreTools(toolRegistry);
-    const memoryManager = createMemoryManager(harness.workspace);
+    const memoryManager = createMemoryManager({
+      workspace: harness.workspace,
+    });
     const agent: AgentRecord = {
       id: "agent-1",
       name: "Memory Agent",

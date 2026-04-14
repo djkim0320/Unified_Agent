@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createAgentGateway } from "./lib/agent-gateway.js";
 import { resolveCodexIdentity, importCodexCliAuth } from "./lib/codex-auth.js";
 import { createBrowserRuntime } from "./lib/browser-runtime.js";
+import { createChannelRegistry } from "./lib/channel-registry.js";
 import { runCodexLogin, runCodexLoginStatus } from "./lib/codex-cli.js";
 import { createDebugLog, redactOpaqueValue } from "./lib/debug-log.js";
 import { AgentRunError, runAgentTurn } from "./lib/agent-runtime.js";
@@ -19,7 +20,14 @@ import {
   exchangeCodexAuthorizationCode,
   refreshCodexSecret,
 } from "./providers/openai-codex.js";
-import type { ProviderKind, ProviderSecret, ProviderSummary } from "./types.js";
+import type {
+  AgentRecord,
+  ProviderKind,
+  ProviderSecret,
+  ProviderSummary,
+  ToolPermission,
+  ToolSummary,
+} from "./types.js";
 
 const ProviderKindSchema = z.enum([
   "openai",
@@ -49,6 +57,21 @@ const AgentUpsertSchema = z.object({
   reasoningLevel: ReasoningLevelSchema.optional(),
 });
 
+const AgentSoulWriteSchema = z.object({
+  content: z.string().max(50_000),
+});
+
+const AgentStandingOrdersWriteSchema = z.object({
+  content: z.string().max(50_000),
+});
+
+const AgentHeartbeatWriteSchema = z.object({
+  enabled: z.boolean(),
+  intervalMinutes: z.coerce.number().int().min(1).max(60 * 24 * 365),
+  lastRun: z.string().nullable().optional(),
+  instructions: z.string().max(50_000).optional().default(""),
+});
+
 const TaskCreateSchema = z.object({
   agentId: z.string().min(1).max(120),
   conversationId: z.string().uuid().optional().nullable(),
@@ -63,6 +86,35 @@ const TaskCreateSchema = z.object({
 const AgentMemoryWriteSchema = z.object({
   content: z.string().min(1).max(10_000),
   target: z.enum(["durable", "daily"]).optional().default("durable"),
+});
+
+const AgentMemorySearchQuerySchema = z.object({
+  query: z.string().min(1),
+  maxResults: z.coerce.number().int().min(1).max(20).optional(),
+});
+
+const SubagentCreateSchema = z.object({
+  title: z.string().min(1).max(120).optional(),
+  prompt: z.string().min(1).max(20_000),
+  providerKind: ProviderKindSchema.optional(),
+  model: z.string().min(1).max(120).optional(),
+  reasoningLevel: ReasoningLevelSchema.optional(),
+});
+
+const TaskFlowCreateSchema = z.object({
+  conversationId: z.string().uuid().optional().nullable(),
+  title: z.string().min(1).max(120),
+  steps: z
+    .array(
+      z.object({
+        stepKey: z.string().min(1).max(80),
+        title: z.string().min(1).max(120),
+        prompt: z.string().min(1).max(20_000),
+        dependencyStepKey: z.string().min(1).max(80).optional().nullable(),
+      }),
+    )
+    .min(1)
+    .max(8),
 });
 
 const ApiProviderAccountSchema = z.object({
@@ -110,6 +162,40 @@ function formatProviderSummary(params: {
     email: params.email ?? null,
     accountId: params.accountId ?? null,
     metadata: params.metadata ?? {},
+  };
+}
+
+function formatToolSummary(tool: {
+  name: string;
+  description: string;
+  permission: ToolPermission;
+  risk?: "low" | "medium" | "high";
+  costHint?: "cheap" | "moderate" | "expensive";
+  concurrencyClass?: "serial" | "parallel-safe" | "exclusive";
+  batchable?: boolean;
+  rolePolicy?: {
+    allowPrimary?: boolean;
+    allowSubagent?: boolean;
+    maxNestingDepth?: number | null;
+  };
+  audit?: {
+    category?: string;
+    safeByDefault?: boolean;
+  };
+}): ToolSummary {
+  return {
+    name: tool.name,
+    description: tool.description,
+    permission: tool.permission,
+    risk: tool.risk,
+    costHint: tool.costHint,
+    concurrencyClass: tool.concurrencyClass,
+    batchable: tool.batchable,
+    rolePolicy: tool.rolePolicy,
+    audit: {
+      category: tool.audit?.category ?? "unknown",
+      safeByDefault: tool.audit?.safeByDefault ?? true,
+    },
   };
 }
 
@@ -179,6 +265,7 @@ export function createApp(options?: {
   const port = options?.port ?? 8787;
   const fetchImpl = options?.fetchImpl ?? fetch;
   const exposeWorkspaceDebugPaths = process.env.ENABLE_WORKSPACE_DEBUG_PATHS === "true";
+  const channelRegistry = createChannelRegistry();
   const store = createStore(dataDir);
   const workspace = createWorkspaceManager(projectRoot, {
     conversationExists: (conversationId) => Boolean(store.getConversation(conversationId)),
@@ -257,26 +344,19 @@ export function createApp(options?: {
 
   app.get("/api/plugins", (_request, response) => {
     response.json({
-      plugins: gateway.pluginManager.listPlugins().map((plugin) => plugin.manifest),
+      plugins: gateway.pluginManager.listPluginSummaries(),
     });
   });
 
   app.get("/api/tools", (_request, response) => {
     response.json({
-      tools: gateway.toolRegistry.list(),
+      tools: gateway.toolRegistry.list().map(formatToolSummary),
     });
   });
 
   app.get("/api/channels", (_request, response) => {
     response.json({
-      channels: [
-        {
-          kind: "webchat",
-          label: "Web Chat",
-          enabled: true,
-          note: "Primary local UI channel.",
-        },
-      ],
+      channels: channelRegistry.listChannels(),
     });
   });
 
@@ -336,6 +416,17 @@ export function createApp(options?: {
     });
   });
 
+  app.get("/api/agents/:agentId/skills", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      agentId: agent.id,
+      skills: gateway.pluginManager.listSkillSummaries(agent),
+    });
+  });
+
   app.post("/api/agents/:agentId/memory", (request, response) => {
     const agent = requireAgent(response, request.params.agentId);
     if (!agent) {
@@ -352,6 +443,116 @@ export function createApp(options?: {
     });
   });
 
+  app.get("/api/agents/:agentId/memory/search", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const query = AgentMemorySearchQuerySchema.parse(request.query);
+    response.json({
+      results: gateway.memoryManager.search(agent.id, query.query, query.maxResults),
+    });
+  });
+
+  app.get("/api/agents/:agentId/soul", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      soul: workspace.readAgentSoul(agent.id),
+    });
+  });
+
+  app.put("/api/agents/:agentId/soul", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = AgentSoulWriteSchema.parse(request.body);
+    response.json({
+      soul: workspace.writeAgentSoul(agent.id, body.content),
+    });
+  });
+
+  app.get("/api/agents/:agentId/standing-orders", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      standingOrders: workspace.readAgentStandingOrders(agent.id),
+    });
+  });
+
+  app.put("/api/agents/:agentId/standing-orders", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = AgentStandingOrdersWriteSchema.parse(request.body);
+    response.json({
+      standingOrders: workspace.writeAgentStandingOrders(agent.id, body.content),
+    });
+  });
+
+  app.get("/api/agents/:agentId/heartbeat", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      heartbeat: workspace.readAgentHeartbeat(agent.id),
+    });
+  });
+
+  app.put("/api/agents/:agentId/heartbeat", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = AgentHeartbeatWriteSchema.parse(request.body);
+    response.json({
+      heartbeat: workspace.writeAgentHeartbeat(agent.id, {
+        enabled: body.enabled,
+        intervalMinutes: body.intervalMinutes,
+        lastRun: body.lastRun ?? null,
+        instructions: body.instructions,
+      }),
+    });
+  });
+
+  app.post("/api/agents/:agentId/heartbeat/trigger", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    void gateway.queueHeartbeatTask({ agentId: agent.id, triggerSource: "manual" })
+      .then((result) => {
+        if (!result) {
+          response.status(409).json({ error: "A heartbeat task is already queued or running." });
+          return;
+        }
+        response.json(result);
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : "Failed to trigger heartbeat.";
+        response.status(/already queued or running/i.test(message) ? 409 : 400).json({
+          error: message,
+        });
+      });
+  });
+
+  app.get("/api/agents/:agentId/heartbeat/logs", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      logs: store.listHeartbeatLogs(agent.id),
+    });
+  });
+
   app.get("/api/agents/:agentId/tasks", (request, response) => {
     const agent = requireAgent(response, request.params.agentId);
     if (!agent) {
@@ -360,6 +561,90 @@ export function createApp(options?: {
     response.json({
       tasks: store.listTasks(agent.id),
     });
+  });
+
+  app.get("/api/agents/:agentId/flows", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      flows: store.listTaskFlows?.(agent.id) ?? [],
+    });
+  });
+
+  app.post("/api/agents/:agentId/flows", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = TaskFlowCreateSchema.parse(request.body);
+    const conversation =
+      body.conversationId
+        ? store.getConversation(body.conversationId)
+        : store.listConversations(agent.id)[0] ??
+          store.saveConversation({
+            agentId: agent.id,
+            title: body.title,
+            providerKind: agent.providerKind,
+            model: agent.model,
+            reasoningLevel: agent.reasoningLevel,
+          });
+    if (!conversation || conversation.agentId !== agent.id) {
+      response.status(404).json({ error: "Session not found for task flow." });
+      return;
+    }
+
+    void gateway
+      .createFlow({
+        agentId: agent.id,
+        conversationId: conversation.id,
+        title: body.title,
+        steps: body.steps.map((step) => ({
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: step.prompt,
+          dependencyStepKey: step.dependencyStepKey ?? null,
+        })),
+      })
+      .then((result) => {
+        response.json(result);
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to create task flow.",
+        });
+      });
+  });
+
+  app.get("/api/flows/:flowId", (request, response) => {
+    const flow = store.getTaskFlow?.(request.params.flowId) ?? null;
+    if (!flow) {
+      response.status(404).json({ error: "Task flow not found" });
+      return;
+    }
+    response.json({
+      flow,
+      steps: store.listTaskFlowSteps?.(flow.id) ?? [],
+    });
+  });
+
+  app.post("/api/flows/:flowId/cancel", (request, response) => {
+    const flow = store.getTaskFlow?.(request.params.flowId) ?? null;
+    if (!flow) {
+      response.status(404).json({ error: "Task flow not found" });
+      return;
+    }
+    void gateway.taskManager
+      .cancelTaskFlow(flow.id)
+      .then((updated) => {
+        response.json({ flow: updated });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to cancel task flow.",
+        });
+      });
   });
 
   app.post("/api/agents/:agentId/tasks", (request, response) => {
@@ -829,6 +1114,7 @@ export function createApp(options?: {
     const conversation = store.saveConversation({
       id: body.conversationId,
       agentId: agent.id,
+      channelKind: channelRegistry.getDefaultChannel().kind,
       title: normalizedConversationTitle,
       providerKind,
       model,
@@ -876,6 +1162,94 @@ export function createApp(options?: {
       return;
     }
     response.json({ ok: true });
+  });
+
+  app.get("/api/sessions/:sessionId/subagents", (request, response) => {
+    const parentConversation = requireConversation(response, request.params.sessionId);
+    if (!parentConversation) {
+      return;
+    }
+    response.json({
+      sessions: store.listConversations(parentConversation.agentId, {
+        sessionKind: "subagent",
+        parentConversationId: parentConversation.id,
+      }),
+    });
+  });
+
+  app.post("/api/sessions/:sessionId/subagents", (request, response) => {
+    const parentConversation = requireConversation(response, request.params.sessionId);
+    if (!parentConversation) {
+      return;
+    }
+    const body = SubagentCreateSchema.parse(request.body);
+    const providerKind = body.providerKind ?? parentConversation.providerKind;
+    const model = body.model ?? parentConversation.model;
+    const reasoningLevel = normalizeReasoningLevel(
+      providerKind,
+      model,
+      body.reasoningLevel ?? parentConversation.reasoningLevel,
+    );
+    const parentRun = store.listWorkspaceRuns(parentConversation.id)[0] ?? null;
+    if (!parentRun) {
+      response.status(409).json({ error: "A parent run must exist before spawning a sub-agent session." });
+      return;
+    }
+
+    void gateway
+      .spawnSubagentSession({
+        agentId: parentConversation.agentId,
+        parentConversationId: parentConversation.id,
+        parentRunId: parentRun.id,
+        prompt: body.prompt,
+        title: body.title,
+        providerKind,
+        model,
+        reasoningLevel,
+      })
+      .then((result) => {
+        response.json(result);
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to spawn sub-agent session.",
+        });
+      });
+  });
+
+  app.post("/api/subagents/:sessionId/cancel", (request, response) => {
+    const childConversation = requireConversation(response, request.params.sessionId);
+    if (!childConversation) {
+      return;
+    }
+    if (childConversation.sessionKind !== "subagent") {
+      response.status(400).json({ error: "Session is not a sub-agent session." });
+      return;
+    }
+    const activeTask =
+      store
+        .listTasks(childConversation.agentId)
+        .find(
+          (task) =>
+            task.conversationId === childConversation.id &&
+            (task.status === "queued" || task.status === "running"),
+        ) ?? null;
+
+    if (!activeTask) {
+      response.json({ ok: true, task: null });
+      return;
+    }
+
+    void gateway.taskManager
+      .cancelTask(activeTask.id)
+      .then((task) => {
+        response.json({ ok: true, task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to cancel sub-agent task.",
+        });
+      });
   });
 
   app.get("/api/workspace/tree", (request, response) => {
@@ -976,6 +1350,93 @@ export function createApp(options?: {
     });
   });
 
+  app.get("/api/runs/:runId", (request, response) => {
+    const conversationId =
+      typeof request.query.conversationId === "string" ? request.query.conversationId : null;
+    const run =
+      conversationId
+        ? store.getWorkspaceRunForConversation(conversationId, request.params.runId)
+        : store.getWorkspaceRun(request.params.runId);
+    if (!run) {
+      response.status(404).json({ error: "Workspace run not found" });
+      return;
+    }
+    response.json({ run });
+  });
+
+  app.post("/api/runs/:runId/cancel", (request, response) => {
+    const run = store.getWorkspaceRun(request.params.runId);
+    if (!run) {
+      response.status(404).json({ error: "Workspace run not found" });
+      return;
+    }
+    if (!run.taskId) {
+      response.status(409).json({ error: "Only task-backed runs can be cancelled from the control API." });
+      return;
+    }
+    void gateway.taskManager
+      .cancelTask(run.taskId)
+      .then((task) => {
+        response.json({ run, task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to cancel run.",
+        });
+      });
+  });
+
+  app.post("/api/runs/:runId/resume", (request, response) => {
+    const run = store.getWorkspaceRun(request.params.runId);
+    if (!run) {
+      response.status(404).json({ error: "Workspace run not found" });
+      return;
+    }
+    if (run.status === "running") {
+      response.status(409).json({ error: "Run is still active." });
+      return;
+    }
+    const conversation = store.getConversation(run.conversationId);
+    if (!conversation) {
+      response.status(404).json({ error: "Session not found for run." });
+      return;
+    }
+    const prompt = run.checkpoint
+      ? [
+          "Resume the previous run from its last checkpoint.",
+          `Original request: ${run.userMessage}`,
+          `Previous run id: ${run.id}`,
+          `Previous step index: ${run.checkpoint.stepIndex} / ${run.checkpoint.maxSteps}`,
+          run.checkpoint.lastToolName ? `Last tool: ${run.checkpoint.lastToolName}` : "",
+          "Previous tool history:",
+          ...(run.checkpoint.toolHistory.map((entry) => `- ${entry.tool}: ${entry.result}`) ?? []),
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : run.userMessage;
+    void gateway.taskManager
+      .enqueueDetachedTask({
+        agentId: conversation.agentId,
+        conversationId: conversation.id,
+        title: `${conversation.title} (resume)`,
+        prompt,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        taskKind: "continuation",
+        originRunId: run.id,
+        startImmediately: true,
+      })
+      .then((task) => {
+        response.json({ run, task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to resume run.",
+        });
+      });
+  });
+
   app.post("/api/chat/stream", async (request, response) => {
     const body = ChatRequestSchema.parse(request.body);
     const conversation = requireConversation(response, body.conversationId);
@@ -999,7 +1460,7 @@ export function createApp(options?: {
     store.saveConversation({
       id: conversation.id,
       agentId: conversation.agentId,
-      channelKind: conversation.channelKind,
+      channelKind: conversation.channelKind ?? channelRegistry.getDefaultChannel().kind,
       title: conversation.title,
       providerKind: body.providerKind,
       model: body.model,

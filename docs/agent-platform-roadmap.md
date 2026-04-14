@@ -1,77 +1,93 @@
 # Agent Platform Roadmap
 
-## 현재 기준선
+This document describes the intended direction of `Unified_Agent`.
 
-Unified_Agent는 로컬 전용 `React + Express + SQLite` 앱이다. 기존에는 대화 중심의 멀티 프로바이더 채팅 앱이었고, 현재는 다음 요소를 이미 포함한다.
+## Current State
 
-- 웹 채팅을 첫 채널로 사용하는 로컬 게이트웨이 프로세스
-- 프로바이더별 모델 선택과 SSE 스트리밍
-- 워크스페이스 샌드박스, 파일 트리, 실행 로그, 브라우저 조사 도구
-- 에이전트별 세션 분리
-- 파일 기반 메모리와 백그라운드 태스크
-- 툴 레지스트리, 스킬 로더, 코어 플러그인 기반
+The repository already supports:
 
-## 목표 아키텍처
+- local React + Express + SQLite runtime
+- webchat as the first channel
+- per-agent sessions backed by the `conversations` table
+- persistent messages, runs, run events, tasks, and task events
+- local workspace sandboxes
+- file-backed memory
+- plugin and skill loading
+- detached tasks
+- multi-provider execution
 
-장기적으로는 대화 앱이 아니라 로컬 우선 에이전트 플랫폼으로 확장한다.
+## Target Shape
+
+The long-term platform model is:
 
 - Agent Gateway
-  - 채널별 입력을 세션으로 라우팅한다.
-  - 이번 단계에서는 `webchat`만 정식 지원한다.
+- Session Router
 - Agent Runtime
-  - 플래닝, 도구 호출, 결과 주입, 최종 응답 스트리밍을 관리한다.
-  - 결정적 종료 상태와 취소 전파를 보장한다.
 - Tool Registry
-  - 모든 도구를 타입 스키마와 권한 클래스로 등록한다.
-  - 파일/웹/브라우저/메모리/태스크 도구를 코어 플러그인으로 제공한다.
-- Memory Manager
-  - `workspace/agents/<agentId>/MEMORY.md`
-  - `workspace/agents/<agentId>/memory/YYYY-MM-DD.md`
-  - 로컬 파일을 소스 오브 트루스로 유지한다.
-- Task Manager
-  - 백그라운드 태스크 생성, 상태 전이, 이벤트 원장, 취소를 담당한다.
 - Plugin Manager
-  - 공유 디렉터리와 플러그인 디렉터리에서 스킬/매니페스트를 불러온다.
+- Memory Manager
+- Task Manager
+- Channel Registry
 
-## 현재 데이터 모델
+The current implementation already contains early versions of most of these pieces. The remaining work is mostly deeper integration, better UX, and broader automation support.
 
-- `agents`
-  - 에이전트 기본 모델/프로바이더/추론 레벨
-- `conversations`
-  - 사실상 세션 역할
-  - `agent_id`, `channel_kind=webchat`
-- `messages`
-  - 세션 메시지 이력
-- `workspace_runs`
-  - 포그라운드/백그라운드 실행 기록
-- `workspace_run_events`
-  - 상태, 도구 호출, 결과, 종료 이벤트
-- `tasks`
-  - 분리 실행 가능한 백그라운드 작업
-- `task_events`
-  - 태스크 상태 전이와 결과 전달 이력
+## Priority Order
 
-## 마이그레이션 전략
+1. Security and correctness
+2. Agent/session/task coherence
+3. Better structured tool calling
+4. Stronger memory and compaction
+5. Multi-agent UX polish
+6. More channel/plugin extensibility
 
-기존 사용자 데이터를 버리지 않고 다음 방식으로 올린다.
+## Roadmap Themes
 
-1. `default-agent`를 자동 생성한다.
-2. 기존 `conversations`에 `agent_id`, `channel_kind`를 채운다.
-3. 기존 대화는 모두 `default-agent`의 `webchat` 세션으로 간주한다.
-4. 워크스페이스는 새 경로를 우선 사용하되, 읽기 호환은 유지한다.
+### 1. Runtime reliability
 
-## 이번 패치에서 의도적으로 미룬 것
+- improve provider-native structured tool calling where practical
+- keep strict fallback for providers that still need text planning
+- tighten cancellation and timeout semantics
+- reduce planner instability in live Codex workflows
 
-- 텔레그램/슬랙/디스코드 같은 추가 채널
-- 프로바이더별 완전한 네이티브 함수 호출 통합
-- 에이전트별 자격 증명 금고 분리
-- 정교한 자동화 스케줄러 UI
-- 다중 에이전트 협업 오케스트레이션
+### 2. Memory
 
-## 다음 우선순위
+- improve memory retrieval quality
+- add better session-summary compaction
+- keep file-backed memory as the source of truth
 
-1. `App.tsx` 상태를 훅 단위로 분리해 다중 에이전트 UI를 안정화한다.
-2. 태스크 보드와 메모리 패널을 독립 화면으로 승격한다.
-3. 프로바이더별 structured tool calling을 적극 도입한다.
-4. 플러그인 디렉터리용 정식 로더와 검증 규칙을 강화한다.
-5. 자동화 스케줄러와 결과 인박스 흐름을 붙인다.
+### 3. Tasks and automation
+
+- expand detached task workflows
+- keep conservative local automation defaults
+- add clearer scheduling and automation UX
+
+### 4. Plugins and skills
+
+- strengthen local plugin manifests
+- improve skill discoverability
+- keep tools, skills, and plugins clearly separated
+
+### 5. Frontend operations UX
+
+- better agent/session/task navigation
+- clearer run timeline presentation
+- stronger workspace inspection workflows
+- reduce state race conditions and stale refresh hazards
+
+## Non-Goals
+
+Not the current priority:
+
+- external messaging channel expansion first
+- complex multi-agent orchestration
+- hosted multi-user deployment
+- hidden or opaque memory systems
+
+## Working Rule
+
+When choosing between a larger refactor and a safe vertical slice, prefer the vertical slice if it preserves:
+
+- correctness
+- local debuggability
+- workspace safety
+- agent usefulness

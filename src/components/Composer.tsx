@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getModelOption } from "../model-catalog";
-import { getReasoningLabel, getReasoningOptions, normalizeReasoningLevel } from "../reasoning-options";
+import {
+  getReasoningLabel,
+  getReasoningOptions,
+  normalizeReasoningLevel,
+} from "../reasoning-options";
 import {
   providerKinds,
   providerLabels,
@@ -18,6 +22,7 @@ interface ComposerProps {
   reasoningLevel: ReasoningLevel;
   message: string;
   disabled: boolean;
+  section?: "chat" | "workspace";
   onOpenSettings: () => void;
   onModelSelect: (providerKind: ProviderKind, model: string) => void;
   onReasoningChange: (reasoningLevel: ReasoningLevel) => void;
@@ -34,6 +39,8 @@ export function Composer(props: ComposerProps) {
   const [reasoningMenuOpen, setReasoningMenuOpen] = useState(false);
   const modelPickerRef = useRef<HTMLDivElement | null>(null);
   const reasoningPickerRef = useRef<HTMLDivElement | null>(null);
+  const layoutSection = props.section ?? "chat";
+
   const providersByKind = useMemo(
     () =>
       Object.fromEntries(props.providers.map((provider) => [provider.kind, provider])) as Record<
@@ -41,6 +48,16 @@ export function Composer(props: ComposerProps) {
         ProviderSummary
       >,
     [props.providers],
+  );
+
+  const orderedProviderKinds = useMemo(
+    () =>
+      [...providerKinds].sort((left, right) => {
+        const leftEnabled = isProviderEnabled(providersByKind[left]);
+        const rightEnabled = isProviderEnabled(providersByKind[right]);
+        return Number(rightEnabled) - Number(leftEnabled);
+      }),
+    [providersByKind],
   );
 
   const selectedModel = getModelOption(props.providerKind, props.model);
@@ -90,7 +107,7 @@ export function Composer(props: ComposerProps) {
   }, [modelMenuOpen, reasoningMenuOpen]);
 
   return (
-    <section className="composer">
+    <section className={`composer ${layoutSection === "workspace" ? "is-detached" : ""}`}>
       <div className="composer__shell composer__shell--prompt">
         <textarea
           className="composer__textarea"
@@ -103,18 +120,18 @@ export function Composer(props: ComposerProps) {
               props.onSend();
             }
           }}
-          placeholder="후속 변경 사항을 부탁해보세요"
+          placeholder="에이전트에게 다음 작업을 요청해보세요"
         />
 
         <div className="composer__footer composer__footer--prompt">
           <div className="composer__control-row">
             <button
               aria-label="프로바이더 설정 열기"
-              className="composer__icon-button"
+              className="composer__icon-button composer__icon-button--text"
               onClick={props.onOpenSettings}
               type="button"
             >
-              +
+              API
             </button>
 
             <div className="composer-picker" ref={modelPickerRef}>
@@ -131,7 +148,7 @@ export function Composer(props: ComposerProps) {
               >
                 <span className="composer-picker__value">{selectedModel.label}</span>
                 <span className="composer-picker__caret" aria-hidden="true">
-                  ▼
+                  ▾
                 </span>
               </button>
 
@@ -141,17 +158,14 @@ export function Composer(props: ComposerProps) {
                   className="composer-picker__menu composer-picker__menu--grouped"
                   role="listbox"
                 >
-                  {providerKinds.map((kind) => {
+                  {orderedProviderKinds.map((kind) => {
                     const provider = providersByKind[kind];
                     const enabled = isProviderEnabled(provider);
                     const providerModels = props.modelsByProvider[kind] ?? [];
-                    const baseModels = providerModels.map((model) => getModelOption(kind, model));
+                    const options = providerModels.map((model) => getModelOption(kind, model));
 
-                    if (
-                      kind === props.providerKind &&
-                      !baseModels.some((option) => option.id === props.model)
-                    ) {
-                      baseModels.unshift(selectedModel);
+                    if (kind === props.providerKind && !options.some((option) => option.id === props.model)) {
+                      options.unshift(selectedModel);
                     }
 
                     return (
@@ -168,12 +182,12 @@ export function Composer(props: ComposerProps) {
                               ? "불러오는 중"
                               : enabled
                                 ? "사용 가능"
-                                : "API 미설정"}
+                                : "연결 필요"}
                           </span>
                         </div>
 
                         <div className="composer-picker__section-options">
-                          {baseModels.map((option) => {
+                          {options.map((option) => {
                             const selected = kind === props.providerKind && option.id === props.model;
                             return (
                               <button
@@ -205,7 +219,7 @@ export function Composer(props: ComposerProps) {
               <button
                 aria-expanded={reasoningMenuOpen}
                 aria-haspopup="listbox"
-                aria-label={`추론 레벨 선택: ${getReasoningLabel(
+                aria-label={`추론 수준 선택: ${getReasoningLabel(
                   props.providerKind,
                   props.model,
                   selectedReasoning,
@@ -225,12 +239,12 @@ export function Composer(props: ComposerProps) {
                   {getReasoningLabel(props.providerKind, props.model, selectedReasoning)}
                 </span>
                 <span className="composer-picker__caret" aria-hidden="true">
-                  ▼
+                  ▾
                 </span>
               </button>
 
               {reasoningMenuOpen ? (
-                <div aria-label="추론 레벨 선택지" className="composer-picker__menu" role="listbox">
+                <div aria-label="추론 수준 선택지" className="composer-picker__menu" role="listbox">
                   {reasoningOptions.map((option) => {
                     const selected = option.value === selectedReasoning;
                     return (

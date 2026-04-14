@@ -76,6 +76,9 @@ Alternative with npm:
 
 ## Architecture notes
 
+- Agent contributor guide: [`AGENTS.md`](AGENTS.md)
+- Detailed operator guide: [`docs/agent-operator-guide.md`](docs/agent-operator-guide.md)
+- Change playbook for AI agents: [`docs/agent-change-playbook.md`](docs/agent-change-playbook.md)
 - Roadmap: [`docs/agent-platform-roadmap.md`](docs/agent-platform-roadmap.md)
 - ADR: [`docs/adr/001-agent-gateway-architecture.md`](docs/adr/001-agent-gateway-architecture.md)
 

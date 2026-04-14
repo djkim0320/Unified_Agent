@@ -104,7 +104,7 @@ describe("workspace run persistence consistency", () => {
     expect(defaultAgent).toEqual(
       expect.objectContaining({
         id: "default-agent",
-        name: "기본 에이전트",
+        name: "\uAE30\uBCF8 \uC5D0\uC774\uC804\uD2B8",
       }),
     );
 
@@ -174,5 +174,299 @@ describe("workspace run persistence consistency", () => {
     expect(store.listTaskEvents(owner.id, task.id).length).toBeGreaterThan(1);
     expect(store.listTaskEvents(other.id, task.id)).toEqual([]);
     expect(store.getTaskForAgent(other.id, task.id)).toBeNull();
+  });
+
+  it("stores task metadata and heartbeat logs", () => {
+    const agent = store.saveAgent({
+      name: "Heartbeat Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const conversation = store.saveConversation({
+      agentId: agent.id,
+      title: "heartbeat session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+
+    const parentTask = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Parent task",
+      prompt: "Parent prompt",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      taskKind: "scheduled",
+      scheduledFor: Date.now(),
+    });
+    const childTask = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Child task",
+      prompt: "Child prompt",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      parentTaskId: parentTask.id,
+    });
+
+    expect(parentTask.taskKind).toBe("scheduled");
+    expect(parentTask.parentTaskId).toBeNull();
+    expect(childTask.taskKind).toBe("continuation");
+    expect(childTask.parentTaskId).toBe(parentTask.id);
+    expect(childTask.nestingDepth).toBe(parentTask.nestingDepth + 1);
+
+    const log = store.createHeartbeatLog({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      triggerSource: "manual",
+      summary: "Queued heartbeat",
+    });
+    const updatedLog = store.transitionHeartbeatLog({
+      id: log.id,
+      taskId: childTask.id,
+      status: "running",
+      summary: "Heartbeat started",
+    });
+
+    expect(updatedLog).not.toBeNull();
+    expect(updatedLog).toEqual(
+      expect.objectContaining({
+        agentId: agent.id,
+        conversationId: conversation.id,
+        taskId: childTask.id,
+        triggerSource: "manual",
+        status: "running",
+        summary: "Heartbeat started",
+      }),
+    );
+    expect(store.listHeartbeatLogs(agent.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: log.id,
+          taskId: childTask.id,
+        }),
+      ]),
+    );
+    expect(store.listHeartbeatLogs("default-agent")).toEqual([]);
+  });
+
+  it("persists sub-agent sessions and task flow records", () => {
+    const agent = store.saveAgent({
+      name: "Flow Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const parentConversation = store.saveConversation({
+      agentId: agent.id,
+      title: "parent session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const childConversation = store.saveConversation({
+      agentId: agent.id,
+      title: "child session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      sessionKind: "subagent",
+      parentConversationId: parentConversation.id,
+      ownerRunId: null,
+    });
+    const originRun = store.createWorkspaceRun({
+      conversationId: parentConversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "start the flow",
+    });
+
+    expect(
+      store.listConversations(agent.id, {
+        sessionKind: "subagent",
+        parentConversationId: parentConversation.id,
+      }).map((conversation) => conversation.id),
+    ).toEqual([childConversation.id]);
+
+    const flow = store.createTaskFlow({
+      agentId: agent.id,
+      conversationId: parentConversation.id,
+      title: "Ship patch",
+      triggerSource: "manual",
+      originRunId: originRun.id,
+    });
+    const firstStep = store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "inspect",
+      title: "Inspect repo",
+      prompt: "Inspect the repo.",
+    });
+    const secondStep = store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "implement",
+      dependencyStepKey: "inspect",
+      title: "Implement fix",
+      prompt: "Implement the fix.",
+    });
+    const flowTask = store.createTask({
+      agentId: agent.id,
+      conversationId: parentConversation.id,
+      title: firstStep.title,
+      prompt: firstStep.prompt,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      taskKind: "flow_step",
+      taskFlowId: flow.id,
+      flowStepKey: firstStep.stepKey,
+      originRunId: originRun.id,
+    });
+
+    const runningFlow = store.transitionTaskFlow({
+      flowId: flow.id,
+      status: "running",
+    });
+    const completedStep = store.transitionTaskFlowStep({
+      stepId: firstStep.id,
+      taskId: flowTask.id,
+      status: "completed",
+      completedAt: Date.now(),
+    });
+    const completedFlow = store.transitionTaskFlow({
+      flowId: flow.id,
+      status: "completed",
+      resultSummary: "done",
+      completedAt: Date.now(),
+    });
+
+    expect(runningFlow).toEqual(expect.objectContaining({ status: "running" }));
+    expect(completedStep).toEqual(
+      expect.objectContaining({
+        id: firstStep.id,
+        taskId: flowTask.id,
+        status: "completed",
+      }),
+    );
+    expect(completedFlow).toEqual(
+      expect.objectContaining({
+        id: flow.id,
+        status: "completed",
+        resultSummary: "done",
+      }),
+    );
+    expect(store.listTaskFlowSteps(flow.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: firstStep.id,
+          status: "completed",
+        }),
+        expect.objectContaining({
+          id: secondStep.id,
+          status: "queued",
+        }),
+      ]),
+    );
+    expect(store.getTask(flowTask.id)).toEqual(
+      expect.objectContaining({
+        taskKind: "flow_step",
+        taskFlowId: flow.id,
+        flowStepKey: firstStep.stepKey,
+        originRunId: originRun.id,
+      }),
+    );
+  });
+
+  it("stores workspace run checkpoints and parent run links", () => {
+    const conversation = store.saveConversation({
+      title: "resume session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const parentTask = store.createTask({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Parent task",
+      prompt: "Parent prompt",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const parentRun = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "parent run",
+    });
+
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      taskId: parentTask.id,
+      parentRunId: parentRun.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "finish the job",
+      phase: "planning",
+      checkpoint: {
+        stepIndex: 2,
+        maxSteps: 4,
+        userMessage: "finish the job",
+        toolHistory: [{ tool: "list_tree", result: "ok" }],
+        changedFiles: ["notes.txt"],
+        runMode: "foreground",
+        lastToolName: "list_tree",
+      },
+      resumeToken: "resume-token",
+    });
+
+    const patched = store.patchWorkspaceRun?.({
+      runId: run.id,
+      phase: "tool_execution",
+      checkpoint: {
+        stepIndex: 3,
+        maxSteps: 4,
+        userMessage: "finish the job",
+        toolHistory: [{ tool: "list_tree", result: "ok" }],
+        changedFiles: ["notes.txt", "summary.md"],
+        runMode: "foreground",
+        lastToolName: "write_file",
+      },
+      resumeToken: "resume-token-2",
+    });
+
+    expect(run).toEqual(
+      expect.objectContaining({
+        taskId: parentTask.id,
+        parentRunId: parentRun.id,
+        phase: "planning",
+        resumeToken: "resume-token",
+        checkpoint: expect.objectContaining({
+          stepIndex: 2,
+          lastToolName: "list_tree",
+        }),
+      }),
+    );
+    expect(patched).toEqual(
+      expect.objectContaining({
+        phase: "tool_execution",
+        checkpoint: expect.objectContaining({
+          stepIndex: 3,
+          lastToolName: "write_file",
+        }),
+      }),
+    );
+    expect(store.getWorkspaceRun(run.id)).toEqual(
+      expect.objectContaining({
+        phase: "tool_execution",
+        resumeToken: "resume-token-2",
+        checkpoint: expect.objectContaining({
+          changedFiles: ["notes.txt", "summary.md"],
+        }),
+      }),
+    );
   });
 });

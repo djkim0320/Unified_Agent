@@ -18,7 +18,11 @@ export function getReasoningOptions(
   }
 
   if (kind === "anthropic") {
-    if (model.startsWith("claude-opus-4-6") || model.startsWith("claude-sonnet-4-6")) {
+    if (
+      model.startsWith("claude-opus-4-7") ||
+      model.startsWith("claude-opus-4-6") ||
+      model.startsWith("claude-sonnet-4-6")
+    ) {
       return LOW_TO_MAX;
     }
 
@@ -30,7 +34,10 @@ export function getReasoningOptions(
   }
 
   if (kind === "gemini") {
-    if (model.startsWith("gemini-3.1-pro-preview")) {
+    if (
+      model.startsWith("gemini-3.1-pro-preview") ||
+      model.startsWith("gemini-3.1-pro-preview-customtools")
+    ) {
       return LOW_TO_HIGH;
     }
 

@@ -7,6 +7,7 @@ import {
   createSubagentSession,
   createTaskFlow,
   deleteAgent,
+  deleteTaskFlow,
   getAgentMemory,
   getAgentHeartbeat,
   getAgentSoul,
@@ -26,6 +27,7 @@ import {
   saveAgentStandingOrders,
   saveAgentHeartbeat,
   saveAgentSoul,
+  saveTaskFlowSteps,
   searchAgentMemory,
   resumeTaskFlow,
   retryTaskFlowStep,
@@ -33,6 +35,7 @@ import {
   startTaskFlow,
   triggerAgentHeartbeat,
   getTaskFlow,
+  startOpenCodeAuthLogin,
   streamChat,
   writeAgentMemory,
 } from "./api";
@@ -47,10 +50,12 @@ function createSseResponse(body: string) {
 
 describe("api helpers", () => {
   beforeEach(() => {
+    globalThis.__LOCAL_API_TOKEN__ = "test-local-token";
     vi.stubGlobal("fetch", vi.fn());
   });
 
   afterEach(() => {
+    delete globalThis.__LOCAL_API_TOKEN__;
     vi.unstubAllGlobals();
   });
 
@@ -540,6 +545,8 @@ describe("api helpers", () => {
       steps: [{ stepKey: "step-1", title: "Step 1", prompt: "Do the thing" }],
     });
     await getTaskFlow("flow-1");
+    await saveTaskFlowSteps("flow-1", [], "Renamed Flow");
+    await deleteTaskFlow("flow-1");
     await cancelTaskFlow("flow-1");
     await startTaskFlow("flow-1");
     await resumeTaskFlow("flow-1");
@@ -621,34 +628,49 @@ describe("api helpers", () => {
     );
     expect(fetch).toHaveBeenNthCalledWith(
       10,
+      "/api/flows/flow-1/steps",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ steps: [], title: "Renamed Flow" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      11,
+      "/api/flows/flow-1",
+      expect.objectContaining({
+        method: "DELETE",
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      12,
       "/api/flows/flow-1/cancel",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      11,
+      13,
       "/api/flows/flow-1/start",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      12,
+      14,
       "/api/flows/flow-1/resume",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      13,
+      15,
       "/api/flows/flow-1/steps/step-1/retry",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      14,
+      16,
       "/api/flows/flow-1/steps/step-1/skip",
       expect.objectContaining({
         method: "POST",
@@ -720,6 +742,36 @@ describe("api helpers", () => {
         headers: expect.objectContaining({
           "Content-Type": "application/json",
         }),
+      }),
+    );
+  });
+
+  it("starts opencode OAuth login through the API helper", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          launched: false,
+          provider: "openai",
+          command: "opencode auth login --provider openai",
+          message: "ready",
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+
+    const result = await startOpenCodeAuthLogin({ provider: "openai", launch: false });
+
+    expect(result.provider).toBe("openai");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/engine/opencode/auth/login",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ provider: "openai", launch: false }),
       }),
     );
   });

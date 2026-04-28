@@ -27,7 +27,7 @@ const CODEX_SCOPE =
   "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const CODEX_ORIGINATOR = "codex_cli_rs";
 const DEFAULT_CODEX_INSTRUCTIONS =
-  "You are OpenAI Codex inside a local web chat app. Answer helpfully and concisely. The local server executes workspace tools for you, so do not try to run your own shell commands.";
+  "You are OpenAI Codex inside AetherOps. Answer helpfully and concisely. The local server executes workspace tools for you, so do not try to run your own shell commands.";
 
 const CodexTokenSchema = z.object({
   access_token: z.string(),
@@ -245,7 +245,7 @@ async function generateCodexText(params: {
 export const openAICodexAdapter: ProviderAdapter<"openai-codex"> = {
   kind: "openai-codex",
   label: "OpenAI Codex",
-  defaultModel: "gpt-5.4",
+  defaultModel: "gpt-5.5",
 
   async listModels() {
     return [...CODEX_MODELS];

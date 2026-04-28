@@ -65,6 +65,35 @@ export type ToolPermissionClass = "read" | "write" | "network" | "exec" | "memor
 export type ToolRiskLevel = "low" | "medium" | "high";
 export type ToolCostHint = "cheap" | "moderate" | "expensive";
 export type ToolConcurrencyClass = "serial" | "parallel-safe" | "exclusive";
+export type ComputerUseMode = "none" | "openai-computer-tool" | "custom-browser-harness";
+export type AgentEngineKind = "opencode";
+export type EngineRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+export type ComputerUseActionType =
+  | "create_session"
+  | "navigate"
+  | "screenshot"
+  | "click"
+  | "double_click"
+  | "type"
+  | "keypress"
+  | "scroll"
+  | "wait"
+  | "extract_text"
+  | "close_session";
+export type ComputerUseDecision = "allowed" | "requires_approval" | "blocked";
+export type ComputerUseEventStatus =
+  | ComputerUseDecision
+  | "approved"
+  | "denied"
+  | "started"
+  | "completed"
+  | "failed";
 
 export interface ToolDescriptor {
   name: ToolName;
@@ -171,6 +200,18 @@ export interface ProviderAccountRecord {
   updatedAt: number;
 }
 
+export interface ProviderModelCapabilities {
+  streaming: boolean;
+  nativeToolCalling: boolean;
+  jsonMode: boolean;
+  reasoningLevel: boolean;
+  vision: boolean;
+  maxContextTokens: number | null;
+  supportsComputerUse: boolean;
+  supportsBrowserUse: boolean;
+  computerUseMode: ComputerUseMode;
+}
+
 export interface ProviderSummary {
   kind: ProviderKind;
   label: string;
@@ -180,6 +221,7 @@ export interface ProviderSummary {
   email: string | null;
   accountId: string | null;
   metadata: Record<string, unknown>;
+  capabilities?: ProviderModelCapabilities;
 }
 
 export interface ChatMessage {
@@ -252,6 +294,54 @@ export interface WorkspaceRunRecord {
   updatedAt: number;
 }
 
+export interface ComputerUseSettingsRecord {
+  enabled: boolean;
+  customBrowserHarnessEnabled: boolean;
+  allowExternalDomains: string[];
+  allowFileUrls: boolean;
+  maxActionsPerSession: number;
+  sessionTimeoutMs: number;
+  updatedAt: number;
+}
+
+export interface ComputerUseSessionRecord {
+  id: string;
+  agentId: string | null;
+  conversationId: string | null;
+  runId: string | null;
+  taskId: string | null;
+  status: "open" | "closed";
+  currentUrl: string | null;
+  allowedDomains: string[];
+  actionCount: number;
+  latestScreenshotPath: string | null;
+  createdAt: number;
+  updatedAt: number;
+  closedAt: number | null;
+}
+
+export interface ComputerUseActionEventRecord {
+  id: string;
+  sessionId: string;
+  actionType: ComputerUseActionType;
+  status: ComputerUseEventStatus;
+  currentUrl: string | null;
+  targetUrl: string | null;
+  summary: string;
+  metadata: Record<string, unknown>;
+  screenshotPath: string | null;
+  createdAt: number;
+}
+
+export interface ComputerUseApprovalRecord {
+  id: string;
+  sessionId: string;
+  actionEventId: string | null;
+  decision: "approved" | "denied";
+  reason: string | null;
+  createdAt: number;
+}
+
 export interface WorkspaceRunEventRecord {
   id: string;
   runId: string;
@@ -265,6 +355,62 @@ export interface WorkspaceRunEventRecord {
     | "run_cancelled";
   payload: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface EngineRunRecord {
+  runId: string;
+  engineKind: AgentEngineKind;
+  status: EngineRunStatus;
+  externalSessionId: string | null;
+  workspacePath: string | null;
+  model: string;
+  command: string | null;
+  exitCode: number | null;
+  eventSummary: Record<string, unknown>;
+  startedAt: number;
+  completedAt: number | null;
+}
+
+export interface EngineStatusRecord {
+  engineKind: AgentEngineKind;
+  configuredEngineKind: AgentEngineKind;
+  available: boolean;
+  installed: boolean;
+  version: string | null;
+  executable: string;
+  executableSource?: "env" | "embedded-package" | "global" | "test-harness";
+  managedPackageVersion?: string | null;
+  configDir: string | null;
+  authStatus: "available" | "unknown" | "unavailable";
+  models: string[];
+  sessions: Array<Record<string, unknown>>;
+  lastFailure: string | null;
+  environment: {
+    autoUpdateDisabled: boolean;
+    pruneDisabled: boolean;
+    defaultPluginsDisabled: boolean;
+  };
+  credentialSync?: {
+    mode: "runtime-env";
+    configuredProviders: ProviderKind[];
+    entries: Array<{
+      providerKind: ProviderKind;
+      opencodeProvider: string;
+      authMode: "api_key" | "oauth" | "base_url";
+      configured: boolean;
+      runtimeEnvKeys: string[];
+      note: string;
+    }>;
+  };
+  opencodeAuthProviders?: string[];
+}
+
+export interface EngineAuthLoginResult {
+  ok: boolean;
+  launched: boolean;
+  provider: string;
+  command: string;
+  message: string;
 }
 
 export interface TaskRecord {
@@ -391,6 +537,7 @@ export interface TaskFlowStepRecord {
   taskId: string | null;
   stepKey: string;
   dependencyStepKey: string | null;
+  position: number;
   title: string;
   prompt: string;
   status: TaskFlowStepStatus;

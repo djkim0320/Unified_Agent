@@ -249,6 +249,18 @@ describe("runAgentTurn", () => {
     expect(harness.events.map((event) => event.eventType)).toEqual(
       expect.arrayContaining(["tool_call", "tool_result"]),
     );
+    expect(harness.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "status",
+          payload: expect.objectContaining({
+            phase: "tool_lifecycle",
+            lifecycle: "completed",
+            tool: "write_file",
+          }),
+        }),
+      ]),
+    );
     expect(harness.finalizations[0]).toMatchObject({
       status: "completed",
       eventType: "run_complete",
@@ -671,6 +683,15 @@ describe("runAgentTurn", () => {
     expect(saved.toString()).toBe("fake-png");
     expect(harness.events).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "status",
+          payload: expect.objectContaining({
+            phase: "tool_policy",
+            lifecycle: "requested",
+            tool: "browser_screenshot",
+            enforcement: "audit_only",
+          }),
+        }),
         expect.objectContaining({
           eventType: "tool_result",
           payload: expect.objectContaining({

@@ -98,7 +98,7 @@ async function generateText(params: {
 export const geminiAdapter: ProviderAdapter<"gemini"> = {
   kind: "gemini",
   label: "Gemini",
-  defaultModel: "gemini-3-flash-preview",
+  defaultModel: "gemini-3.1-pro-preview",
 
   async listModels(secret) {
     const config = assertConfigured(secret);

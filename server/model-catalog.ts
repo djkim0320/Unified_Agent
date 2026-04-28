@@ -9,34 +9,39 @@ export interface ModelCatalogEntry {
 
 const openAIModels: ModelCatalogEntry[] = [
   {
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    note: "Best for complex reasoning, coding, and agentic work",
+  },
+  {
     id: "gpt-5.4",
     label: "GPT-5.4",
-    note: "Best overall",
+    note: "Strong frontier default for professional work",
   },
   {
     id: "gpt-5.4-mini",
     label: "GPT-5.4 Mini",
-    note: "Faster daily chat",
+    note: "Fast, lower-cost option for daily turns",
   },
   {
     id: "gpt-5.4-nano",
     label: "GPT-5.4 Nano",
-    note: "Lowest latency",
+    note: "Lowest-latency option for simple work",
   },
 ];
 
 const anthropicModels: ModelCatalogEntry[] = [
   {
-    id: "claude-sonnet-4-6",
-    label: "Claude Sonnet 4.6",
-    note: "Best balance",
-    matchPrefixes: ["claude-sonnet-4-6"],
+    id: "claude-opus-4-7",
+    label: "Claude Opus 4.7",
+    note: "Most capable Claude model for complex reasoning and agentic coding",
+    matchPrefixes: ["claude-opus-4-7"],
   },
   {
-    id: "claude-opus-4-6",
-    label: "Claude Opus 4.6",
-    note: "Highest quality",
-    matchPrefixes: ["claude-opus-4-6"],
+    id: "claude-sonnet-4-6",
+    label: "Claude Sonnet 4.6",
+    note: "Best speed/intelligence balance",
+    matchPrefixes: ["claude-sonnet-4-6"],
   },
   {
     id: "claude-haiku-4-5",
@@ -48,21 +53,27 @@ const anthropicModels: ModelCatalogEntry[] = [
 
 const geminiModels: ModelCatalogEntry[] = [
   {
-    id: "gemini-3-flash-preview",
-    label: "Gemini 3 Flash Preview",
-    note: "Best balance",
-    matchPrefixes: ["gemini-3-flash-preview"],
-  },
-  {
     id: "gemini-3.1-pro-preview",
     label: "Gemini 3.1 Pro Preview",
-    note: "Highest reasoning",
+    note: "Advanced Gemini model for complex agentic workflows",
     matchPrefixes: ["gemini-3.1-pro-preview"],
+  },
+  {
+    id: "gemini-3.1-pro-preview-customtools",
+    label: "Gemini 3.1 Pro Preview Custom Tools",
+    note: "Gemini 3.1 Pro endpoint tuned for custom tools and bash workflows",
+    matchPrefixes: ["gemini-3.1-pro-preview-customtools"],
+  },
+  {
+    id: "gemini-3-flash-preview",
+    label: "Gemini 3 Flash Preview",
+    note: "Fast frontier-class Gemini model",
+    matchPrefixes: ["gemini-3-flash-preview"],
   },
   {
     id: "gemini-3.1-flash-lite-preview",
     label: "Gemini 3.1 Flash-Lite Preview",
-    note: "Fastest low-cost option",
+    note: "Fastest low-cost Gemini 3 option",
     matchPrefixes: ["gemini-3.1-flash-lite-preview"],
   },
 ];
@@ -90,29 +101,34 @@ const ollamaFallbackModels: ModelCatalogEntry[] = [
 
 const codexModels: ModelCatalogEntry[] = [
   {
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    note: "Recommended Codex model when signed in with ChatGPT/OAuth",
+  },
+  {
     id: "gpt-5.4",
     label: "GPT-5.4",
-    note: "Best overall",
+    note: "Recommended fallback when GPT-5.5 is unavailable",
   },
   {
     id: "gpt-5.4-mini",
     label: "GPT-5.4 Mini",
-    note: "Faster coding turns",
+    note: "Fast, efficient model for lighter coding tasks and subagents",
   },
   {
     id: "gpt-5.3-codex",
-    label: "GPT-5.3-Codex",
-    note: "Strong agentic coding",
+    label: "GPT-5.3 Codex",
+    note: "Specialized coding model for complex software engineering",
   },
   {
     id: "gpt-5.3-codex-spark",
-    label: "GPT-5.3-Codex-Spark",
-    note: "Fast iteration",
+    label: "GPT-5.3 Codex Spark",
+    note: "Research preview for near-instant coding iteration",
   },
   {
-    id: "gpt-5.2-codex",
-    label: "GPT-5.2-Codex",
-    note: "Reliable long-horizon coding",
+    id: "gpt-5.2",
+    label: "GPT-5.2",
+    note: "Previous general-purpose coding and agentic model",
   },
 ];
 

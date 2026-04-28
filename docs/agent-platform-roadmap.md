@@ -1,6 +1,6 @@
 # Agent Platform Roadmap
 
-This document describes the intended direction of `Unified_Agent`.
+This document describes the intended direction of `AetherOps`.
 
 ## Current State
 

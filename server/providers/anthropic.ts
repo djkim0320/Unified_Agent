@@ -55,7 +55,11 @@ function buildRequestBody(params: {
     requestBody.system = params.system;
   }
 
-  if (params.model.startsWith("claude-opus-4-6") || params.model.startsWith("claude-sonnet-4-6")) {
+  if (
+    params.model.startsWith("claude-opus-4-7") ||
+    params.model.startsWith("claude-opus-4-6") ||
+    params.model.startsWith("claude-sonnet-4-6")
+  ) {
     requestBody.thinking = { type: "adaptive" };
     requestBody.output_config = {
       effort: getAnthropicAdaptiveEffort(normalizedReasoning),
@@ -125,7 +129,7 @@ async function generateText(params: {
 export const anthropicAdapter: ProviderAdapter<"anthropic"> = {
   kind: "anthropic",
   label: "Anthropic",
-  defaultModel: "claude-sonnet-4-6",
+  defaultModel: "claude-opus-4-7",
 
   async listModels(secret) {
     const config = assertConfigured(secret);

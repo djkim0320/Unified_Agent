@@ -1,6 +1,6 @@
-# Local Multi-Provider Chat
+# AetherOps
 
-React + Express + SQLite based local chat app with per-conversation provider and model selection.
+AetherOps is a React + Express + SQLite local-first agent operations platform for tool-calling chat, workspace automation, long-running workflows, and future engineering design integrations.
 
 ## Supported providers
 
@@ -23,6 +23,7 @@ React + Express + SQLite based local chat app with per-conversation provider and
 - Workspace runtime with per-session sandboxes, file tree, run logs, and browser research/computer-use tools
 - Core tool registry, skill/plugin loader, and detached background task ledger
 - Long-running task flows with ordered steps, dependencies, start/resume/retry/skip/cancel controls, and step-linked task/run traces
+- Embedded `opencode-ai` Workspace Engine integration for local-first execution; chat, tasks, flows, heartbeat, and sub-agents all use the same opencode engine path
 
 ## Run on Windows PowerShell
 
@@ -68,12 +69,11 @@ Alternative with npm:
 
 - SQLite DB: `.data/chat.sqlite`
 - Encryption key: `.data/secret.key`
-- Agent workspaces: `workspace/agents/<agentId>/`
-  - durable memory: `MEMORY.md`
-  - daily notes: `memory/YYYY-MM-DD.md`
-  - sessions: `sessions/<conversationId>/`
-- Shared skills: `workspace/shared/skills/`
-- Local plugins: `workspace/shared/plugins/`
+- opencode session workspaces: `workspace/opencode/agents/<agentId>/sessions/<conversationId>/`
+- AetherOps agent control files: `workspace/opencode/agents/<agentId>/SOUL.md`, `STANDING_ORDERS.md`, and `HEARTBEAT.md`
+- One-time opencode-only migration marker: `.data/opencode-only-migration.json`
+- On first server start after the migration, only legacy AetherOps runtime folders are deleted: `workspace/agents`, `workspace/shared/skills`, and `workspace/shared/plugins`.
+- `.data`, SQLite history, provider secrets, task/flow/run audit records, and local API tokens are preserved.
 
 ## Long-Running Workflows
 
@@ -103,23 +103,51 @@ Flow operation endpoints:
 
 The workspace UI exposes the same controls in the task-flow panel, including an outline-to-steps editor and per-step task/run summaries.
 
-## Workspace File Actions
+## Removed Internal Runtime Surfaces
 
-The cockpit file tab can create local workspace artifacts without leaving the UI. Writes stay scoped to either the active session sandbox or the shared workspace; `scope=root` is intentionally rejected for write routes.
+AetherOps is now opencode-only for execution. The old internal tool registry, local skill/plugin execution, direct workspace file CRUD UI, and custom Computer Use API are intentionally removed from the product path.
 
-- `POST /api/workspace/file`: create a UTF-8 text file with `{ conversationId, scope, path, content, overwrite? }`
-- `POST /api/workspace/folder`: create a folder with `{ conversationId, scope, path }`
-- Existing files are protected by default; pass `overwrite=true` only when the user explicitly intends to replace a file.
+These routes return `410 Gone` so old clients fail loudly instead of silently using the wrong runtime:
 
-## Browser Computer-Use Tools
+- `GET /api/tools`
+- `POST /api/mcp/servers`
+- `GET/POST /api/agents/:agentId/skills`
+- `GET/POST /api/agents/:agentId/memory`
+- `GET /api/agents/:agentId/memory/search`
+- `GET/POST /api/workspace/tree`
+- `GET/POST /api/workspace/file`
+- `POST /api/workspace/folder`
+- `/api/computer-use/*`
 
-The core tool registry includes browser actions for rendered web/UI work:
+Equivalent filesystem, command, browser, MCP, and tool behavior should be configured in opencode itself.
 
-- `browser_wait_for`: wait for a selector, text, or URL fragment before the next step.
-- `browser_press`: press keyboard shortcuts or keys, optionally scoped to a selector.
-- `browser_screenshot`: save a PNG evidence artifact under the active session sandbox, for example `artifacts/browser/home.png`.
+## opencode Workspace Engine
 
-These tools keep the existing browser SSRF protections and run-scoped isolation. Screenshot paths are workspace-bounded and must end in `.png`.
+AetherOps treats itself as the control tower and delegates the actual workspace execution loop to the official `opencode` CLI. The app depends on `opencode-ai`, so a normal project install provides a managed local opencode launcher under `node_modules` without requiring a separate global install.
+
+- Foreground chat, detached tasks, heartbeat runs, sub-agent tasks, and task-flow steps all route through the shared `AgentEngine` abstraction.
+- The only runtime engine path is `opencode`; tests use an opencode-shaped deterministic command harness instead of the old provider/tool fallback.
+- Runtime resolution order is `OPENCODE_BIN` when explicitly set, then the embedded `opencode-ai` package, then a global `opencode` command as a last compatibility path.
+- The opencode engine runs only inside the active conversation sandbox under `workspace/opencode/agents/<agentId>/sessions/<conversationId>/`.
+- Host provider secrets are not forwarded through environment inheritance. The process environment is allowlisted and sets `OPENCODE_DISABLE_AUTOUPDATE=true`, `OPENCODE_DISABLE_PRUNE=true`, and `OPENCODE_DISABLE_DEFAULT_PLUGINS=true` by default.
+- AetherOps records the opencode command metadata, external session id when reported, JSON event summary, stdout/stderr summary, exit code, changed files, and lifecycle status into workspace run events.
+
+Useful environment variables:
+
+- `OPENCODE_BIN=opencode` only when you intentionally want to override the managed embedded package
+- `OPENCODE_CONFIG_DIR=<path>`
+- `OPENCODE_DISABLE_AUTOUPDATE=true`
+- `OPENCODE_DISABLE_PRUNE=true`
+- `OPENCODE_DISABLE_DEFAULT_PLUGINS=true`
+- `AETHEROPS_OPENCODE_PREFIX_PROVIDER=true` if your opencode config expects `provider/model` strings instead of plain model aliases
+
+Native engine endpoints:
+
+- `GET /api/engine/status`
+- `POST /api/engine/opencode/refresh-models`
+- `GET /api/engine/runs/:runId`
+
+If opencode is not installed or not authenticated, the settings dialog shows the engine as unavailable and chat/task execution returns a structured run failure instead of silently falling back.
 
 ## Architecture notes
 

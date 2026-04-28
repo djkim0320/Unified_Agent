@@ -4,6 +4,10 @@ import type {
   AgentSkillSummary,
   AgentHeartbeatRecord,
   ConversationRecord,
+  ComputerUseApprovalRecord,
+  ComputerUseSessionDetail,
+  ComputerUseSessionRecord,
+  ComputerUseSettingsRecord,
   HeartbeatLogRecord,
   AgentSoulRecord,
   MemorySearchResult,
@@ -17,6 +21,7 @@ import type {
   StreamEventPayloadMap,
   ToolDescriptor,
   TaskFlowRecord,
+  TaskFlowStepDraft,
   TaskFlowStepDetail,
   WorkspaceFileRecord,
   WorkspaceRunEventRecord,
@@ -26,44 +31,12 @@ import type {
   ChannelSummary,
   TaskEventRecord,
   TaskRecord,
+  ProviderModelCapabilities,
+  EngineRunRecord,
+  EngineStatusRecord,
+  EngineAuthLoginResult,
 } from "./types";
-
-async function readJsonOrThrow<T>(response: Response): Promise<T> {
-  const text = await response.text();
-  let payload: unknown = null;
-
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      throw new Error(text);
-    }
-  }
-
-  if (!response.ok) {
-    const message =
-      typeof payload === "object" &&
-      payload !== null &&
-      "error" in payload &&
-      typeof (payload as { error?: unknown }).error === "string"
-        ? ((payload as { error: string }).error ?? `Request failed (${response.status})`)
-        : `Request failed (${response.status})`;
-    throw new Error(message);
-  }
-
-  return payload as T;
-}
-
-async function apiRequest<T>(input: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
-  return readJsonOrThrow<T>(response);
-}
+import { apiRequest, buildHeaders, readJsonOrThrow } from "./apiClient";
 
 export async function listProviders() {
   return apiRequest<{ providers: ProviderSummary[] }>("/api/providers");
@@ -117,6 +90,143 @@ export async function listChannels(signal?: AbortSignal) {
   return apiRequest<{ channels: ChannelSummary[] }>("/api/channels", { signal });
 }
 
+export async function getComputerUseSettings(signal?: AbortSignal) {
+  return apiRequest<{ settings: ComputerUseSettingsRecord }>("/api/computer-use/settings", {
+    signal,
+  });
+}
+
+export async function saveComputerUseSettings(payload: {
+  enabled: boolean;
+  customBrowserHarnessEnabled?: boolean;
+  allowExternalDomains?: string[];
+  allowFileUrls?: boolean;
+  maxActionsPerSession?: number;
+  sessionTimeoutMs?: number;
+}) {
+  return apiRequest<{ settings: ComputerUseSettingsRecord }>("/api/computer-use/settings", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function createComputerUseSession(payload: {
+  agentId?: string | null;
+  conversationId?: string | null;
+  runId?: string | null;
+  taskId?: string | null;
+  allowedDomains?: string[];
+}) {
+  return apiRequest<{
+    session: ComputerUseSessionRecord;
+    events: ComputerUseSessionDetail["events"];
+    approvals: ComputerUseSessionDetail["approvals"];
+  }>("/api/computer-use/sessions", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getComputerUseSession(sessionId: string, signal?: AbortSignal) {
+  return apiRequest<ComputerUseSessionDetail>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}`,
+    { signal },
+  );
+}
+
+export async function closeComputerUseSession(sessionId: string) {
+  return apiRequest<{ session: ComputerUseSessionRecord | null }>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}/close`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
+export async function approveComputerUseAction(
+  sessionId: string,
+  payload: { actionEventId?: string | null; reason?: string | null },
+) {
+  return apiRequest<{
+    approval: ComputerUseApprovalRecord;
+    detail: ComputerUseSessionDetail;
+  }>(`/api/computer-use/sessions/${encodeURIComponent(sessionId)}/approve`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function denyComputerUseAction(
+  sessionId: string,
+  payload: { actionEventId?: string | null; reason?: string | null },
+) {
+  return apiRequest<{
+    approval: ComputerUseApprovalRecord;
+    detail: ComputerUseSessionDetail;
+  }>(`/api/computer-use/sessions/${encodeURIComponent(sessionId)}/deny`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function navigateComputerUseSession(sessionId: string, url: string) {
+  return apiRequest<Record<string, unknown>>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}/navigate`,
+    {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    },
+  );
+}
+
+export async function screenshotComputerUseSession(sessionId: string) {
+  return apiRequest<Record<string, unknown>>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}/screenshot`,
+    {
+      method: "POST",
+      body: JSON.stringify({ fullPage: false }),
+    },
+  );
+}
+
+export async function clickComputerUseSession(
+  sessionId: string,
+  payload: {
+    selector: string;
+    visibleText?: string;
+    maySubmit?: boolean;
+    mayChangeState?: boolean;
+    mayDelete?: boolean;
+    mayUpload?: boolean;
+    mayDownload?: boolean;
+    mayPurchase?: boolean;
+  },
+) {
+  return apiRequest<Record<string, unknown>>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}/click`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function typeComputerUseSession(
+  sessionId: string,
+  payload: {
+    selector: string;
+    text: string;
+    typedTextKind?: "plain" | "password" | "token" | "api_key" | "payment" | "email" | "personal";
+    submit?: boolean;
+  },
+) {
+  return apiRequest<Record<string, unknown>>(
+    `/api/computer-use/sessions/${encodeURIComponent(sessionId)}/type`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
 export async function listAgentSkills(agentId: string, signal?: AbortSignal) {
   return apiRequest<{ agentId: string; skills: AgentSkillSummary[] }>(
     `/api/agents/${encodeURIComponent(agentId)}/skills`,
@@ -142,18 +252,16 @@ export async function listPlatformMetadata(
   agentId?: string | null,
   signal?: AbortSignal,
 ): Promise<PlatformMetadata> {
-  const [pluginsResponse, toolsResponse, channelsResponse, agentSkillsResponse] = await Promise.all([
+  const [pluginsResponse, channelsResponse] = await Promise.all([
     listPlugins(signal),
-    listTools(signal),
     listChannels(signal),
-    agentId ? listAgentSkills(agentId, signal) : Promise.resolve<{ agentId: string; skills: AgentSkillSummary[] } | null>(null),
   ]);
 
   return {
     plugins: pluginsResponse.plugins,
-    tools: toolsResponse.tools,
+    tools: [],
     channels: channelsResponse.channels,
-    agentSkills: agentSkillsResponse?.skills ?? [],
+    agentSkills: [],
   };
 }
 
@@ -360,6 +468,26 @@ export async function getTaskFlow(flowId: string, signal?: AbortSignal) {
   );
 }
 
+export async function saveTaskFlowSteps(
+  flowId: string,
+  steps: TaskFlowStepDraft[],
+  title?: string,
+) {
+  return apiRequest<{ flow: TaskFlowRecord; steps: TaskFlowStepDetail[] }>(
+    `/api/flows/${encodeURIComponent(flowId)}/steps`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ steps, ...(title ? { title } : {}) }),
+    },
+  );
+}
+
+export async function deleteTaskFlow(flowId: string) {
+  return apiRequest<{ ok: true; flowId: string }>(`/api/flows/${encodeURIComponent(flowId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function cancelTaskFlow(flowId: string) {
   return apiRequest<{ flow: TaskFlowRecord | null; steps?: TaskFlowStepDetail[] }>(`/api/flows/${encodeURIComponent(flowId)}/cancel`, {
     method: "POST",
@@ -412,7 +540,42 @@ export async function saveProviderAccount(
 }
 
 export async function listModels(kind: ProviderKind) {
-  return apiRequest<{ models: string[] }>(`/api/providers/${kind}/models`);
+  return apiRequest<{
+    models: string[];
+    capabilitiesByModel?: Record<string, ProviderModelCapabilities>;
+  }>(`/api/providers/${kind}/models`);
+}
+
+export async function getEngineStatus(signal?: AbortSignal) {
+  return apiRequest<EngineStatusRecord>("/api/engine/status", { signal });
+}
+
+export async function refreshOpenCodeModels() {
+  return apiRequest<{ ok: boolean; models: string[]; message: string }>(
+    "/api/engine/opencode/refresh-models",
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  );
+}
+
+export async function startOpenCodeAuthLogin(payload?: {
+  provider?: string;
+  method?: string | null;
+  launch?: boolean;
+}) {
+  return apiRequest<EngineAuthLoginResult>("/api/engine/opencode/auth/login", {
+    method: "POST",
+    body: JSON.stringify(payload ?? { provider: "openai", launch: true }),
+  });
+}
+
+export async function getEngineRun(runId: string, signal?: AbortSignal) {
+  return apiRequest<{ engineRun: EngineRunRecord }>(
+    `/api/engine/runs/${encodeURIComponent(runId)}`,
+    { signal },
+  );
 }
 
 export async function testProvider(kind: ProviderKind) {
@@ -603,9 +766,7 @@ export async function streamChat(
 ) {
   const response = await fetch("/api/chat/stream", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: await buildHeaders({ method: "POST" }),
     body: JSON.stringify(payload),
     signal,
   });

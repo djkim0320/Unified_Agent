@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { createBrowserRuntime } from "./browser-runtime.js";
+import type { createComputerUseSessionManager } from "./computer-use/session-manager.js";
 import type { createMemoryManager } from "./memory-manager.js";
 import type { createWorkspaceManager } from "./workspace.js";
 import type { ProviderAdapter } from "../providers/base.js";
@@ -46,6 +47,7 @@ export interface ToolDescriptor {
     isHeartbeatRun?: boolean;
     workspace: ReturnType<typeof createWorkspaceManager>;
     browserRuntime: ReturnType<typeof createBrowserRuntime>;
+    computerUse?: ReturnType<typeof createComputerUseSessionManager>;
     memoryManager: ReturnType<typeof createMemoryManager>;
     adapter: ProviderAdapter<ProviderKind>;
     secret: ProviderSecret<ProviderKind>;
@@ -113,6 +115,9 @@ export function createToolRegistry() {
   const tools = new Map<string, ToolDescriptor>();
 
   function register(descriptor: ToolDescriptor) {
+    if (tools.has(descriptor.name)) {
+      throw new Error(`Tool already registered: ${descriptor.name}`);
+    }
     tools.set(descriptor.name, descriptor);
   }
 
@@ -124,8 +129,15 @@ export function createToolRegistry() {
     return [...tools.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
 
-  function listAllowed(context?: { isSubagent?: boolean; nestingDepth?: number }) {
+  function listAllowed(context?: {
+    isSubagent?: boolean;
+    nestingDepth?: number;
+    computerUseEnabled?: boolean;
+  }) {
     return list().filter((tool) => {
+      if (tool.audit?.category === "computer_use" && !context?.computerUseEnabled) {
+        return false;
+      }
       const policy = tool.rolePolicy;
       if (!policy) {
         return true;
@@ -180,7 +192,11 @@ export function createToolRegistry() {
     });
   }
 
-  function buildPlannerGuide(context?: { isSubagent?: boolean; nestingDepth?: number }) {
+  function buildPlannerGuide(context?: {
+    isSubagent?: boolean;
+    nestingDepth?: number;
+    computerUseEnabled?: boolean;
+  }) {
     return listAllowed(context)
       .map(
         (tool) =>

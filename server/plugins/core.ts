@@ -2,8 +2,10 @@ import { z } from "zod";
 import { searchDuckDuckGo } from "../lib/duckduckgo.js";
 import { runWorkspaceCommand } from "../lib/exec-command.js";
 import { fetchWebPage } from "../lib/web-fetch.js";
+import { ComputerUseActionSchemas } from "../lib/computer-use/actions.js";
 import type { RegisteredPlugin } from "../lib/plugin-manager.js";
 import type { createToolRegistry } from "../lib/tool-registry.js";
+import type { createComputerUseSessionManager } from "../lib/computer-use/session-manager.js";
 import type { WorkspaceScope } from "../types.js";
 
 const ScopeSchema = z.enum(["sandbox", "shared", "root"]).default("sandbox");
@@ -113,6 +115,17 @@ export const corePlugin: RegisteredPlugin = {
       "browser_screenshot",
       "browser_back",
       "browser_close",
+      "computer.browser.createSession",
+      "computer.browser.navigate",
+      "computer.browser.screenshot",
+      "computer.browser.click",
+      "computer.browser.doubleClick",
+      "computer.browser.type",
+      "computer.browser.keypress",
+      "computer.browser.scroll",
+      "computer.browser.wait",
+      "computer.browser.extractText",
+      "computer.browser.closeSession",
       "memory_get",
       "memory_search",
       "memory_write",
@@ -146,7 +159,38 @@ export const corePlugin: RegisteredPlugin = {
   },
 };
 
-export function registerCoreTools(registry: ReturnType<typeof createToolRegistry>) {
+function requireComputerUse(
+  computerUse: ReturnType<typeof createComputerUseSessionManager> | undefined,
+) {
+  if (!computerUse) {
+    throw new Error("Computer Use service is unavailable.");
+  }
+  return computerUse;
+}
+
+function computerToolDefaults(risk: "low" | "medium" | "high") {
+  return {
+    permission: "browser" as const,
+    risk,
+    costHint: "moderate" as const,
+    concurrencyClass: "exclusive" as const,
+    rolePolicy: {
+      allowPrimary: true,
+      allowSubagent: false,
+    },
+    audit: {
+      category: "computer_use",
+      safeByDefault: risk === "low",
+    },
+  };
+}
+
+export function registerCoreTools(
+  registry: ReturnType<typeof createToolRegistry>,
+  options?: {
+    computerUse?: ReturnType<typeof createComputerUseSessionManager>;
+  },
+) {
   registry.register({
     name: "list_tree",
     description: "List files and folders in a workspace scope.",
@@ -623,6 +667,193 @@ export function registerCoreTools(registry: ReturnType<typeof createToolRegistry
     async execute({ runId, browserRuntime }) {
       await browserRuntime.closeSession(runId);
       return { closed: true };
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.createSession",
+    description: "Create an isolated, opt-in Computer Use browser session. The feature must be enabled in settings.",
+    schema: ComputerUseActionSchemas.createSession,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.createSession","arguments":{"allowedDomains":["localhost"]}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, agentId, conversationId, runId, currentTaskId, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return {
+        session: await service.createSession({
+          agentId,
+          conversationId,
+          runId,
+          taskId: currentTaskId ?? null,
+          allowedDomains: Array.isArray(args.allowedDomains) ? (args.allowedDomains as string[]) : [],
+        }),
+      };
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.navigate",
+    description: "Navigate a Computer Use browser session. Localhost is allowed; allowlisted external domains require approval.",
+    schema: ComputerUseActionSchemas.navigate,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.navigate","arguments":{"sessionId":"...","url":"http://127.0.0.1:5173"}}}',
+    ...computerToolDefaults("medium"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.navigate(args.sessionId as string, args.url as string);
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.screenshot",
+    description: "Capture a private PNG screenshot artifact for the current Computer Use browser page.",
+    schema: ComputerUseActionSchemas.screenshot,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.screenshot","arguments":{"sessionId":"...","fullPage":false}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      const result = await service.screenshot(args.sessionId as string, Boolean(args.fullPage));
+      if (result.status === "completed" && result.output && "screenshotBase64" in result.output) {
+        const { screenshotBase64: _screenshotBase64, ...safeOutput } = result.output as Record<string, unknown>;
+        return {
+          ...result,
+          output: safeOutput,
+        };
+      }
+      return result;
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.click",
+    description: "Click an element in a Computer Use session. Destructive or submit-like clicks require approval.",
+    schema: ComputerUseActionSchemas.click,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.click","arguments":{"sessionId":"...","selector":"button"}}}',
+    ...computerToolDefaults("medium"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.click({
+        sessionId: args.sessionId as string,
+        selector: args.selector as string,
+        visibleText: typeof args.visibleText === "string" ? args.visibleText : undefined,
+        maySubmit: Boolean(args.maySubmit),
+        mayChangeState: Boolean(args.mayChangeState),
+        mayDelete: Boolean(args.mayDelete),
+        mayUpload: Boolean(args.mayUpload),
+        mayDownload: Boolean(args.mayDownload),
+        mayPurchase: Boolean(args.mayPurchase),
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.doubleClick",
+    description: "Double-click an element in a Computer Use session.",
+    schema: ComputerUseActionSchemas.doubleClick,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.doubleClick","arguments":{"sessionId":"...","selector":"button"}}}',
+    ...computerToolDefaults("medium"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.click({
+        sessionId: args.sessionId as string,
+        selector: args.selector as string,
+        visibleText: typeof args.visibleText === "string" ? args.visibleText : undefined,
+        double: true,
+        mayChangeState: Boolean(args.mayChangeState),
+        mayDelete: Boolean(args.mayDelete),
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.type",
+    description: "Type into an input in a Computer Use session. Secrets, payment, email, and personal data require approval metadata.",
+    schema: ComputerUseActionSchemas.type,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.type","arguments":{"sessionId":"...","selector":"input[name=q]","text":"query","typedTextKind":"plain"}}}',
+    ...computerToolDefaults("high"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.type({
+        sessionId: args.sessionId as string,
+        selector: args.selector as string,
+        text: args.text as string,
+        typedTextKind: args.typedTextKind as never,
+        submit: Boolean(args.submit),
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.keypress",
+    description: "Press a key in a Computer Use session.",
+    schema: ComputerUseActionSchemas.keypress,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.keypress","arguments":{"sessionId":"...","key":"Enter"}}}',
+    ...computerToolDefaults("medium"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.keypress({
+        sessionId: args.sessionId as string,
+        key: args.key as string,
+        selector: typeof args.selector === "string" ? args.selector : undefined,
+        visibleText: typeof args.visibleText === "string" ? args.visibleText : undefined,
+        maySubmit: Boolean(args.maySubmit),
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.scroll",
+    description: "Scroll the current Computer Use browser page.",
+    schema: ComputerUseActionSchemas.scroll,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.scroll","arguments":{"sessionId":"...","deltaY":700}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.scroll({
+        sessionId: args.sessionId as string,
+        deltaX: args.deltaX as number,
+        deltaY: args.deltaY as number,
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.wait",
+    description: "Wait briefly in a Computer Use browser session.",
+    schema: ComputerUseActionSchemas.wait,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.wait","arguments":{"sessionId":"...","timeoutMs":1000}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.wait({
+        sessionId: args.sessionId as string,
+        timeoutMs: args.timeoutMs as number,
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.extractText",
+    description: "Extract visible text from the current Computer Use page or selector.",
+    schema: ComputerUseActionSchemas.extractText,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.extractText","arguments":{"sessionId":"...","selector":"main"}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return service.extractText({
+        sessionId: args.sessionId as string,
+        selector: typeof args.selector === "string" ? args.selector : undefined,
+      });
+    },
+  });
+
+  registry.register({
+    name: "computer.browser.closeSession",
+    description: "Close an isolated Computer Use browser session and clean up its browser resources.",
+    schema: ComputerUseActionSchemas.closeSession,
+    example: '{"type":"tool_call","tool":{"name":"computer.browser.closeSession","arguments":{"sessionId":"..."}}}',
+    ...computerToolDefaults("low"),
+    async execute({ arguments: args, computerUse }) {
+      const service = requireComputerUse(computerUse ?? options?.computerUse);
+      return { session: await service.closeSession(args.sessionId as string) };
     },
   });
 

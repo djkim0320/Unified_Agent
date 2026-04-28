@@ -83,6 +83,7 @@ describe("WorkspaceView task flows", () => {
       taskId: "task-1",
       stepKey: "research",
       dependencyStepKey: null,
+      position: 0,
       title: "자료 조사",
       prompt: "자료를 조사한다.",
       status: "failed",

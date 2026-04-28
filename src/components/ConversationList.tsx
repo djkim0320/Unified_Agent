@@ -1,10 +1,12 @@
 import { getModelOption } from "../model-catalog";
+import { displayConversationTitle } from "../appStateUtils";
 import { type AgentRecord, type ConversationRecord, providerLabels } from "../types";
 import { CustomSelect } from "./ui/CustomSelect";
 
 export type CockpitNavTarget =
   | "chat"
   | "workflow"
+  | "computer"
   | "mcp"
   | "skills"
   | "files"
@@ -28,9 +30,6 @@ interface ConversationListProps {
 const navItems: Array<{ target: CockpitNavTarget; label: string }> = [
   { target: "chat", label: "채팅" },
   { target: "workflow", label: "워크플로우" },
-  { target: "mcp", label: "MCP 서버" },
-  { target: "skills", label: "스킬" },
-  { target: "files", label: "파일" },
 ];
 
 export function ConversationList(props: ConversationListProps) {
@@ -39,7 +38,7 @@ export function ConversationList(props: ConversationListProps) {
   return (
     <aside className="conversation-shell">
       <nav className="cockpit-nav" aria-label="주요 화면">
-        <div className="cockpit-nav__mark">UA</div>
+        <div className="cockpit-nav__mark">AO</div>
         {navItems.map((item) => (
           <button
             aria-current={props.activeNavTarget === item.target ? "page" : undefined}
@@ -67,10 +66,10 @@ export function ConversationList(props: ConversationListProps) {
 
       <div className="conversation-list">
         <div className="conversation-list__brand">
-          <div className="conversation-list__mark">◇</div>
+          <div className="conversation-list__mark">AO</div>
           <div>
-            <p className="conversation-list__brand-title">통합 에이전트</p>
-            <p className="conversation-list__brand-subtitle">로컬 작업 조종석</p>
+            <p className="conversation-list__brand-title">AetherOps</p>
+            <p className="conversation-list__brand-subtitle">opencode 관제탑</p>
           </div>
         </div>
 
@@ -111,23 +110,24 @@ export function ConversationList(props: ConversationListProps) {
           {props.conversations.map((conversation) => {
             const active = conversation.id === props.activeConversationId;
             const model = getModelOption(conversation.providerKind, conversation.model);
+            const title = displayConversationTitle(conversation.title);
 
             return (
               <div className={`conversation-list__item ${active ? "is-active" : ""}`} key={conversation.id}>
                 <button
                   className="conversation-list__item-main"
                   onClick={() => props.onSelectConversation(conversation.id)}
-                  title={conversation.title}
+                  title={title}
                   type="button"
                 >
-                  <span className="conversation-list__title">{conversation.title}</span>
+                  <span className="conversation-list__title">{title}</span>
                   <span className="conversation-list__meta">
                     {providerLabels[conversation.providerKind]} / {model.label}
                   </span>
                 </button>
 
                 <button
-                  aria-label={`${conversation.title} 삭제`}
+                  aria-label={`${title} 삭제`}
                   className="conversation-list__delete"
                   onClick={() => props.onDeleteConversation(conversation.id)}
                   type="button"

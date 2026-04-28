@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Operational guide for AI agents working inside `Unified_Agent`.
+Operational guide for AI agents working inside `AetherOps`.
 
 ## Purpose
 

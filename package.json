@@ -1,5 +1,5 @@
 {
-  "name": "local-multi-provider-chat",
+  "name": "aetherops",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -7,7 +7,10 @@
     "dev": "concurrently -n web,api -c cyan,magenta \"vite --host 127.0.0.1 --port 5173\" \"tsx watch server/index.ts\"",
     "build": "vite build && tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js",
-    "test": "vitest run --config vitest.config.ts && vitest run --config vitest.server.config.ts"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "vitest run --config vitest.config.ts && vitest run --config vitest.server.config.ts",
+    "test:server": "vitest run --config vitest.server.config.ts",
+    "test:web": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.56.0",
@@ -16,6 +19,7 @@
     "eventsource-parser": "^3.0.1",
     "express": "^5.1.0",
     "openai": "^4.104.0",
+    "opencode-ai": "1.14.28",
     "playwright": "^1.59.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -42,7 +46,8 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "better-sqlite3"
+      "better-sqlite3",
+      "opencode-ai"
     ]
   }
 }

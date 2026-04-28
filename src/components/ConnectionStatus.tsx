@@ -5,30 +5,21 @@ interface ConnectionStatusProps {
   modelCount: number;
   modelsLoading: boolean;
   modelsError: string | null;
+  backendOnline?: boolean | null;
 }
 
 export function ConnectionStatus(props: ConnectionStatusProps) {
-  const statusLabel = props.provider
-    ? props.provider.status === "connected"
-      ? "연결됨"
-      : props.provider.status === "configured"
-        ? "구성됨"
-        : "연결 필요"
-    : "연결 필요";
-
-  const statusClass =
-    props.provider?.status === "connected"
-      ? "is-connected"
-      : props.provider?.status === "configured"
-        ? "is-configured"
-        : "is-disconnected";
-
-  const summaryText = props.modelsLoading
-    ? "모델 목록을 확인하는 중입니다."
-    : `${props.modelCount}개 모델 후보`;
+  const backendOffline = props.backendOnline === false;
+  const statusLabel = backendOffline ? "서버 오프라인" : "정상";
+  const statusClass = backendOffline ? "is-backend-offline" : "is-connected";
+  const summaryText = backendOffline
+    ? "백엔드 서버 응답이 없습니다."
+    : props.modelsLoading
+      ? "모델 목록을 확인하는 중입니다."
+      : `${props.modelCount}개 모델 사용 가능`;
 
   return (
-    <section className={`connection-status ${statusClass}`}>
+    <section className={`connection-status ${statusClass}`} aria-label={statusLabel}>
       <div className="connection-status__badge">
         <span className="connection-status__dot" aria-hidden="true" />
         {statusLabel}

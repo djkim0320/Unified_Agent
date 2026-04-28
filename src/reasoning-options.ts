@@ -37,7 +37,11 @@ export function getReasoningOptions(kind: ProviderKind, model: string): Reasonin
   }
 
   if (kind === "anthropic") {
-    if (model.startsWith("claude-opus-4-6") || model.startsWith("claude-sonnet-4-6")) {
+    if (
+      model.startsWith("claude-opus-4-7") ||
+      model.startsWith("claude-opus-4-6") ||
+      model.startsWith("claude-sonnet-4-6")
+    ) {
       return LOW_TO_XHIGH;
     }
     return LOW_TO_HIGH;

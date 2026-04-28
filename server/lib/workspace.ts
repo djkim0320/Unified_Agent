@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { parseHeartbeatDocument, serializeHeartbeatDocument } from "./heartbeat-config.js";
 import type {
@@ -228,13 +229,15 @@ export function createWorkspaceManager(
 ) {
   const rootDir = path.join(projectRoot, "workspace");
   const sharedDir = path.join(rootDir, "shared");
-  const conversationsDir = path.join(rootDir, "conversations");
-  const agentsDir = path.join(rootDir, "agents");
+  const opencodeDir = path.join(rootDir, "opencode");
+  const conversationsDir = path.join(opencodeDir, "conversations");
+  const agentsDir = path.join(opencodeDir, "agents");
   const enableRootScope = options?.enableRootScope ?? process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true";
 
   function bootstrap() {
     fs.mkdirSync(rootDir, { recursive: true });
     fs.mkdirSync(sharedDir, { recursive: true });
+    fs.mkdirSync(opencodeDir, { recursive: true });
     fs.mkdirSync(conversationsDir, { recursive: true });
     fs.mkdirSync(agentsDir, { recursive: true });
 
@@ -265,9 +268,9 @@ export function createWorkspaceManager(
       [
         "# TOOLS",
         "",
-        "- File tools operate within the workspace boundary.",
-        "- Command execution runs in the current conversation sandbox.",
-        "- Browser research can search, open, and extract pages.",
+        "- AetherOps no longer exposes an internal tool runtime.",
+        "- opencode is the only workspace execution engine.",
+        "- All execution must stay inside the current opencode conversation sandbox.",
       ].join("\n"),
     );
   }
@@ -658,6 +661,61 @@ export function createWorkspaceManager(
     };
   }
 
+  function atomicWriteResolved(
+    resolved: { root: string; absolutePath: string; relativePath: string },
+    content: string | Buffer,
+  ) {
+    const parentDir = path.dirname(resolved.absolutePath);
+    const parentStat = fs.lstatSync(parentDir, { throwIfNoEntry: false });
+    if (!parentStat || !parentStat.isDirectory()) {
+      throw new Error("Workspace parent path is not a directory.");
+    }
+    assertNoLink(parentStat, parentDir);
+    ensureCanonicalInside(resolved.root, parentDir);
+
+    const existingStat = fs.lstatSync(resolved.absolutePath, { throwIfNoEntry: false });
+    if (existingStat) {
+      assertNoLink(existingStat, resolved.absolutePath);
+      if (existingStat.isDirectory()) {
+        throw new Error("Workspace target path is a directory.");
+      }
+    }
+
+    const tempPath = path.join(
+      parentDir,
+      `.${path.basename(resolved.absolutePath)}.${process.pid}.${Date.now()}.${crypto
+        .randomBytes(6)
+        .toString("hex")}.tmp`,
+    );
+
+    try {
+      fs.writeFileSync(tempPath, content, {
+        ...(typeof content === "string" ? { encoding: "utf8" as const } : {}),
+        flag: "wx",
+      });
+      ensureCanonicalInside(resolved.root, tempPath);
+      fs.renameSync(tempPath, resolved.absolutePath);
+
+      const finalStat = fs.lstatSync(resolved.absolutePath, { throwIfNoEntry: false });
+      if (!finalStat || !finalStat.isFile()) {
+        throw new Error("Workspace write did not produce a file.");
+      }
+      assertNoLink(finalStat, resolved.absolutePath);
+      ensureCanonicalInside(resolved.root, resolved.absolutePath);
+    } catch (error) {
+      try {
+        const tempStat = fs.lstatSync(tempPath, { throwIfNoEntry: false });
+        if (tempStat && !isUnsafeLink(tempStat)) {
+          ensureCanonicalInside(resolved.root, tempPath);
+          fs.rmSync(tempPath, { force: true });
+        }
+      } catch {
+        // Cleanup is best effort; the original write error is more useful to callers.
+      }
+      throw error;
+    }
+  }
+
   function writeFile(params: {
     conversationId: string;
     scope: WorkspaceScope;
@@ -675,8 +733,7 @@ export function createWorkspaceManager(
     if (stat) {
       assertNoLink(stat, resolved.absolutePath);
     }
-    fs.writeFileSync(resolved.absolutePath, params.content, "utf8");
-    ensureCanonicalInside(resolved.root, resolved.absolutePath);
+    atomicWriteResolved(resolved, params.content);
     return resolved.relativePath;
   }
 
@@ -697,8 +754,7 @@ export function createWorkspaceManager(
     if (stat) {
       assertNoLink(stat, resolved.absolutePath);
     }
-    fs.writeFileSync(resolved.absolutePath, params.content);
-    ensureCanonicalInside(resolved.root, resolved.absolutePath);
+    atomicWriteResolved(resolved, params.content);
     return resolved.relativePath;
   }
 
@@ -859,6 +915,7 @@ export function createWorkspaceManager(
   return {
     rootDir,
     sharedDir,
+    opencodeDir,
     conversationsDir,
     agentsDir,
     bootstrap,

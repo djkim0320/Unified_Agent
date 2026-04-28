@@ -125,6 +125,7 @@ export function createTaskManager(params: {
     listTaskFlows?: (agentId: string) => TaskFlowRecord[];
     transitionTaskFlow?: (input: {
       flowId: string;
+      title?: string;
       status?: TaskFlowRecord["status"];
       resultSummary?: string | null;
       errorText?: string | null;
@@ -137,6 +138,7 @@ export function createTaskManager(params: {
       flowId: string;
       stepKey: string;
       dependencyStepKey?: string | null;
+      position?: number;
       title: string;
       prompt: string;
     }) => TaskFlowStepRecord;

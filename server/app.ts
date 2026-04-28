@@ -4,15 +4,24 @@ import path from "node:path";
 import { z } from "zod";
 import { createAgentGateway } from "./lib/agent-gateway.js";
 import { resolveCodexIdentity, importCodexCliAuth } from "./lib/codex-auth.js";
-import { createBrowserRuntime } from "./lib/browser-runtime.js";
 import { createChannelRegistry } from "./lib/channel-registry.js";
 import { runCodexLogin, runCodexLoginStatus } from "./lib/codex-cli.js";
 import { createDebugLog, redactOpaqueValue } from "./lib/debug-log.js";
-import { AgentRunError, runAgentTurn } from "./lib/agent-runtime.js";
+import { EngineRunError, isEngineRunError } from "./lib/agent-engine.js";
 import { isAbortError } from "./lib/process-control.js";
 import { createWorkspaceManager } from "./lib/workspace.js";
+import { runOpenCodeOnlyWorkspaceMigration } from "./lib/opencode-only-migration.js";
+import { loadOrCreateLocalApiToken } from "./lib/local-api-token.js";
+import { createLocalApiAuthMiddleware } from "./middleware/local-api-auth.js";
+import { errorHandler, notFound } from "./middleware/error-handler.js";
+import { registerPlatformRoutes } from "./routes/platform.routes.js";
+import { registerWorkspaceRoutes } from "./routes/workspace.routes.js";
 import { createStore, DEFAULT_AGENT_ID, DEFAULT_CONVERSATION_TITLE } from "./db.js";
 import { getCuratedModelIds } from "./model-catalog.js";
+import {
+  buildCapabilitiesByModel,
+  getProviderModelCapabilities,
+} from "./lib/provider-capabilities.js";
 import { getProviderAdapter, providerKinds } from "./provider-registry.js";
 import { normalizeReasoningLevel } from "./reasoning-options.js";
 import {
@@ -29,8 +38,6 @@ import type {
   TaskFlowStepDetail,
   TaskFlowStepRecord,
   TaskRecord,
-  ToolPermission,
-  ToolSummary,
   WorkspaceRunRecord,
 } from "./types.js";
 
@@ -43,7 +50,6 @@ const ProviderKindSchema = z.enum([
 ]);
 
 const ReasoningLevelSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
-const WorkspaceScopeSchema = z.enum(["sandbox", "shared", "root"]);
 
 const ConversationUpsertSchema = z.object({
   conversationId: z.string().uuid().optional(),
@@ -88,30 +94,6 @@ const TaskCreateSchema = z.object({
   autoStart: z.boolean().optional().default(true),
 });
 
-const AgentMemoryWriteSchema = z.object({
-  content: z.string().min(1).max(10_000),
-  target: z.enum(["durable", "daily"]).optional().default("durable"),
-});
-
-const AgentSkillWriteSchema = z.object({
-  name: z.string().min(1).max(80),
-  content: z.string().min(1).max(20_000),
-  scope: z.enum(["agent", "shared"]).optional().default("agent"),
-});
-
-const LocalMcpServerWriteSchema = z.object({
-  label: z.string().min(1).max(80),
-  transport: z.enum(["stdio", "http", "mock"]).optional().default("stdio"),
-  command: z.string().max(500).optional().default(""),
-  description: z.string().max(1000).optional().default(""),
-  enabled: z.boolean().optional().default(false),
-});
-
-const AgentMemorySearchQuerySchema = z.object({
-  query: z.string().min(1),
-  maxResults: z.coerce.number().int().min(1).max(20).optional(),
-});
-
 const SubagentCreateSchema = z.object({
   title: z.string().min(1).max(120).optional(),
   prompt: z.string().min(1).max(20_000),
@@ -134,10 +116,17 @@ const TaskFlowCreateSchema = z
           dependencyStepKey: z.string().min(1).max(80).optional().nullable(),
         }),
       )
-      .min(1)
+      .min(0)
       .max(8),
   })
   .superRefine((flow, context) => {
+    if (flow.autoStart && flow.steps.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["steps"],
+        message: "Empty task flows must be created with autoStart=false.",
+      });
+    }
     const stepKeys = new Set<string>();
     const dependencyByStepKey = new Map<string, string | null | undefined>();
     for (const [index, step] of flow.steps.entries()) {
@@ -177,6 +166,34 @@ const TaskFlowCreateSchema = z
         seen.add(dependency);
         dependency = dependencyByStepKey.get(dependency);
       }
+    }
+  });
+
+const TaskFlowStepsReplaceSchema = z
+  .object({
+    title: z.string().min(1).max(120).optional(),
+    steps: z
+      .array(
+        z.object({
+          stepKey: z.string().min(1).max(80),
+          title: z.string().min(1).max(120),
+          prompt: z.string().min(1).max(20_000),
+        }),
+      )
+      .min(0)
+      .max(8),
+  })
+  .superRefine((body, context) => {
+    const stepKeys = new Set<string>();
+    for (const [index, step] of body.steps.entries()) {
+      if (stepKeys.has(step.stepKey)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["steps", index, "stepKey"],
+          message: "Step keys must be unique.",
+        });
+      }
+      stepKeys.add(step.stepKey);
     }
   });
 
@@ -220,30 +237,6 @@ function toSafeLocalName(value: string, fallback: string) {
   return normalized || fallback;
 }
 
-function resolveUniqueMarkdownPath(directory: string, baseName: string) {
-  fs.mkdirSync(directory, { recursive: true });
-  const safeBaseName = toSafeLocalName(baseName, "skill");
-  let candidate = path.join(directory, `${safeBaseName}.md`);
-  let index = 2;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(directory, `${safeBaseName}-${index}.md`);
-    index += 1;
-  }
-  return candidate;
-}
-
-function resolveUniqueDirectoryPath(directory: string, baseName: string) {
-  fs.mkdirSync(directory, { recursive: true });
-  const safeBaseName = toSafeLocalName(baseName, "mcp-server").toLowerCase();
-  let candidate = path.join(directory, safeBaseName);
-  let index = 2;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(directory, `${safeBaseName}-${index}`);
-    index += 1;
-  }
-  return candidate;
-}
-
 const ApiProviderAccountSchema = z.object({
   apiKey: z.string().min(1).optional(),
   baseUrl: z.string().url().optional(),
@@ -257,33 +250,10 @@ const ChatRequestSchema = z.object({
   message: z.string().min(1),
 });
 
-const WorkspaceTreeQuerySchema = z.object({
-  conversationId: z.string().uuid(),
-  scope: WorkspaceScopeSchema.optional().default("sandbox"),
-  path: z.string().optional(),
-  maxDepth: z.coerce.number().int().min(0).max(8).optional(),
-});
-
-const WorkspaceFileQuerySchema = z.object({
-  conversationId: z.string().uuid(),
-  scope: WorkspaceScopeSchema.optional().default("sandbox"),
-  path: z.string().min(1),
-});
-
-const WorkspaceWriteScopeSchema = z.enum(["sandbox", "shared"]);
-
-const WorkspaceFileWriteSchema = z.object({
-  conversationId: z.string().uuid(),
-  scope: WorkspaceWriteScopeSchema.optional().default("sandbox"),
-  path: z.string().min(1).max(300),
-  content: z.string().max(200_000).optional().default(""),
-  overwrite: z.boolean().optional().default(false),
-});
-
-const WorkspaceDirectoryWriteSchema = z.object({
-  conversationId: z.string().uuid(),
-  scope: WorkspaceWriteScopeSchema.optional().default("sandbox"),
-  path: z.string().min(1).max(300),
+const OpenCodeAuthLoginSchema = z.object({
+  provider: z.string().min(1).max(80).optional().default("openai"),
+  method: z.string().min(1).max(80).optional().nullable(),
+  launch: z.boolean().optional().default(true),
 });
 
 function formatProviderSummary(params: {
@@ -305,40 +275,7 @@ function formatProviderSummary(params: {
     email: params.email ?? null,
     accountId: params.accountId ?? null,
     metadata: params.metadata ?? {},
-  };
-}
-
-function formatToolSummary(tool: {
-  name: string;
-  description: string;
-  permission: ToolPermission;
-  risk?: "low" | "medium" | "high";
-  costHint?: "cheap" | "moderate" | "expensive";
-  concurrencyClass?: "serial" | "parallel-safe" | "exclusive";
-  batchable?: boolean;
-  rolePolicy?: {
-    allowPrimary?: boolean;
-    allowSubagent?: boolean;
-    maxNestingDepth?: number | null;
-  };
-  audit?: {
-    category?: string;
-    safeByDefault?: boolean;
-  };
-}): ToolSummary {
-  return {
-    name: tool.name,
-    description: tool.description,
-    permission: tool.permission,
-    risk: tool.risk,
-    costHint: tool.costHint,
-    concurrencyClass: tool.concurrencyClass,
-    batchable: tool.batchable,
-    rolePolicy: tool.rolePolicy,
-    audit: {
-      category: tool.audit?.category ?? "unknown",
-      safeByDefault: tool.audit?.safeByDefault ?? true,
-    },
+    capabilities: getProviderModelCapabilities(params.kind, getProviderAdapter(params.kind).defaultModel),
   };
 }
 
@@ -407,6 +344,10 @@ export function createApp(options?: {
   const dataDir = options?.dataDir ?? path.join(projectRoot, ".data");
   const port = options?.port ?? 8787;
   const fetchImpl = options?.fetchImpl ?? fetch;
+  const localApiToken = loadOrCreateLocalApiToken(dataDir);
+  const opencodeOnlyMigration = runOpenCodeOnlyWorkspaceMigration({ projectRoot, dataDir });
+  app.locals.localApiToken = localApiToken;
+  app.locals.opencodeOnlyMigration = opencodeOnlyMigration;
   const exposeWorkspaceDebugPaths = process.env.ENABLE_WORKSPACE_DEBUG_PATHS === "true";
   const channelRegistry = createChannelRegistry();
   const store = createStore(dataDir);
@@ -415,14 +356,9 @@ export function createApp(options?: {
     conversationAgentId: (conversationId) => store.getConversation(conversationId)?.agentId ?? null,
     enableRootScope: process.env.ENABLE_WORKSPACE_ROOT_SCOPE === "true",
   });
-  const browserRuntime = createBrowserRuntime();
-  for (const agent of store.listAgents()) {
-    workspace.createAgentWorkspace(agent.id);
-  }
   const gateway = createAgentGateway({
     projectRoot,
     workspace,
-    browserRuntime,
     store,
     resolveSecret: getSecret,
   });
@@ -440,6 +376,55 @@ export function createApp(options?: {
   >();
 
   app.use(express.json({ limit: "2mb" }));
+  app.use(
+    createLocalApiAuthMiddleware({
+      token: localApiToken,
+      allowedPorts: [port, 5173],
+    }),
+  );
+
+  registerPlatformRoutes(app, { localApiToken, gateway, channelRegistry });
+  app.get("/api/engine/status", async (_request, response) => {
+    response.json(await gateway.agentEngine.getStatus());
+  });
+  app.post("/api/engine/opencode/refresh-models", async (_request, response) => {
+    const result = await gateway.agentEngine.refreshModels();
+    response.status(result.ok ? 200 : 400).json(result);
+  });
+  app.post("/api/engine/opencode/auth/login", async (request, response) => {
+    const body = OpenCodeAuthLoginSchema.parse(request.body ?? {});
+    const result = await gateway.agentEngine.startAuthLogin(body);
+    response.status(result.ok ? 200 : 400).json(result);
+  });
+  app.get("/api/engine/runs/:runId", async (request, response) => {
+    const engineRun = await gateway.agentEngine.getRunSummary(request.params.runId);
+    if (!engineRun) {
+      response.status(404).json({ error: "Engine run not found." });
+      return;
+    }
+    response.json({ engineRun });
+  });
+  app.get(["/health", "/api/health"], (_request, response) => {
+    response.json({
+      ok: true,
+      service: "aetherops",
+      timestamp: new Date().toISOString(),
+    });
+  });
+  registerWorkspaceRoutes(app, {
+    store,
+    workspace,
+    taskManager: gateway.taskManager,
+    exposeWorkspaceDebugPaths,
+  });
+
+  app.use("/api/computer-use", (_request, response) => {
+    response.status(410).json({
+      error:
+        "Custom Computer Use routes were removed from AetherOps opencode-only mode. Use opencode-supported browser/computer integrations instead.",
+      engineKind: "opencode",
+    });
+  });
 
   function requireConversation(
     response: express.Response,
@@ -496,13 +481,6 @@ export function createApp(options?: {
     return step;
   }
 
-  function workspaceErrorStatus(error: unknown) {
-    if (error instanceof Error && /conversation not found/i.test(error.message)) {
-      return 404;
-    }
-    return 400;
-  }
-
   function getProviderSummary(kind: ProviderKind): ProviderSummary {
     const adapter = getProviderAdapter(kind);
     const account = store.getProviderAccount(kind);
@@ -518,60 +496,6 @@ export function createApp(options?: {
       metadata: account?.metadata ?? {},
     });
   }
-
-  app.get("/api/plugins", (_request, response) => {
-    response.json({
-      plugins: gateway.pluginManager.listPluginSummaries(),
-    });
-  });
-
-  app.post("/api/mcp/servers", (request, response) => {
-    const body = LocalMcpServerWriteSchema.parse(request.body);
-    const serverDirectory = resolveUniqueDirectoryPath(gateway.pluginManager.sharedPluginDir, `mcp-${body.label}`);
-    const pluginId = path.basename(serverDirectory);
-    fs.mkdirSync(serverDirectory, { recursive: true });
-    const manifest = {
-      id: pluginId,
-      name: body.label,
-      version: "0.1.0",
-      description:
-        body.description ||
-        `Metadata-only MCP bridge profile (${body.transport}). Tools are not executable until a real bridge adapter is attached.`,
-      tools: [],
-      skills: [
-        {
-          name: `${body.label} MCP profile`,
-          content: [
-            `# ${body.label} MCP bridge profile`,
-            "",
-            `- Transport: ${body.transport}`,
-            `- Enabled: ${body.enabled ? "yes" : "no"}`,
-            body.command ? `- Launch command: ${body.command}` : "- Launch command: not configured",
-            "",
-            "This profile is metadata-only for the local cockpit. It does not execute external MCP tools yet.",
-            "Attach a real MCP bridge adapter before relying on this profile for tool execution.",
-          ].join("\n"),
-        },
-      ],
-    };
-    fs.writeFileSync(path.join(serverDirectory, "plugin.json"), JSON.stringify(manifest, null, 2), "utf8");
-    response.status(201).json({
-      plugin: manifest,
-      plugins: gateway.pluginManager.listPluginSummaries(),
-    });
-  });
-
-  app.get("/api/tools", (_request, response) => {
-    response.json({
-      tools: gateway.toolRegistry.list().map(formatToolSummary),
-    });
-  });
-
-  app.get("/api/channels", (_request, response) => {
-    response.json({
-      channels: channelRegistry.listChannels(),
-    });
-  });
 
   app.get("/api/agents", (_request, response) => {
     response.json({
@@ -603,9 +527,6 @@ export function createApp(options?: {
       response.status(400).json({ error: "The default agent cannot be deleted." });
       return;
     }
-    for (const conversation of store.listConversations(agent.id)) {
-      await browserRuntime.closeConversationSessions(conversation.id).catch(() => undefined);
-    }
     const deleted = store.deleteAgent(agent.id);
     if (!deleted) {
       response.status(404).json({ error: "Agent not found" });
@@ -614,86 +535,36 @@ export function createApp(options?: {
     try {
       workspace.deleteAgentWorkspace(agent.id);
     } catch {
-      // Agent workspace cleanup is best-effort and anchored to workspace/agents/<agentId>.
+      // Agent workspace cleanup is best-effort and anchored to workspace/opencode/agents/<agentId>.
     }
     response.json({ ok: true });
   });
 
-  app.get("/api/agents/:agentId/memory", (request, response) => {
-    const agent = requireAgent(response, request.params.agentId);
-    if (!agent) {
-      return;
-    }
-    response.json({
-      memory: gateway.memoryManager.getSnapshot(agent.id),
+  function gone(response: express.Response, message: string) {
+    response.status(410).json({
+      error: message,
+      engineKind: "opencode",
     });
+  }
+
+  app.get("/api/agents/:agentId/memory", (_request, response) => {
+    gone(response, "AetherOps internal memory files were removed in opencode-only mode.");
   });
 
-  app.get("/api/agents/:agentId/skills", (request, response) => {
-    const agent = requireAgent(response, request.params.agentId);
-    if (!agent) {
-      return;
-    }
-    response.json({
-      agentId: agent.id,
-      skills: gateway.pluginManager.listSkillSummaries(agent),
-    });
+  app.post("/api/agents/:agentId/memory", (_request, response) => {
+    gone(response, "AetherOps internal memory files were removed in opencode-only mode.");
   });
 
-  app.post("/api/agents/:agentId/skills", (request, response) => {
-    const agent = requireAgent(response, request.params.agentId);
-    if (!agent) {
-      return;
-    }
-    const body = AgentSkillWriteSchema.parse(request.body);
-    const skillDirectory =
-      body.scope === "shared"
-        ? gateway.pluginManager.sharedSkillDir
-        : path.join(projectRoot, "workspace", "agents", agent.id, "skills");
-    const skillPath = resolveUniqueMarkdownPath(skillDirectory, body.name);
-    const content = body.content.trimStart().startsWith("#")
-      ? body.content
-      : `# ${body.name}\n\n${body.content}`;
-    fs.writeFileSync(skillPath, content, "utf8");
-    response.status(201).json({
-      skill: {
-        name: path.basename(skillPath, ".md"),
-        source: body.scope,
-        path:
-          body.scope === "shared"
-            ? `workspace/shared/skills/${path.basename(skillPath)}`
-            : `workspace/agents/${agent.id}/skills/${path.basename(skillPath)}`,
-      },
-      agentId: agent.id,
-      skills: gateway.pluginManager.listSkillSummaries(agent),
-    });
+  app.get("/api/agents/:agentId/memory/search", (_request, response) => {
+    gone(response, "AetherOps internal memory search was removed in opencode-only mode.");
   });
 
-  app.post("/api/agents/:agentId/memory", (request, response) => {
-    const agent = requireAgent(response, request.params.agentId);
-    if (!agent) {
-      return;
-    }
-    const body = AgentMemoryWriteSchema.parse(request.body);
-    gateway.memoryManager.write({
-      agentId: agent.id,
-      content: body.content,
-      target: body.target,
-    });
-    response.json({
-      memory: gateway.memoryManager.getSnapshot(agent.id),
-    });
+  app.get("/api/agents/:agentId/skills", (_request, response) => {
+    gone(response, "AetherOps skill/plugin execution was removed; attach tools through opencode instead.");
   });
 
-  app.get("/api/agents/:agentId/memory/search", (request, response) => {
-    const agent = requireAgent(response, request.params.agentId);
-    if (!agent) {
-      return;
-    }
-    const query = AgentMemorySearchQuerySchema.parse(request.query);
-    response.json({
-      results: gateway.memoryManager.search(agent.id, query.query, query.maxResults),
-    });
+  app.post("/api/agents/:agentId/skills", (_request, response) => {
+    gone(response, "AetherOps skill/plugin execution was removed; attach tools through opencode instead.");
   });
 
   app.get("/api/agents/:agentId/soul", (request, response) => {
@@ -876,6 +747,69 @@ export function createApp(options?: {
     response.json(buildTaskFlowResponse(flow));
   });
 
+  app.put("/api/flows/:flowId/steps", (request, response) => {
+    const flow = requireTaskFlow(response, request.params.flowId);
+    if (!flow) {
+      return;
+    }
+    if (flow.status !== "queued") {
+      response.status(409).json({ error: "Only queued task flows can be edited." });
+      return;
+    }
+    const existingSteps = store.listTaskFlowSteps?.(flow.id) ?? [];
+    if (existingSteps.some((step) => step.taskId)) {
+      response.status(409).json({ error: "Task flow steps with task audit records cannot be edited." });
+      return;
+    }
+    const parsedBody = TaskFlowStepsReplaceSchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      response.status(400).json({
+        error: "Invalid task flow steps request.",
+        details: parsedBody.error.flatten(),
+      });
+      return;
+    }
+    if (!store.replaceTaskFlowSteps) {
+      response.status(500).json({ error: "Task flow step editing is unavailable." });
+      return;
+    }
+
+    store.replaceTaskFlowSteps(
+      flow.id,
+      parsedBody.data.steps.map((step, index, steps) => ({
+        stepKey: step.stepKey,
+        title: step.title,
+        prompt: step.prompt,
+        dependencyStepKey: index > 0 ? steps[index - 1].stepKey : null,
+        position: index,
+      })),
+      parsedBody.data.title,
+    );
+    const updatedFlow = store.getTaskFlow?.(flow.id) ?? flow;
+    response.json(buildTaskFlowResponse(updatedFlow));
+  });
+
+  app.delete("/api/flows/:flowId", (request, response) => {
+    const flow = requireTaskFlow(response, request.params.flowId);
+    if (!flow) {
+      return;
+    }
+    if (flow.status === "running") {
+      response.status(409).json({ error: "Running task flows cannot be deleted." });
+      return;
+    }
+    if (!store.deleteTaskFlow) {
+      response.status(500).json({ error: "Task flow deletion is unavailable." });
+      return;
+    }
+    const deleted = store.deleteTaskFlow(flow.id);
+    if (!deleted) {
+      response.status(404).json({ error: "Task flow not found" });
+      return;
+    }
+    response.json({ ok: true, flowId: flow.id });
+  });
+
   app.post("/api/flows/:flowId/cancel", (request, response) => {
     const flow = requireTaskFlow(response, request.params.flowId);
     if (!flow) {
@@ -896,6 +830,10 @@ export function createApp(options?: {
   app.post("/api/flows/:flowId/start", (request, response) => {
     const flow = requireTaskFlow(response, request.params.flowId);
     if (!flow) {
+      return;
+    }
+    if ((store.listTaskFlowSteps?.(flow.id) ?? []).length === 0) {
+      response.status(409).json({ error: "Task flow requires at least one step before it can start." });
       return;
     }
     void gateway.taskManager
@@ -1147,7 +1085,10 @@ export function createApp(options?: {
       }
 
       const models = getCuratedModelIds(kind, liveModels);
-      response.json({ models });
+      response.json({
+        models,
+        capabilitiesByModel: buildCapabilitiesByModel(kind, models),
+      });
     } catch (error) {
       response.status(400).json({
         error: error instanceof Error ? error.message : "Failed to load models",
@@ -1481,7 +1422,6 @@ export function createApp(options?: {
       response.status(404).json({ error: "Conversation not found" });
       return;
     }
-    await browserRuntime.closeConversationSessions(conversation.id).catch(() => undefined);
     try {
       workspace.deleteConversationWorkspace(conversation.id);
     } catch {
@@ -1583,271 +1523,10 @@ export function createApp(options?: {
       });
   });
 
-  app.get("/api/workspace/tree", (request, response) => {
-    try {
-      const query = WorkspaceTreeQuerySchema.parse(request.query);
-      if (!requireConversation(response, query.conversationId)) {
-        return;
-      }
-      const tree = workspace.listTree({
-        conversationId: query.conversationId,
-        scope: query.scope,
-        relativePath: query.path,
-        maxDepth: query.maxDepth,
-      });
-      const resolved =
-        exposeWorkspaceDebugPaths
-          ? workspace.resolvePath({
-              conversationId: query.conversationId,
-              scope: query.scope,
-              relativePath: query.path ?? ".",
-              mode: "read",
-            })
-          : null;
-      response.json({
-        scope: query.scope,
-        path: query.path ?? ".",
-        tree,
-        ...(resolved
-          ? {
-              debug: {
-                workspaceRoot: resolved.root,
-                absolutePath: resolved.absolutePath,
-              },
-            }
-          : {}),
-      });
-    } catch (error) {
-      response.status(workspaceErrorStatus(error)).json({
-        error: error instanceof Error ? error.message : "Failed to read workspace tree",
-      });
-    }
-  });
-
-  app.get("/api/workspace/file", (request, response) => {
-    try {
-      const query = WorkspaceFileQuerySchema.parse(request.query);
-      if (!requireConversation(response, query.conversationId)) {
-        return;
-      }
-      const file = workspace.readFile({
-        conversationId: query.conversationId,
-        scope: query.scope,
-        relativePath: query.path,
-      });
-      const resolved =
-        exposeWorkspaceDebugPaths
-          ? workspace.resolvePath({
-              conversationId: query.conversationId,
-              scope: query.scope,
-              relativePath: query.path,
-              mode: "read",
-            })
-          : null;
-      response.json({
-        file: {
-          ...file,
-          ...(resolved ? { absolutePath: resolved.absolutePath } : {}),
-        },
-      });
-    } catch (error) {
-      response.status(workspaceErrorStatus(error)).json({
-        error: error instanceof Error ? error.message : "Failed to read workspace file",
-      });
-    }
-  });
-
-  app.post("/api/workspace/file", (request, response) => {
-    try {
-      const body = WorkspaceFileWriteSchema.parse(request.body);
-      if (!requireConversation(response, body.conversationId)) {
-        return;
-      }
-
-      if (!body.overwrite) {
-        try {
-          workspace.readFile({
-            conversationId: body.conversationId,
-            scope: body.scope,
-            relativePath: body.path,
-          });
-          response.status(409).json({
-            error: "Workspace file already exists. Use overwrite=true to replace it.",
-          });
-          return;
-        } catch (error) {
-          if (!(error instanceof Error) || !/not found/i.test(error.message)) {
-            throw error;
-          }
-        }
-      }
-
-      const relativePath = workspace.writeFile({
-        conversationId: body.conversationId,
-        scope: body.scope,
-        relativePath: body.path,
-        content: body.content,
-      });
-      response.status(201).json({
-        file: workspace.readFile({
-          conversationId: body.conversationId,
-          scope: body.scope,
-          relativePath,
-        }),
-      });
-    } catch (error) {
-      response.status(workspaceErrorStatus(error)).json({
-        error: error instanceof Error ? error.message : "Failed to write workspace file",
-      });
-    }
-  });
-
-  app.post("/api/workspace/folder", (request, response) => {
-    try {
-      const body = WorkspaceDirectoryWriteSchema.parse(request.body);
-      if (!requireConversation(response, body.conversationId)) {
-        return;
-      }
-      const relativePath = workspace.makeDir({
-        conversationId: body.conversationId,
-        scope: body.scope,
-        relativePath: body.path,
-      });
-      response.status(201).json({
-        folder: {
-          scope: body.scope,
-          path: relativePath,
-        },
-      });
-    } catch (error) {
-      response.status(workspaceErrorStatus(error)).json({
-        error: error instanceof Error ? error.message : "Failed to create workspace folder",
-      });
-    }
-  });
-
-  app.get("/api/workspace/runs", (request, response) => {
-    const conversationId = z.string().uuid().parse(request.query.conversationId);
-    if (!requireConversation(response, conversationId)) {
-      return;
-    }
-    response.json({
-      runs: store.listWorkspaceRuns(conversationId),
-    });
-  });
-
-  app.get("/api/workspace/runs/:runId/events", (request, response) => {
-    const conversationId = z.string().uuid().parse(request.query.conversationId);
-    if (!requireConversation(response, conversationId)) {
-      return;
-    }
-    if (!store.getWorkspaceRunForConversation(conversationId, request.params.runId)) {
-      response.status(404).json({ error: "Workspace run not found" });
-      return;
-    }
-    response.json({
-      events: store.listWorkspaceRunEvents(conversationId, request.params.runId),
-    });
-  });
-
-  app.get("/api/runs/:runId", (request, response) => {
-    const conversationId =
-      typeof request.query.conversationId === "string" ? request.query.conversationId : null;
-    const run =
-      conversationId
-        ? store.getWorkspaceRunForConversation(conversationId, request.params.runId)
-        : store.getWorkspaceRun(request.params.runId);
-    if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
-      return;
-    }
-    response.json({ run });
-  });
-
-  app.post("/api/runs/:runId/cancel", (request, response) => {
-    const run = store.getWorkspaceRun(request.params.runId);
-    if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
-      return;
-    }
-    if (!run.taskId) {
-      response.status(409).json({ error: "Only task-backed runs can be cancelled from the control API." });
-      return;
-    }
-    void gateway.taskManager
-      .cancelTask(run.taskId)
-      .then((task) => {
-        response.json({ run, task });
-      })
-      .catch((error) => {
-        response.status(400).json({
-          error: error instanceof Error ? error.message : "Failed to cancel run.",
-        });
-      });
-  });
-
-  app.post("/api/runs/:runId/resume", (request, response) => {
-    const run = store.getWorkspaceRun(request.params.runId);
-    if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
-      return;
-    }
-    if (run.status === "running") {
-      response.status(409).json({ error: "Run is still active." });
-      return;
-    }
-    const conversation = store.getConversation(run.conversationId);
-    if (!conversation) {
-      response.status(404).json({ error: "Session not found for run." });
-      return;
-    }
-    const prompt = run.checkpoint
-      ? [
-          "Resume the previous run from its last checkpoint.",
-          `Original request: ${run.userMessage}`,
-          `Previous run id: ${run.id}`,
-          `Previous step index: ${run.checkpoint.stepIndex} / ${run.checkpoint.maxSteps}`,
-          run.checkpoint.lastToolName ? `Last tool: ${run.checkpoint.lastToolName}` : "",
-          "Previous tool history:",
-          ...(run.checkpoint.toolHistory.map((entry) => `- ${entry.tool}: ${entry.result}`) ?? []),
-        ]
-          .filter(Boolean)
-          .join("\n")
-      : run.userMessage;
-    void gateway.taskManager
-      .enqueueDetachedTask({
-        agentId: conversation.agentId,
-        conversationId: conversation.id,
-        title: `${conversation.title} (resume)`,
-        prompt,
-        providerKind: conversation.providerKind,
-        model: conversation.model,
-        reasoningLevel: conversation.reasoningLevel,
-        taskKind: "continuation",
-        originRunId: run.id,
-        startImmediately: true,
-      })
-      .then((task) => {
-        response.json({ run, task });
-      })
-      .catch((error) => {
-        response.status(400).json({
-          error: error instanceof Error ? error.message : "Failed to resume run.",
-        });
-      });
-  });
-
   app.post("/api/chat/stream", async (request, response) => {
     const body = ChatRequestSchema.parse(request.body);
     const conversation = requireConversation(response, body.conversationId);
     if (!conversation) {
-      return;
-    }
-
-    const adapter = getProviderAdapter(body.providerKind);
-    const secret = await getSecret(body.providerKind);
-    if (!secret) {
-      response.status(400).json({ error: `${adapter.label} must be configured first.` });
       return;
     }
 
@@ -1895,10 +1574,10 @@ export function createApp(options?: {
     let streamFinished = false;
     const closeHandler = () => {
       if (!streamFinished) {
-        abortController.abort(new AgentRunError("Client disconnected.", "cancelled"));
+        abortController.abort(new EngineRunError("Client disconnected.", "cancelled"));
       }
     };
-    request.on("close", closeHandler);
+    request.on("aborted", closeHandler);
     response.on("close", closeHandler);
 
     const sendEvent = (eventName: string, payload: Record<string, unknown>) => {
@@ -1910,31 +1589,15 @@ export function createApp(options?: {
     };
 
     try {
-      const runtimeResult = await runAgentTurn({
-        agent: store.getAgent(conversation.agentId) ?? undefined,
-        adapter: adapter as never,
-        secret: secret as never,
+      const runtimeResult = await gateway.runForegroundTurn({
         providerKind: body.providerKind,
         model: body.model,
         reasoningLevel: normalizedReasoningLevel,
         conversationId: conversation.id,
-        agentId: conversation.agentId,
         userMessage: body.message,
-        messages: store.listMessages(conversation.id).map((message) => ({
-          role: message.role,
-          content: message.content,
-        })),
-        workspace,
-        browserRuntime,
-        memoryManager: gateway.memoryManager,
-        pluginManager: gateway.pluginManager,
-        toolRegistry: gateway.toolRegistry,
-        taskManager: gateway.taskManager,
-        store,
         sendEvent,
         signal: abortController.signal,
         unsafeShellEnabled: process.env.ENABLE_UNSAFE_WORKSPACE_EXEC === "true",
-        conversationTitle: conversation.title,
       });
 
       if (abortController.signal.aborted) {
@@ -1961,25 +1624,28 @@ export function createApp(options?: {
       }
     } catch (error) {
       const status =
-        error instanceof AgentRunError
+        isEngineRunError(error)
           ? error.status
           : isAbortError(error)
             ? "cancelled"
             : "failed";
       sendEvent("error", {
         error: error instanceof Error ? error.message : "Streaming failed",
-        runId: error instanceof AgentRunError ? error.runId : undefined,
+        runId: isEngineRunError(error) ? error.runId : undefined,
         status,
       });
     } finally {
       streamFinished = true;
-      request.off("close", closeHandler);
+      request.off("aborted", closeHandler);
       response.off("close", closeHandler);
       if (!response.destroyed && !response.writableEnded) {
         response.end();
       }
     }
   });
+
+  app.use("/api", notFound);
+  app.use(errorHandler);
 
   const clientDir = path.join(process.cwd(), "dist", "client");
   if (fs.existsSync(clientDir)) {
@@ -1993,7 +1659,6 @@ export function createApp(options?: {
     app,
     store,
     workspace,
-    browserRuntime,
     gateway,
   };
 }

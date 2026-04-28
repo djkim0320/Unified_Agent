@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createStore } from "./db.js";
 
@@ -26,6 +27,145 @@ describe("workspace run persistence consistency", () => {
       reasoningLevel: "medium",
     });
   }
+
+  it("records schema migrations and configures SQLite pragmas", () => {
+    const migrations = store.rawDb
+      .prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC")
+      .all() as Array<{ version: number; name: string }>;
+
+    expect(migrations.map((migration) => migration.version)).toEqual(
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    );
+    expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
+    expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
+  });
+
+  it("upgrades an existing partial conversation schema without deleting data", () => {
+    store.rawDb.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    const db = new Database(path.join(dataDir, "chat.sqlite"));
+    const now = Date.now();
+    db.exec(`
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        provider_kind TEXT NOT NULL,
+        model TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO conversations (id, title, provider_kind, model, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run("legacy-conversation", "legacy", "openai", "gpt-5.4", now, now);
+    db.close();
+
+    store = createStore(dataDir);
+    expect(store.getConversation("legacy-conversation")).toEqual(
+      expect.objectContaining({
+        id: "legacy-conversation",
+        agentId: "default-agent",
+        reasoningLevel: "medium",
+      }),
+    );
+    expect(
+      store.rawDb
+        .prepare("SELECT COUNT(*) as count FROM schema_migrations")
+        .get() as { count: number },
+    ).toEqual(expect.objectContaining({ count: expect.any(Number) }));
+  });
+
+  it("backfills task flow step positions in legacy created-at order", () => {
+    store.rawDb.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    const db = new Database(path.join(dataDir, "chat.sqlite"));
+    const now = Date.now();
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        default_provider_kind TEXT NOT NULL,
+        default_model TEXT NOT NULL,
+        default_reasoning_level TEXT NOT NULL DEFAULT 'medium',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        channel_kind TEXT NOT NULL DEFAULT 'webchat',
+        session_kind TEXT NOT NULL DEFAULT 'primary',
+        parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+        owner_run_id TEXT,
+        title TEXT NOT NULL,
+        provider_kind TEXT NOT NULL,
+        model TEXT NOT NULL,
+        reasoning_level TEXT NOT NULL DEFAULT 'medium',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE task_flows (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        origin_run_id TEXT,
+        trigger_source TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_summary TEXT,
+        error_text TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+      CREATE TABLE task_flow_steps (
+        id TEXT PRIMARY KEY,
+        flow_id TEXT NOT NULL REFERENCES task_flows(id) ON DELETE CASCADE,
+        task_id TEXT,
+        step_key TEXT NOT NULL,
+        dependency_step_key TEXT,
+        title TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+    `);
+    db.prepare(
+      `INSERT INTO agents (id, name, description, default_provider_kind, default_model, default_reasoning_level, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("default-agent", "Default", null, "openai", "gpt-5.4", "medium", now, now);
+    db.prepare(
+      `INSERT INTO conversations (id, agent_id, title, provider_kind, model, reasoning_level, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("conversation-1", "default-agent", "Legacy flow", "openai", "gpt-5.4", "medium", now, now);
+    db.prepare(
+      `INSERT INTO task_flows (id, agent_id, conversation_id, origin_run_id, trigger_source, title, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run("flow-1", "default-agent", "conversation-1", null, "manual", "Legacy", "queued", now, now);
+    const insertStep = db.prepare(
+      `INSERT INTO task_flow_steps (id, flow_id, task_id, step_key, dependency_step_key, title, prompt, status, created_at, updated_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insertStep.run("step-late", "flow-1", null, "late", null, "Late", "Late.", "queued", now + 30, now + 30, null);
+    insertStep.run("step-early", "flow-1", null, "early", null, "Early", "Early.", "queued", now + 10, now + 10, null);
+    insertStep.run("step-middle", "flow-1", null, "middle", null, "Middle", "Middle.", "queued", now + 20, now + 20, null);
+    db.close();
+
+    store = createStore(dataDir);
+    expect(store.listTaskFlowSteps("flow-1").map((step) => [step.stepKey, step.position])).toEqual([
+      ["early", 0],
+      ["middle", 1],
+      ["late", 2],
+    ]);
+  });
 
   it("does not return run events for the wrong conversation", () => {
     const first = createConversation("first");
@@ -336,6 +476,7 @@ describe("workspace run persistence consistency", () => {
     const firstStep = store.createTaskFlowStep({
       flowId: flow.id,
       stepKey: "inspect",
+      position: 0,
       title: "Inspect repo",
       prompt: "Inspect the repo.",
     });
@@ -343,9 +484,25 @@ describe("workspace run persistence consistency", () => {
       flowId: flow.id,
       stepKey: "implement",
       dependencyStepKey: "inspect",
+      position: 1,
       title: "Implement fix",
       prompt: "Implement the fix.",
     });
+    const emptyDraftFlow = store.createTaskFlow({
+      agentId: agent.id,
+      conversationId: parentConversation.id,
+      title: "Empty draft",
+      triggerSource: "manual",
+    });
+    expect(store.listTaskFlowSteps(emptyDraftFlow.id)).toEqual([]);
+    expect(store.replaceTaskFlowSteps(emptyDraftFlow.id, [], "Renamed empty draft")).toEqual([]);
+    expect(store.getTaskFlow(emptyDraftFlow.id)).toEqual(
+      expect.objectContaining({
+        id: emptyDraftFlow.id,
+        title: "Renamed empty draft",
+        status: "queued",
+      }),
+    );
     const flowTask = store.createTask({
       agentId: agent.id,
       conversationId: parentConversation.id,
@@ -396,10 +553,12 @@ describe("workspace run persistence consistency", () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: firstStep.id,
+          position: 0,
           status: "completed",
         }),
         expect.objectContaining({
           id: secondStep.id,
+          position: 1,
           status: "queued",
         }),
       ]),

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createWorkspaceManager } from "./workspace.js";
 
 function createTempProjectRoot() {
@@ -277,6 +277,65 @@ describe("workspace sandbox hardening", () => {
     expect(file.content).toBe(content);
     expect(file.binary).toBe(false);
     expect(file.unsupportedEncoding).toBe(false);
+  });
+
+  it("writes nested files atomically and overwrites existing files", () => {
+    const { workspace, addConversation } = createTestWorkspace();
+    const conversationId = "conv-atomic-write";
+    const sandboxDir = addConversation(conversationId);
+
+    workspace.writeFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "nested/notes.txt",
+      content: "first",
+    });
+    workspace.writeFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "nested/notes.txt",
+      content: "second",
+    });
+
+    expect(fs.readFileSync(path.join(sandboxDir, "nested", "notes.txt"), "utf8")).toBe("second");
+    expect(fs.readdirSync(path.join(sandboxDir, "nested")).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("cleans up atomic temp files when a workspace write fails", () => {
+    const { workspace, addConversation } = createTestWorkspace();
+    const conversationId = "conv-atomic-failure";
+    const sandboxDir = addConversation(conversationId);
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementationOnce(() => {
+      throw new Error("simulated rename failure");
+    });
+
+    expect(() =>
+      workspace.writeFile({
+        conversationId,
+        scope: "sandbox",
+        relativePath: "notes.txt",
+        content: "hello",
+      }),
+    ).toThrow(/simulated rename failure/i);
+
+    renameSpy.mockRestore();
+    expect(fs.readdirSync(sandboxDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    expect(fs.existsSync(path.join(sandboxDir, "notes.txt"))).toBe(false);
+  });
+
+  it("writes binary files through the same sandbox boundary", () => {
+    const { workspace, addConversation } = createTestWorkspace();
+    const conversationId = "conv-binary-write";
+    const sandboxDir = addConversation(conversationId);
+
+    workspace.writeBinaryFile({
+      conversationId,
+      scope: "sandbox",
+      relativePath: "artifacts/blob.bin",
+      content: Buffer.from([1, 2, 3]),
+    });
+
+    expect([...fs.readFileSync(path.join(sandboxDir, "artifacts", "blob.bin"))]).toEqual([1, 2, 3]);
   });
 
   it("reads UTF-16 BOM text safely and flags unsupported encodings", () => {

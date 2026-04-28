@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-`Unified_Agent` started as a local chat app with provider selection and a shared UI. The product direction moved toward a local-first agent platform with:
+`AetherOps` started as a local chat app with provider selection and a shared UI. The product direction moved toward a local-first agent platform with:
 
 - multiple agents
 - session-scoped chat

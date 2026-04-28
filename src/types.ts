@@ -14,6 +14,36 @@ export type WorkspaceScope = "sandbox" | "shared" | "root";
 export type ChannelKind = "webchat";
 export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
 export type TaskKind = "detached" | "heartbeat" | "continuation" | "scheduled" | "subagent" | "flow_step";
+export type ComputerUseMode = "none" | "openai-computer-tool" | "custom-browser-harness";
+export type AgentEngineKind = "opencode";
+export type EngineRunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
+export type ComputerUseActionType =
+  | "create_session"
+  | "navigate"
+  | "screenshot"
+  | "click"
+  | "double_click"
+  | "type"
+  | "keypress"
+  | "scroll"
+  | "wait"
+  | "extract_text"
+  | "close_session";
+export type ComputerUseEventStatus =
+  | "allowed"
+  | "requires_approval"
+  | "blocked"
+  | "approved"
+  | "denied"
+  | "started"
+  | "completed"
+  | "failed";
 export type ToolPermission =
   | "workspace"
   | "memory"
@@ -73,6 +103,19 @@ export interface ProviderSummary {
   email: string | null;
   accountId: string | null;
   metadata: Record<string, unknown>;
+  capabilities?: ProviderModelCapabilities;
+}
+
+export interface ProviderModelCapabilities {
+  streaming: boolean;
+  nativeToolCalling: boolean;
+  jsonMode: boolean;
+  reasoningLevel: boolean;
+  vision: boolean;
+  maxContextTokens: number | null;
+  supportsComputerUse: boolean;
+  supportsBrowserUse: boolean;
+  computerUseMode: ComputerUseMode;
 }
 
 export interface ProviderDraft {
@@ -134,6 +177,7 @@ export interface TaskFlowStepRecord {
   title: string;
   prompt: string;
   dependencyStepKey: string | null;
+  position: number;
   status: string | null;
   taskId: string | null;
   createdAt: number;
@@ -163,6 +207,12 @@ export interface TaskFlowStepRunSummary {
 export interface TaskFlowStepDetail extends TaskFlowStepRecord {
   task?: TaskFlowStepTaskSummary | null;
   run?: TaskFlowStepRunSummary | null;
+}
+
+export interface TaskFlowStepDraft {
+  stepKey: string;
+  title: string;
+  prompt: string;
 }
 
 export interface PluginSkillSummary {
@@ -200,6 +250,62 @@ export interface PlatformMetadata {
   tools: ToolDescriptor[];
   channels: ChannelSummary[];
   agentSkills?: AgentSkillSummary[];
+}
+
+export interface ComputerUseSettingsRecord {
+  enabled: boolean;
+  customBrowserHarnessEnabled: boolean;
+  allowExternalDomains: string[];
+  allowFileUrls: boolean;
+  maxActionsPerSession: number;
+  sessionTimeoutMs: number;
+  updatedAt: number;
+}
+
+export interface ComputerUseSessionRecord {
+  id: string;
+  agentId: string | null;
+  conversationId: string | null;
+  runId: string | null;
+  taskId: string | null;
+  status: "open" | "closed";
+  currentUrl: string | null;
+  allowedDomains: string[];
+  actionCount: number;
+  latestScreenshotPath: string | null;
+  createdAt: number;
+  updatedAt: number;
+  closedAt: number | null;
+}
+
+export interface ComputerUseActionEventRecord {
+  id: string;
+  sessionId: string;
+  actionType: ComputerUseActionType;
+  status: ComputerUseEventStatus;
+  currentUrl: string | null;
+  targetUrl: string | null;
+  summary: string;
+  metadata: Record<string, unknown>;
+  screenshotPath: string | null;
+  createdAt: number;
+}
+
+export interface ComputerUseApprovalRecord {
+  id: string;
+  sessionId: string;
+  actionEventId: string | null;
+  decision: "approved" | "denied";
+  reason: string | null;
+  createdAt: number;
+}
+
+export interface ComputerUseSessionDetail {
+  session: ComputerUseSessionRecord;
+  events: ComputerUseActionEventRecord[];
+  approvals: ComputerUseApprovalRecord[];
+  latestScreenshotBase64?: string | null;
+  latestScreenshotMimeType?: string | null;
 }
 
 export interface WorkspaceTreeNode {
@@ -248,6 +354,62 @@ export interface WorkspaceRunEventRecord {
     | "run_cancelled";
   payload: Record<string, unknown>;
   createdAt: number;
+}
+
+export interface EngineRunRecord {
+  runId: string;
+  engineKind: AgentEngineKind;
+  status: EngineRunStatus;
+  externalSessionId: string | null;
+  workspacePath: string | null;
+  model: string;
+  command: string | null;
+  exitCode: number | null;
+  eventSummary: Record<string, unknown>;
+  startedAt: number;
+  completedAt: number | null;
+}
+
+export interface EngineStatusRecord {
+  engineKind: AgentEngineKind;
+  configuredEngineKind: AgentEngineKind;
+  available: boolean;
+  installed: boolean;
+  version: string | null;
+  executable: string;
+  executableSource?: "env" | "embedded-package" | "global" | "test-harness";
+  managedPackageVersion?: string | null;
+  configDir: string | null;
+  authStatus: "available" | "unknown" | "unavailable";
+  models: string[];
+  sessions: Array<Record<string, unknown>>;
+  lastFailure: string | null;
+  environment: {
+    autoUpdateDisabled: boolean;
+    pruneDisabled: boolean;
+    defaultPluginsDisabled: boolean;
+  };
+  credentialSync?: {
+    mode: "runtime-env";
+    configuredProviders: ProviderKind[];
+    entries: Array<{
+      providerKind: ProviderKind;
+      opencodeProvider: string;
+      authMode: "api_key" | "oauth" | "base_url";
+      configured: boolean;
+      runtimeEnvKeys: string[];
+      note: string;
+    }>;
+  };
+  opencodeAuthProviders?: string[];
+}
+
+export interface EngineAuthLoginResult {
+  ok: boolean;
+  launched: boolean;
+  provider: string;
+  command: string;
+  message: string;
 }
 
 export interface TaskRecord {
@@ -335,7 +497,7 @@ export interface StreamEventPayloadMap {
   status: { message: string; tool?: string };
   tool_call: { tool: string; arguments: Record<string, unknown> };
   tool_result: { tool: string; result: Record<string, unknown> };
-  run_complete: { runId: string; changedFiles: string[] };
+  run_complete: { runId: string; changedFiles: string[]; engineRun?: EngineRunRecord };
   delta: { delta: string };
   done: { messageId: string | null; runId?: string; changedFiles?: string[] };
   error: { error: string; runId?: string; status?: WorkspaceRunStatus };
@@ -357,11 +519,11 @@ export const providerLabels: Record<ProviderKind, string> = {
 };
 
 export const defaultModels: Record<ProviderKind, string> = {
-  openai: "gpt-5.4",
-  anthropic: "claude-sonnet-4-6",
-  gemini: "gemini-3-flash-preview",
+  openai: "gpt-5.5",
+  anthropic: "claude-opus-4-7",
+  gemini: "gemini-3.1-pro-preview",
   ollama: "qwen3",
-  "openai-codex": "gpt-5.4",
+  "openai-codex": "gpt-5.5",
 };
 
 export const defaultReasoningLevels: Record<ProviderKind, ReasoningLevel> = {

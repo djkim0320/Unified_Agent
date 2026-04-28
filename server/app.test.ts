@@ -2,9 +2,36 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import request from "supertest";
+import supertest from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "./app.js";
+
+const UNSAFE_TEST_METHODS = new Set(["post", "put", "patch", "delete"]);
+
+function request(app: Parameters<typeof supertest>[0]) {
+  const client = supertest(app);
+  const token =
+    typeof (app as { locals?: { localApiToken?: unknown } }).locals?.localApiToken === "string"
+      ? ((app as unknown as { locals: { localApiToken: string } }).locals.localApiToken)
+      : null;
+
+  return new Proxy(client, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (
+        typeof property === "string" &&
+        UNSAFE_TEST_METHODS.has(property) &&
+        typeof value === "function"
+      ) {
+        return (...args: unknown[]) => {
+          const test = value.apply(target, args);
+          return token ? test.set("X-Local-API-Token", token) : test;
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as ReturnType<typeof supertest>;
+}
 
 function jsonResponse(body: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -117,7 +144,145 @@ describe("createApp", () => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it("creates local skill files for the active agent", async () => {
+  it("protects unsafe local API methods with a generated token", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const tokenResponse = await supertest(app)
+      .get("/api/local-api-token")
+      .set("Origin", "http://127.0.0.1:5173")
+      .expect(200);
+    const token = tokenResponse.body.token as string;
+    expect(token).toBeTruthy();
+    expect(fs.existsSync(path.join(dataDir, "local-api.token"))).toBe(true);
+
+    await supertest(app)
+      .get("/api/providers")
+      .set("Origin", "http://127.0.0.1:5173")
+      .expect(200);
+    await supertest(app)
+      .get("/api/providers")
+      .set("Origin", "https://example.com")
+      .expect(403);
+    await supertest(app)
+      .put("/api/providers/openai/account")
+      .send({ apiKey: "sk-missing" })
+      .expect(401);
+    await supertest(app)
+      .put("/api/providers/openai/account")
+      .set("X-Local-API-Token", "wrong")
+      .send({ apiKey: "sk-invalid" })
+      .expect(401);
+    await supertest(app)
+      .put("/api/providers/openai/account")
+      .set("X-Local-API-Token", token)
+      .send({ apiKey: "sk-valid" })
+      .expect(200);
+  });
+
+  it("returns a backend health status for the local UI", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const apiResponse = await request(app).get("/api/health").expect(200);
+    expect(apiResponse.body).toEqual(
+      expect.objectContaining({
+        ok: true,
+        service: "aetherops",
+        timestamp: expect.any(String),
+      }),
+    );
+
+    await request(app).get("/health").expect(200);
+  });
+
+  it("exposes execution engine status through the native API", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const response = await request(app).get("/api/engine/status").expect(200);
+
+    expect(response.body.engineKind).toBe("opencode");
+    expect(response.body.available).toBe(true);
+    expect(response.body.executable).toBe("opencode-test-harness");
+  });
+
+  it("starts the official opencode OAuth helper through a protected endpoint", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const response = await request(app)
+      .post("/api/engine/opencode/auth/login")
+      .send({ provider: "openai-codex", launch: false })
+      .expect(200);
+
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        ok: true,
+        launched: false,
+        provider: "openai",
+      }),
+    );
+    expect(response.body.command).toContain("auth login");
+  });
+
+  it("returns structured Zod details for invalid request payloads", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const response = await request(app)
+      .put("/api/providers/not-a-provider/account")
+      .send({ apiKey: "sk-invalid" })
+      .expect(400);
+
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        error: "Invalid request.",
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            code: expect.any(String),
+            message: expect.any(String),
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("returns Gone for custom Computer Use routes in opencode-only mode", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    await supertest(app)
+      .get("/api/computer-use/settings")
+      .expect(410);
+
+    await request(app)
+      .put("/api/computer-use/settings")
+      .send({ enabled: true })
+      .expect(410);
+
+    await request(app)
+      .post("/api/computer-use/sessions")
+      .send({ allowedDomains: ["localhost"] })
+      .expect(410);
+  });
+
+  it("returns Gone for custom Computer Use action routes", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    await request(app)
+      .post("/api/computer-use/sessions/session-1/click")
+      .send({ selector: "" })
+      .expect(410);
+
+    await request(app)
+      .post("/api/computer-use/sessions/session-1/type")
+      .send({ selector: "input", text: "redacted", typedTextKind: "secret" })
+      .expect(410);
+  });
+
+  it("returns Gone for local skill files in opencode-only mode", async () => {
     const projectRoot = path.join(dataDir, "project-root");
     const appDataDir = path.join(dataDir, "db");
     fs.mkdirSync(projectRoot, { recursive: true });
@@ -131,27 +296,17 @@ describe("createApp", () => {
         content: "- Split long aviation work into requirements, research, variants, plan, and decision log.",
         scope: "agent",
       })
-      .expect(201);
-
-    expect(response.body.skill.path).toContain("workspace/agents/default-agent/skills/");
-    expect(
-      fs.existsSync(path.join(projectRoot, "workspace", "agents", "default-agent", "skills", "Aviation-Planner.md")),
-    ).toBe(true);
+      .expect(410);
 
     const skillsResponse = await request(context.app)
       .get("/api/agents/default-agent/skills")
-      .expect(200);
-    expect(skillsResponse.body.skills).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "Aviation-Planner",
-          source: "agent",
-        }),
-      ]),
-    );
+      .expect(410);
+    expect(response.body.engineKind).toBe("opencode");
+    expect(skillsResponse.body.engineKind).toBe("opencode");
+    expect(fs.existsSync(path.join(projectRoot, "workspace", "agents"))).toBe(false);
   });
 
-  it("creates metadata-only MCP bridge profiles without executable tools", async () => {
+  it("returns Gone for metadata-only MCP bridge profiles in opencode-only mode", async () => {
     const projectRoot = path.join(dataDir, "project-root");
     const appDataDir = path.join(dataDir, "db");
     fs.mkdirSync(projectRoot, { recursive: true });
@@ -166,25 +321,13 @@ describe("createApp", () => {
         command: "npx -y @modelcontextprotocol/server-filesystem ./workspace",
         enabled: true,
       })
-      .expect(201);
-
-    expect(response.body.plugin).toMatchObject({
-      name: "filesystem mcp",
-      tools: [],
-    });
-    expect(
-      fs.existsSync(path.join(projectRoot, "workspace", "shared", "plugins", "mcp-filesystem-mcp", "plugin.json")),
-    ).toBe(true);
+      .expect(410);
+    expect(response.body.engineKind).toBe("opencode");
+    expect(fs.existsSync(path.join(projectRoot, "workspace", "shared", "plugins"))).toBe(false);
 
     const pluginsResponse = await request(context.app).get("/api/plugins").expect(200);
-    expect(pluginsResponse.body.plugins).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "filesystem mcp",
-          tools: [],
-        }),
-      ]),
-    );
+    expect(pluginsResponse.body.plugins).toEqual([]);
+    expect(pluginsResponse.body.engineKind).toBe("opencode");
   });
 
   it("stores API-key providers encrypted at rest", async () => {
@@ -223,49 +366,38 @@ describe("createApp", () => {
 
     const openaiResponse = await request(app).get("/api/providers/openai/models");
     expect(openaiResponse.status).toBe(200);
-    expect(openaiResponse.body.models).toEqual(["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]);
+    expect(openaiResponse.body.models).toEqual([
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.4-nano",
+    ]);
 
     const anthropicResponse = await request(app).get("/api/providers/anthropic/models");
     expect(anthropicResponse.status).toBe(200);
     expect(anthropicResponse.body.models).toEqual([
+      "claude-opus-4-7",
       "claude-sonnet-4-6",
-      "claude-opus-4-6",
       "claude-haiku-4-5",
     ]);
 
     const geminiResponse = await request(app).get("/api/providers/gemini/models");
     expect(geminiResponse.status).toBe(200);
     expect(geminiResponse.body.models).toEqual([
-      "gemini-3-flash-preview",
       "gemini-3.1-pro-preview",
+      "gemini-3.1-pro-preview-customtools",
+      "gemini-3-flash-preview",
       "gemini-3.1-flash-lite-preview",
     ]);
   });
 
-  it("exposes normalized channels, plugin manifests, and agent skill summaries", async () => {
+  it("exposes channels and disables internal tool/plugin/skill surfaces in opencode-only mode", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
     const toolsResponse = await request(app).get("/api/tools");
-    expect(toolsResponse.status).toBe(200);
-    expect(toolsResponse.body.tools).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "list_tree",
-          description: "List files and folders in a workspace scope.",
-          permission: "workspace",
-          audit: expect.objectContaining({
-            category: "unknown",
-            safeByDefault: true,
-          }),
-        }),
-        expect.objectContaining({
-          name: "browser_screenshot",
-          permission: "browser",
-        }),
-      ]),
-    );
-    expect(JSON.stringify(toolsResponse.body)).not.toContain("execute");
+    expect(toolsResponse.status).toBe(410);
+    expect(toolsResponse.body.engineKind).toBe("opencode");
 
     const channelsResponse = await request(app).get("/api/channels");
     expect(channelsResponse.status).toBe(200);
@@ -283,37 +415,12 @@ describe("createApp", () => {
 
     const pluginsResponse = await request(app).get("/api/plugins");
     expect(pluginsResponse.status).toBe(200);
-    expect(pluginsResponse.body.plugins).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: "core",
-          name: "Core Tools",
-          description: "Built-in workspace, research, memory, task, and execution tools.",
-          tools: expect.arrayContaining(["list_tree", "exec_command", "spawn_task", "browser_wait_for"]),
-          skills: expect.arrayContaining([
-            expect.objectContaining({
-              name: "workspace-runtime",
-              summary: expect.stringContaining("Core runtime guidance"),
-            }),
-          ]),
-        }),
-      ]),
-    );
-    expect(JSON.stringify(pluginsResponse.body)).not.toContain("Use the sandbox files");
+    expect(pluginsResponse.body.plugins).toEqual([]);
+    expect(pluginsResponse.body.engineKind).toBe("opencode");
 
     const skillsResponse = await request(app).get("/api/agents/default-agent/skills");
-    expect(skillsResponse.status).toBe(200);
-    expect(skillsResponse.body.agentId).toBe("default-agent");
-    expect(skillsResponse.body.skills).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          source: "plugin",
-          name: "workspace-runtime",
-          summary: expect.stringContaining("Core runtime guidance"),
-        }),
-      ]),
-    );
-    expect(JSON.stringify(skillsResponse.body)).not.toContain("Use the sandbox files");
+    expect(skillsResponse.status).toBe(410);
+    expect(skillsResponse.body.engineKind).toBe("opencode");
   });
 
   it("creates agents, scopes sessions, and exposes explicit memory files", async () => {
@@ -354,26 +461,18 @@ describe("createApp", () => {
     const writeMemoryResponse = await request(app)
       .post(`/api/agents/${agentId}/memory`)
       .send({ content: "User prefers research summaries in Korean.", target: "durable" });
-    expect(writeMemoryResponse.status).toBe(200);
-    expect(writeMemoryResponse.body.memory.durableMemory).toContain("Korean");
+    expect(writeMemoryResponse.status).toBe(410);
+    expect(writeMemoryResponse.body.engineKind).toBe("opencode");
 
     const memoryResponse = await request(app).get(`/api/agents/${agentId}/memory`);
-    expect(memoryResponse.status).toBe(200);
-    expect(memoryResponse.body.memory.durableMemoryPath).toBe("MEMORY.md");
+    expect(memoryResponse.status).toBe(410);
     expect(JSON.stringify(memoryResponse.body)).not.toContain(dataDir);
 
     const memorySearchResponse = await request(app).get(
       `/api/agents/${agentId}/memory/search?query=${encodeURIComponent("Korean summaries")}&maxResults=5`,
     );
-    expect(memorySearchResponse.status).toBe(200);
-    expect(memorySearchResponse.body.results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          path: "MEMORY.md",
-          kind: "durable",
-        }),
-      ]),
-    );
+    expect(memorySearchResponse.status).toBe(410);
+    expect(memorySearchResponse.body.engineKind).toBe("opencode");
   });
 
   it("exposes soul and heartbeat routes and records manual heartbeat triggers", async () => {
@@ -941,7 +1040,7 @@ describe("createApp", () => {
     );
     expect(messagesResponse.body.conversation.title).toBe("Say hi");
     expect(messagesResponse.body.conversation.reasoningLevel).toBe("high");
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("deletes a conversation and cascades its messages", async () => {
@@ -1019,25 +1118,24 @@ describe("createApp", () => {
     const treeResponse = await request(app).get(
       `/api/workspace/tree?conversationId=${conversationId}&scope=sandbox`,
     );
-    expect(treeResponse.status).toBe(200);
+    expect(treeResponse.status).toBe(410);
     expect(JSON.stringify(treeResponse.body)).not.toContain(dataDir);
-    expect(treeResponse.body.workspaceRoot).toBeUndefined();
+    expect(treeResponse.body.engineKind).toBe("opencode");
 
     const fileResponse = await request(app).get(
       `/api/workspace/file?conversationId=${conversationId}&scope=sandbox&path=${encodeURIComponent("메모.txt")}`,
     );
-    expect(fileResponse.status).toBe(200);
-    expect(fileResponse.body.file.absolutePath).toBeUndefined();
-    expect(fileResponse.body.file.content).toBe("한글");
+    expect(fileResponse.status).toBe(410);
+    expect(fileResponse.body.engineKind).toBe("opencode");
+    expect(fileResponse.body.error).toContain("Workspace file CRUD");
 
     const rootResponse = await request(app).get(
       `/api/workspace/tree?conversationId=${conversationId}&scope=root`,
     );
-    expect(rootResponse.status).toBe(400);
-    expect(rootResponse.body.error).toContain("Root workspace scope is disabled");
+    expect(rootResponse.status).toBe(410);
   });
 
-  it("creates workspace files and folders through scoped API routes", async () => {
+  it("returns Gone for workspace file and folder CRUD routes", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
@@ -1059,14 +1157,8 @@ describe("createApp", () => {
         path: "research/notes.md",
         content: "# Notes\n\nhello",
       });
-    expect(fileResponse.status).toBe(201);
-    expect(fileResponse.body.file).toEqual(
-      expect.objectContaining({
-        scope: "sandbox",
-        path: "research/notes.md",
-        content: "# Notes\n\nhello",
-      }),
-    );
+    expect(fileResponse.status).toBe(410);
+    expect(fileResponse.body.engineKind).toBe("opencode");
 
     const conflictResponse = await request(app)
       .post("/api/workspace/file")
@@ -1076,7 +1168,7 @@ describe("createApp", () => {
         path: "research/notes.md",
         content: "replace me",
       });
-    expect(conflictResponse.status).toBe(409);
+    expect(conflictResponse.status).toBe(410);
 
     const folderResponse = await request(app)
       .post("/api/workspace/folder")
@@ -1085,11 +1177,7 @@ describe("createApp", () => {
         scope: "shared",
         path: "templates/aviation",
       });
-    expect(folderResponse.status).toBe(201);
-    expect(folderResponse.body.folder).toEqual({
-      scope: "shared",
-      path: "templates/aviation",
-    });
+    expect(folderResponse.status).toBe(410);
 
     const rootWriteResponse = await request(app)
       .post("/api/workspace/file")
@@ -1099,10 +1187,10 @@ describe("createApp", () => {
         path: "unsafe.txt",
         content: "nope",
       });
-    expect(rootWriteResponse.status).toBe(400);
+    expect(rootWriteResponse.status).toBe(410);
   });
 
-  it("exposes absolute workspace paths only when debug paths are enabled", async () => {
+  it("keeps workspace file routes Gone even when debug paths are enabled", async () => {
     const previous = process.env.ENABLE_WORKSPACE_DEBUG_PATHS;
     process.env.ENABLE_WORKSPACE_DEBUG_PATHS = "true";
 
@@ -1129,19 +1217,16 @@ describe("createApp", () => {
       const treeResponse = await request(app).get(
         `/api/workspace/tree?conversationId=${conversationId}&scope=sandbox`,
       );
-      expect(treeResponse.status).toBe(200);
-      expect(treeResponse.body.debug.workspaceRoot).toContain(
-        path.join("workspace", "agents", "default-agent", "sessions"),
-      );
-      expect(treeResponse.body.debug.absolutePath).toContain(conversationId);
+      expect(treeResponse.status).toBe(410);
+      expect(treeResponse.body.engineKind).toBe("opencode");
+      expect(JSON.stringify(treeResponse.body)).not.toContain(dataDir);
 
       const fileResponse = await request(app).get(
         `/api/workspace/file?conversationId=${conversationId}&scope=sandbox&path=notes.txt`,
       );
-      expect(fileResponse.status).toBe(200);
-      expect(fileResponse.body.file.absolutePath).toContain(
-        path.join("workspace", "agents", "default-agent", "sessions"),
-      );
+      expect(fileResponse.status).toBe(410);
+      expect(fileResponse.body.engineKind).toBe("opencode");
+      expect(JSON.stringify(fileResponse.body)).not.toContain(dataDir);
     } finally {
       if (previous === undefined) {
         delete process.env.ENABLE_WORKSPACE_DEBUG_PATHS;
@@ -1186,7 +1271,7 @@ describe("createApp", () => {
     expect(rightResponse.body.events.length).toBeGreaterThan(0);
   });
 
-  it("reads standing orders, searches agent memory, and lists sub-agent sessions", async () => {
+  it("reads standing orders, disables memory routes, and lists sub-agent sessions", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
@@ -1208,20 +1293,14 @@ describe("createApp", () => {
     const memoryWriteResponse = await request(app)
       .post("/api/agents/default-agent/memory")
       .send({ content: "User prefers Korean summaries.", target: "durable" });
-    expect(memoryWriteResponse.status).toBe(200);
+    expect(memoryWriteResponse.status).toBe(410);
+    expect(memoryWriteResponse.body.engineKind).toBe("opencode");
 
     const memorySearchResponse = await request(app).get(
       "/api/agents/default-agent/memory/search?query=Korean&maxResults=5",
     );
-    expect(memorySearchResponse.status).toBe(200);
-    expect(memorySearchResponse.body.results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          path: "MEMORY.md",
-          text: expect.stringContaining("Korean"),
-        }),
-      ]),
-    );
+    expect(memorySearchResponse.status).toBe(410);
+    expect(memorySearchResponse.body.engineKind).toBe("opencode");
 
     const parentConversation = store.saveConversation({
       title: "Parent session",
@@ -1409,6 +1488,16 @@ describe("createApp", () => {
       });
     const conversationId = conversationResponse.body.conversation.id as string;
 
+    const emptyAutoStartResponse = await request(app)
+      .post("/api/agents/default-agent/flows")
+      .send({
+        conversationId,
+        title: "Invalid empty flow",
+        steps: [],
+      });
+    expect(emptyAutoStartResponse.status).toBe(400);
+    expect(JSON.stringify(emptyAutoStartResponse.body)).toContain("autoStart=false");
+
     const duplicateResponse = await request(app)
       .post("/api/agents/default-agent/flows")
       .send({
@@ -1458,6 +1547,169 @@ describe("createApp", () => {
       });
     expect(cyclicResponse.status).toBe(400);
     expect(JSON.stringify(cyclicResponse.body)).toContain("cycle");
+  });
+
+  it("edits queued flow steps and protects task-flow audit history", async () => {
+    const { app, store } = createApp({
+      dataDir,
+      projectRoot: dataDir,
+    });
+    openStores.push(store);
+
+    const conversationResponse = await request(app)
+      .post("/api/conversations")
+      .send({
+        title: "Editable flow session",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+    const conversationId = conversationResponse.body.conversation.id as string;
+
+    const emptyCreateResponse = await request(app)
+      .post("/api/agents/default-agent/flows")
+      .send({
+        conversationId,
+        title: "Empty editable flow",
+        autoStart: false,
+        steps: [],
+      })
+      .expect(200);
+    const emptyFlowId = emptyCreateResponse.body.flow.id as string;
+    expect(emptyCreateResponse.body.steps).toEqual([]);
+
+    const startEmptyResponse = await request(app).post(`/api/flows/${emptyFlowId}/start`);
+    expect(startEmptyResponse.status).toBe(409);
+    expect(startEmptyResponse.body.error).toContain("at least one step");
+
+    const renameEmptyResponse = await request(app)
+      .put(`/api/flows/${emptyFlowId}/steps`)
+      .send({ title: "Renamed empty flow", steps: [] })
+      .expect(200);
+    expect(renameEmptyResponse.body.flow.title).toBe("Renamed empty flow");
+    expect(renameEmptyResponse.body.steps).toEqual([]);
+
+    const createFlowResponse = await request(app)
+      .post("/api/agents/default-agent/flows")
+      .send({
+        conversationId,
+        title: "Editable flow",
+        autoStart: false,
+        steps: [
+          { stepKey: "inspect", title: "Inspect", prompt: "Inspect." },
+          { stepKey: "implement", title: "Implement", prompt: "Implement.", dependencyStepKey: "inspect" },
+          { stepKey: "summarize", title: "Summarize", prompt: "Summarize.", dependencyStepKey: "implement" },
+        ],
+      })
+      .expect(200);
+    const flowId = createFlowResponse.body.flow.id as string;
+
+    const replaceResponse = await request(app)
+      .put(`/api/flows/${flowId}/steps`)
+      .send({
+        title: "Editable flow revised",
+        steps: [
+          { stepKey: "summarize", title: "Summarize revised", prompt: "Summarize revised." },
+          { stepKey: "inspect", title: "Inspect revised", prompt: "Inspect revised." },
+          { stepKey: "verify", title: "Verify", prompt: "Verify." },
+        ],
+      })
+      .expect(200);
+
+    expect(replaceResponse.body.flow.title).toBe("Editable flow revised");
+    expect(replaceResponse.body.steps.map((step: { stepKey: string }) => step.stepKey)).toEqual([
+      "summarize",
+      "inspect",
+      "verify",
+    ]);
+    expect(
+      replaceResponse.body.steps.map((step: { dependencyStepKey: string | null; position: number }) => [
+        step.dependencyStepKey,
+        step.position,
+      ]),
+    ).toEqual([
+      [null, 0],
+      ["summarize", 1],
+      ["inspect", 2],
+    ]);
+    expect(store.listTaskFlowSteps(flowId).map((step) => step.stepKey)).not.toContain("implement");
+
+    await request(app)
+      .put(`/api/flows/${flowId}/steps`)
+      .send({
+        steps: [
+          { stepKey: "same", title: "Same 1", prompt: "Same 1." },
+          { stepKey: "same", title: "Same 2", prompt: "Same 2." },
+        ],
+      })
+      .expect(400);
+
+    const lockedFlow = store.createTaskFlow({
+      agentId: "default-agent",
+      conversationId,
+      title: "Locked flow",
+    });
+    const lockedStep = store.createTaskFlowStep({
+      flowId: lockedFlow.id,
+      stepKey: "locked",
+      title: "Locked",
+      prompt: "Locked.",
+    });
+    const auditTask = store.createTask({
+      agentId: "default-agent",
+      conversationId,
+      title: lockedStep.title,
+      prompt: lockedStep.prompt,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      taskKind: "flow_step",
+      taskFlowId: lockedFlow.id,
+      flowStepKey: lockedStep.stepKey,
+    });
+    store.transitionTaskFlowStep({
+      stepId: lockedStep.id,
+      taskId: auditTask.id,
+      status: "completed",
+      completedAt: Date.now(),
+    });
+
+    await request(app)
+      .put(`/api/flows/${lockedFlow.id}/steps`)
+      .send({ steps: [{ stepKey: "new", title: "New", prompt: "New." }] })
+      .expect(409);
+
+    const deleteResponse = await request(app).delete(`/api/flows/${lockedFlow.id}`).expect(200);
+    expect(deleteResponse.body).toEqual({ ok: true, flowId: lockedFlow.id });
+    expect(store.getTaskFlow(lockedFlow.id)).toBeNull();
+    expect(store.listTaskFlowSteps(lockedFlow.id)).toEqual([]);
+    expect(store.getTask(auditTask.id)).toEqual(
+      expect.objectContaining({
+        id: auditTask.id,
+        taskFlowId: null,
+        flowStepKey: lockedStep.stepKey,
+      }),
+    );
+
+    const runningFlow = store.createTaskFlow({
+      agentId: "default-agent",
+      conversationId,
+      title: "Running flow",
+    });
+    store.createTaskFlowStep({
+      flowId: runningFlow.id,
+      stepKey: "running",
+      title: "Running",
+      prompt: "Running.",
+    });
+    store.transitionTaskFlow({ flowId: runningFlow.id, status: "running" });
+
+    await request(app)
+      .put(`/api/flows/${runningFlow.id}/steps`)
+      .send({ steps: [{ stepKey: "new", title: "New", prompt: "New." }] })
+      .expect(409);
+    await request(app).delete(`/api/flows/${runningFlow.id}`).expect(409);
+    expect(store.getTaskFlow(runningFlow.id)).toEqual(expect.objectContaining({ status: "running" }));
   });
 
   it("returns run details, cancels task-backed runs, and resumes from checkpoints", async () => {
@@ -1678,6 +1930,7 @@ describe("createApp", () => {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-Local-API-Token": app.locals.localApiToken as string,
       },
     });
     clientRequest.on("error", () => undefined);

@@ -38,11 +38,11 @@ describe("memory manager", () => {
     expect(snapshot.agentId).toBe("agent-1");
     expect(
       fs.readFileSync(
-        path.join(projectRoot, "workspace", "agents", "agent-1", "summaries", "session-1.md"),
+        path.join(workspace.agentsDir, "agent-1", "summaries", "session-1.md"),
         "utf8",
       ),
     ).toContain("Summary written successfully.");
-    expect(outcomePath).toContain(path.join("workspace", "agents", "agent-1", "outcomes"));
+    expect(outcomePath).toContain(path.join(workspace.agentsDir, "agent-1", "outcomes"));
     expect(fs.readFileSync(outcomePath, "utf8")).toContain("Created hello_browser.ts");
   });
 });

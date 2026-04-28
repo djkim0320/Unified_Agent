@@ -27,6 +27,7 @@ vi.mock("./api", () => ({
   createTaskFlow: vi.fn(),
   deleteAgent: vi.fn(),
   deleteConversation: vi.fn(),
+  deleteTaskFlow: vi.fn(),
   getAgentHeartbeat: vi.fn(),
   getAgentMemory: vi.fn(),
   getAgentSoul: vi.fn(),
@@ -56,6 +57,7 @@ vi.mock("./api", () => ({
   saveAgentSoul: vi.fn(),
   saveAgentStandingOrders: vi.fn(),
   saveConversation: vi.fn(),
+  saveTaskFlowSteps: vi.fn(),
   saveProviderAccount: vi.fn(),
   searchAgentMemory: vi.fn(),
   skipTaskFlowStep: vi.fn(),
@@ -235,6 +237,7 @@ const selectedFlowSteps: TaskFlowStepDetail[] = [
     title: "Step 1",
     prompt: "Do the thing",
     dependencyStepKey: null,
+    position: 0,
     status: "queued",
     taskId: null,
     createdAt: 1,
@@ -329,6 +332,8 @@ function mockDefaults() {
   vi.mocked(api.getTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.createTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.cancelTaskFlow).mockResolvedValue({ flow: null });
+  vi.mocked(api.deleteTaskFlow).mockResolvedValue({ ok: true, flowId: selectedFlow.id });
+  vi.mocked(api.saveTaskFlowSteps).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.startTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.resumeTaskFlow).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.retryTaskFlowStep).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
@@ -434,12 +439,18 @@ describe("App frontend", () => {
     expect(shell.queryByRole("button", { name: "개요" })).not.toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" })).toBeInTheDocument();
     expect(await shell.findByLabelText("워크플로우 관제 패널")).toBeInTheDocument();
+    expect(container.querySelector(".cockpit-chat-card__tabs")).not.toBeInTheDocument();
+    expect(container.querySelector(".chat-panel__current-model")).not.toBeInTheDocument();
+    expect(api.getWorkspaceTree).not.toHaveBeenCalled();
+    expect(api.getWorkspaceFile).not.toHaveBeenCalled();
+    expect(api.getAgentMemory).not.toHaveBeenCalled();
+    expect(api.searchAgentMemory).not.toHaveBeenCalled();
+    expect(shell.queryByRole("button", { name: "프로바이더" })).not.toBeInTheDocument();
 
-    const tabs = container.querySelectorAll<HTMLButtonElement>(".chat-panel__tab");
-    await user.click(tabs[1]!);
+    await user.click(await shell.findByRole("button", { name: "워크플로우" }));
 
     expect(await shell.findByRole("heading", { name: "워크플로우 관제" })).toBeInTheDocument();
-    expect(await shell.findByRole("heading", { name: "Flow 생성" })).toBeInTheDocument();
+    expect(await shell.findByRole("heading", { name: "Outline으로 빠르게 만들기" })).toBeInTheDocument();
   });
 
   it("opens the standing orders tab in agent settings", async () => {

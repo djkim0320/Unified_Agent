@@ -1,10 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   AgentMemorySnapshot,
   AgentRecord,
+  ComputerUseActionEventRecord,
+  ComputerUseSessionDetail,
+  ComputerUseSettingsRecord,
   ConversationRecord,
   PlatformMetadata,
   TaskFlowRecord,
+  TaskFlowStepDraft,
   TaskFlowStepDetail,
   TaskRecord,
   WorkspaceFileRecord,
@@ -14,13 +18,27 @@ import type {
   WorkspaceTreeNode,
 } from "../types";
 import type { CockpitNavTarget } from "./ConversationList";
+import { ComputerUsePanel } from "./ComputerUsePanel";
 
 type CockpitSectionTarget = Exclude<CockpitNavTarget, "chat" | "settings">;
+
+type EditableFlowStep = TaskFlowStepDraft & {
+  clientId: string;
+};
+
+const MAX_FLOW_STEPS = 8;
 
 interface CockpitSectionViewProps {
   activeAgent: AgentRecord | null;
   activeConversation: ConversationRecord | null;
   changedFiles: string[];
+  computerUseAllowlistDraft: string;
+  computerUseClickSelector: string;
+  computerUseDetail: ComputerUseSessionDetail | null;
+  computerUseError: string | null;
+  computerUseLoading: boolean;
+  computerUseNavigationUrl: string;
+  computerUseSettings: ComputerUseSettingsRecord | null;
   file: WorkspaceFileRecord | null;
   liveEvents: WorkspaceRunEventRecord[];
   memory: AgentMemorySnapshot | null;
@@ -39,6 +57,12 @@ interface CockpitSectionViewProps {
   tree: WorkspaceTreeNode[];
   workspaceLoading: boolean;
   onCancelTaskFlow: (flowId: string) => void;
+  onApproveComputerUseAction: (event: ComputerUseActionEventRecord) => void;
+  onCloseComputerUseSession: () => void;
+  onComputerUseAllowlistDraftChange: (value: string) => void;
+  onComputerUseClickSelectorChange: (value: string) => void;
+  onComputerUseNavigationUrlChange: (value: string) => void;
+  onCreateComputerUseSession: () => void;
   onCreateConversation: () => void;
   onCreateMcpServerProfile: (payload: {
     label: string;
@@ -62,17 +86,11 @@ interface CockpitSectionViewProps {
       dependencyStepKey?: string | null;
     }>;
   }) => void;
-  onCreateWorkspaceFile: (payload: {
-    scope: Extract<WorkspaceScope, "sandbox" | "shared">;
-    path: string;
-    content?: string;
-    overwrite?: boolean;
-  }) => void;
-  onCreateWorkspaceFolder: (payload: {
-    scope: Extract<WorkspaceScope, "sandbox" | "shared">;
-    path: string;
-  }) => void;
+  onDeleteTaskFlow: (flowId: string) => void;
+  onDenyComputerUseAction: (event: ComputerUseActionEventRecord) => void;
+  onClickComputerUseSession: () => void;
   onNavigate: (target: CockpitNavTarget) => void;
+  onNavigateComputerUseSession: () => void;
   onOpenAgentSettings: () => void;
   onOpenProviderSettings: () => void;
   onRefreshFiles: () => void;
@@ -82,8 +100,14 @@ interface CockpitSectionViewProps {
   onScopeChange: (scope: WorkspaceScope) => void;
   onSelectFile: (path: string) => void;
   onSelectTaskFlow: (flowId: string) => void;
+  onSaveTaskFlowSteps: (flowId: string, steps: TaskFlowStepDraft[], title?: string) => void;
   onSkipTaskFlowStep: (flowId: string, stepId: string) => void;
   onStartTaskFlow: (flowId: string) => void;
+  onSaveComputerUseSettings: () => void;
+  onScreenshotComputerUseSession: () => void;
+  onRiskyClickComputerUseSession: () => void;
+  onSensitiveTypeComputerUseSession: () => void;
+  onToggleComputerUseEnabled: () => void;
 }
 
 const sectionCopy: Record<
@@ -94,6 +118,11 @@ const sectionCopy: Record<
     eyebrow: "장기 작업",
     title: "워크플로우 관제",
     description: "여러 단계로 나뉜 작업 흐름을 만들고, 시작하고, 실패한 단계를 재시도하거나 건너뜁니다.",
+  },
+  computer: {
+    eyebrow: "제어 브라우저",
+    title: "Computer Use",
+    description: "격리된 로컬 브라우저를 명시적으로 켜고, localhost UI를 관찰하거나 안전한 클릭/입력 액션을 수행합니다.",
   },
   mcp: {
     eyebrow: "외부 도구 연결",
@@ -244,10 +273,79 @@ function createAircraftResearchFlow() {
   }));
 }
 
+function createEditableStep(step: TaskFlowStepDetail, index: number): EditableFlowStep {
+  return {
+    clientId: step.id || `${step.stepKey}-${index}`,
+    stepKey: step.stepKey,
+    title: step.title,
+    prompt: step.prompt,
+  };
+}
+
+function createBlankEditableStep(index: number): EditableFlowStep {
+  return {
+    clientId: `new-step-${Date.now()}-${index}`,
+    stepKey: `step-${index + 1}`,
+    title: `Step ${index + 1}`,
+    prompt: "",
+  };
+}
+
+function moveItem<T>(items: T[], fromIndex: number, toIndex: number) {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= items.length || toIndex >= items.length) {
+    return items;
+  }
+  const next = [...items];
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, item);
+  return next;
+}
+
+function draftStepForSave(step: EditableFlowStep): TaskFlowStepDraft {
+  return {
+    stepKey: step.stepKey.trim(),
+    title: step.title.trim(),
+    prompt: step.prompt.trim(),
+  };
+}
+
+function validateFlowDraft(title: string, steps: EditableFlowStep[]) {
+  const errors: string[] = [];
+  const trimmedTitle = title.trim();
+  if (!trimmedTitle) {
+    errors.push("Flow 제목을 입력하세요.");
+  }
+  const seenStepKeys = new Set<string>();
+  for (const [index, step] of steps.entries()) {
+    const stepNumber = index + 1;
+    const normalized = draftStepForSave(step);
+    if (!normalized.stepKey) {
+      errors.push(`${stepNumber}번 단계의 Step Key를 입력하세요.`);
+    } else if (seenStepKeys.has(normalized.stepKey)) {
+      errors.push(`Step Key "${normalized.stepKey}"가 중복되었습니다.`);
+    }
+    seenStepKeys.add(normalized.stepKey);
+    if (!normalized.title) {
+      errors.push(`${stepNumber}번 단계의 제목을 입력하세요.`);
+    }
+    if (!normalized.prompt) {
+      errors.push(`${stepNumber}번 단계의 프롬프트를 입력하세요.`);
+    }
+  }
+  return errors;
+}
+
 export function CockpitSectionView({
   activeAgent,
   activeConversation,
   changedFiles,
+  computerUseAllowlistDraft,
+  computerUseClickSelector,
+  computerUseDetail,
+  computerUseError,
+  computerUseLoading,
+  computerUseNavigationUrl,
+  computerUseSettings,
   file,
   liveEvents,
   memory,
@@ -266,13 +364,21 @@ export function CockpitSectionView({
   tree,
   workspaceLoading,
   onCancelTaskFlow,
+  onApproveComputerUseAction,
+  onCloseComputerUseSession,
+  onComputerUseAllowlistDraftChange,
+  onComputerUseClickSelectorChange,
+  onComputerUseNavigationUrlChange,
+  onCreateComputerUseSession,
   onCreateConversation,
   onCreateMcpServerProfile,
   onCreateSkill,
   onCreateTaskFlow,
-  onCreateWorkspaceFile,
-  onCreateWorkspaceFolder,
-  onNavigate,
+  onDeleteTaskFlow,
+  onDenyComputerUseAction,
+  onClickComputerUseSession,
+  onNavigate: onNavigateTarget,
+  onNavigateComputerUseSession,
   onOpenAgentSettings,
   onOpenProviderSettings,
   onRefreshFiles,
@@ -282,8 +388,14 @@ export function CockpitSectionView({
   onScopeChange,
   onSelectFile,
   onSelectTaskFlow,
+  onSaveTaskFlowSteps,
   onSkipTaskFlowStep,
   onStartTaskFlow,
+  onSaveComputerUseSettings,
+  onScreenshotComputerUseSession,
+  onRiskyClickComputerUseSession,
+  onSensitiveTypeComputerUseSession,
+  onToggleComputerUseEnabled,
 }: CockpitSectionViewProps) {
   const [flowTitle, setFlowTitle] = useState("");
   const [flowOutline, setFlowOutline] = useState("");
@@ -296,15 +408,44 @@ export function CockpitSectionView({
   const [mcpCommand, setMcpCommand] = useState("");
   const [mcpDescription, setMcpDescription] = useState("");
   const [mcpEnabled, setMcpEnabled] = useState(false);
-  const [workspaceFilePath, setWorkspaceFilePath] = useState("notes.md");
-  const [workspaceFileContent, setWorkspaceFileContent] = useState("# Notes\n\n");
-  const [workspaceFolderPath, setWorkspaceFolderPath] = useState("research");
+  const [flowEditingId, setFlowEditingId] = useState<string | null>(null);
+  const [flowEditTitle, setFlowEditTitle] = useState("");
+  const [flowEditSteps, setFlowEditSteps] = useState<EditableFlowStep[]>([]);
+  const [selectedFlowEditStepId, setSelectedFlowEditStepId] = useState<string | null>(null);
+  const [draggingStepIndex, setDraggingStepIndex] = useState<number | null>(null);
+  const [pendingFlowEditId, setPendingFlowEditId] = useState<string | null>(null);
 
   const flowCounts = countStatus(taskFlows);
   const taskCounts = countStatus(tasks);
   const runCounts = countStatus(runs);
   const selectedOrFirstFlow =
     selectedTaskFlow ?? (taskFlows[0] ? { flow: taskFlows[0], steps: [] } : null);
+  const selectedFlowId = selectedOrFirstFlow?.flow.id ?? null;
+  const selectedFlowDetailLoaded =
+    Boolean(selectedFlowId) && selectedTaskFlow?.flow.id === selectedFlowId;
+  const selectedFlowSteps = selectedFlowDetailLoaded ? selectedTaskFlow?.steps ?? [] : [];
+  const selectedFlowHasTaskLinkedSteps = selectedFlowSteps.some((step) => Boolean(step.taskId || step.task));
+  const selectedFlowCanEdit =
+    Boolean(selectedOrFirstFlow) &&
+    selectedFlowDetailLoaded &&
+    selectedOrFirstFlow?.flow.status === "queued" &&
+    !selectedFlowHasTaskLinkedSteps;
+  const isEditingSelectedFlow = Boolean(selectedFlowId && flowEditingId === selectedFlowId);
+  const selectedFlowCanStart = Boolean(selectedOrFirstFlow && selectedFlowSteps.length > 0);
+  const selectedFlowEditStepIndex = flowEditSteps.findIndex((step) => step.clientId === selectedFlowEditStepId);
+  const selectedFlowEditStep =
+    selectedFlowEditStepIndex >= 0 ? flowEditSteps[selectedFlowEditStepIndex] : null;
+  const flowEditValidationErrors = validateFlowDraft(flowEditTitle, flowEditSteps);
+  const canSaveFlowEdit = isEditingSelectedFlow && flowEditValidationErrors.length === 0;
+  const editBlockReason = !selectedOrFirstFlow
+    ? "편집할 Flow를 먼저 선택하세요."
+    : !selectedFlowDetailLoaded
+      ? "먼저 상세 불러오기로 단계 정보를 가져와야 편집 가능 여부를 확인할 수 있습니다."
+      : selectedOrFirstFlow.flow.status !== "queued"
+        ? "구조 편집은 아직 시작하지 않은 대기 상태 Flow에서만 가능합니다."
+        : selectedFlowHasTaskLinkedSteps
+          ? "이미 작업(task)에 연결된 단계가 있어 구조를 바꿀 수 없습니다. 실행 이력 보호를 위해 새 Flow를 만들어 주세요."
+          : "대기 중인 Flow입니다. 단계 구조를 편집할 수 있습니다.";
   const allEvents = useMemo(
     () => [...(runEvents ?? []), ...liveEvents].slice(-10).reverse(),
     [liveEvents, runEvents],
@@ -326,8 +467,37 @@ export function CockpitSectionView({
     (tool) => tool.permission === "network" || tool.permission === "browser" || tool.name.toLowerCase().includes("mcp"),
   );
   const copy = sectionCopy[target];
-  const writableScope: Extract<WorkspaceScope, "sandbox" | "shared"> =
-    scope === "shared" ? "shared" : "sandbox";
+  const onNavigate = (nextTarget: CockpitNavTarget) => {
+    onNavigateTarget(
+      nextTarget === "computer" || nextTarget === "mcp" || nextTarget === "skills" || nextTarget === "files"
+        ? "workflow"
+        : nextTarget,
+    );
+  };
+
+  useEffect(() => {
+    if (!selectedFlowId || flowEditingId !== selectedFlowId) {
+      return;
+    }
+    const nextSteps = selectedFlowSteps.map(createEditableStep);
+    setFlowEditTitle(selectedOrFirstFlow?.flow.title ?? "");
+    setFlowEditSteps(nextSteps);
+    setSelectedFlowEditStepId((current) =>
+      current && nextSteps.some((step) => step.clientId === current)
+        ? current
+        : nextSteps[0]?.clientId ?? null,
+    );
+  }, [flowEditingId, selectedFlowId, selectedFlowSteps, selectedOrFirstFlow?.flow.title]);
+
+  useEffect(() => {
+    if (!selectedFlowId || flowEditingId !== selectedFlowId) {
+      setFlowEditingId(null);
+      setFlowEditTitle("");
+      setFlowEditSteps([]);
+      setSelectedFlowEditStepId(null);
+      setDraggingStepIndex(null);
+    }
+  }, [flowEditingId, selectedFlowId]);
 
   const createFlowFromEditor = () => {
     const title = flowTitle.trim() || "새 장기 작업 흐름";
@@ -335,6 +505,125 @@ export function CockpitSectionView({
     onCreateTaskFlow({ title, autoStart: flowAutoStart, steps });
     setFlowTitle("");
     setFlowOutline("");
+  };
+
+  const createBlankFlow = () => {
+    const baseTitle = "새 워크플로우";
+    const existingTitles = new Set(taskFlows.map((flow) => flow.title));
+    let title = baseTitle;
+    let suffix = 2;
+    while (existingTitles.has(title)) {
+      title = `${baseTitle} ${suffix}`;
+      suffix += 1;
+    }
+    onCreateTaskFlow({ title, autoStart: false, steps: [] });
+    onNavigate("workflow");
+  };
+
+  const beginFlowEdit = (initialStepClientId?: string) => {
+    if (!selectedFlowId || !selectedFlowCanEdit) return;
+    setFlowEditingId(selectedFlowId);
+    const nextSteps = selectedFlowSteps.map(createEditableStep);
+    setFlowEditTitle(selectedOrFirstFlow?.flow.title ?? "");
+    setFlowEditSteps(nextSteps);
+    setSelectedFlowEditStepId(
+      initialStepClientId && nextSteps.some((step) => step.clientId === initialStepClientId)
+        ? initialStepClientId
+        : nextSteps[0]?.clientId ?? null,
+    );
+  };
+
+  useEffect(() => {
+    if (!pendingFlowEditId || selectedFlowId !== pendingFlowEditId || !selectedFlowDetailLoaded) {
+      return;
+    }
+    if (selectedFlowCanEdit) {
+      beginFlowEdit();
+    }
+    setPendingFlowEditId(null);
+  }, [
+    pendingFlowEditId,
+    selectedFlowCanEdit,
+    selectedFlowDetailLoaded,
+    selectedFlowId,
+    selectedFlowSteps,
+    selectedOrFirstFlow?.flow.title,
+  ]);
+
+  const resetFlowEdit = () => {
+    setFlowEditingId(null);
+    setFlowEditTitle("");
+    setFlowEditSteps([]);
+    setSelectedFlowEditStepId(null);
+    setDraggingStepIndex(null);
+  };
+
+  const addFlowEditStep = () => {
+    if (flowEditSteps.length >= MAX_FLOW_STEPS) {
+      return;
+    }
+    const nextStep = createBlankEditableStep(flowEditSteps.length);
+    setFlowEditSteps((current) => [...current, nextStep]);
+    setSelectedFlowEditStepId(nextStep.clientId);
+  };
+
+  const updateFlowEditStep = (
+    index: number,
+    field: keyof TaskFlowStepDraft,
+    value: string,
+  ) => {
+    setFlowEditSteps((current) =>
+      current.map((step, stepIndex) =>
+        stepIndex === index
+          ? {
+              ...step,
+              [field]: value,
+            }
+          : step,
+      ),
+    );
+  };
+
+  const deleteFlowEditStep = (index: number) => {
+    const next = flowEditSteps.filter((_, stepIndex) => stepIndex !== index);
+    setFlowEditSteps(next);
+    setSelectedFlowEditStepId((current) => {
+      if (current && next.some((step) => step.clientId === current)) {
+        return current;
+      }
+      return next[Math.min(index, next.length - 1)]?.clientId ?? null;
+    });
+  };
+
+  const moveFlowEditStep = (fromIndex: number, toIndex: number) => {
+    setFlowEditSteps((current) => moveItem(current, fromIndex, toIndex));
+  };
+
+  const saveFlowEdit = () => {
+    if (!selectedFlowId || !isEditingSelectedFlow) return;
+    const steps = flowEditSteps.map(draftStepForSave);
+    if (validateFlowDraft(flowEditTitle, flowEditSteps).length > 0) return;
+    onSaveTaskFlowSteps(selectedFlowId, steps, flowEditTitle.trim());
+    resetFlowEdit();
+  };
+
+  const requestDeleteFlow = (flow: TaskFlowRecord) => {
+    if (flow.status === "running") return;
+    if (window.confirm(`Flow "${flow.title}"를 삭제할까요? 이 작업은 되돌릴 수 없습니다.`)) {
+      onDeleteTaskFlow(flow.id);
+    }
+  };
+
+  const requestEditFlow = (flow: TaskFlowRecord) => {
+    if (flow.status !== "queued") {
+      return;
+    }
+    if (selectedFlowId === flow.id && selectedFlowCanEdit) {
+      beginFlowEdit();
+      return;
+    }
+    setPendingFlowEditId(flow.id);
+    onSelectTaskFlow(flow.id);
   };
 
   const createDefaultResearchFlow = () => {
@@ -398,32 +687,6 @@ export function CockpitSectionView({
     });
   };
 
-  const createWorkspaceFileFromForm = () => {
-    const path = workspaceFilePath.trim();
-    if (!path) return;
-    onCreateWorkspaceFile({
-      scope: writableScope,
-      path,
-      content: workspaceFileContent,
-    });
-  };
-
-  const createWorkspaceFolderFromForm = () => {
-    const path = workspaceFolderPath.trim();
-    if (!path) return;
-    onCreateWorkspaceFolder({
-      scope: writableScope,
-      path,
-    });
-  };
-
-  const prepareResearchWorkspace = () => {
-    onCreateWorkspaceFolder({
-      scope: writableScope,
-      path: "research",
-    });
-  };
-
   const scrollToPanel = (id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
@@ -449,14 +712,30 @@ export function CockpitSectionView({
       <section className="cockpit-command-strip" aria-label="탭 빠른 작업">
         {target === "workflow" ? (
           <>
-            <button onClick={() => scrollToPanel("flow-create-panel")} type="button">Flow 작성</button>
+            <button onClick={createBlankFlow} type="button">빈 Flow 만들기</button>
             <button onClick={createDefaultResearchFlow} type="button">항공 연구 템플릿</button>
             <button onClick={() => selectedOrFirstFlow && onSelectTaskFlow(selectedOrFirstFlow.flow.id)} disabled={!selectedOrFirstFlow} type="button">
               선택 Flow 새로고침
             </button>
             <button onClick={() => onNavigate("chat")} type="button">채팅으로 실행 요청</button>
-            <button onClick={() => onNavigate("files")} type="button">산출 파일 보기</button>
-            <button onClick={() => onNavigate("mcp")} type="button">외부 도구 연결</button>
+            <button onClick={() => onNavigate("chat")} type="button">opencode 파일 점검 요청</button>
+            <button onClick={onOpenProviderSettings} type="button">opencode 설정</button>
+          </>
+        ) : null}
+        {target === "computer" ? (
+          <>
+            <button onClick={onToggleComputerUseEnabled} type="button">
+              {computerUseSettings?.enabled ? "Computer Use 끄기" : "Computer Use 켜기"}
+            </button>
+            <button onClick={onCreateComputerUseSession} type="button" disabled={!computerUseSettings?.enabled}>
+              브라우저 세션 시작
+            </button>
+            <button onClick={onScreenshotComputerUseSession} type="button" disabled={!computerUseDetail}>
+              스크린샷
+            </button>
+            <button onClick={onCloseComputerUseSession} type="button" disabled={!computerUseDetail}>
+              닫기
+            </button>
           </>
         ) : null}
         {target === "mcp" ? (
@@ -482,18 +761,45 @@ export function CockpitSectionView({
           <>
             <button aria-pressed={scope === "sandbox"} onClick={() => onScopeChange("sandbox")} type="button">세션 파일</button>
             <button aria-pressed={scope === "shared"} onClick={() => onScopeChange("shared")} type="button">공유 파일</button>
-            <button onClick={() => scrollToPanel("workspace-file-create-panel")} type="button">새 파일</button>
-            <button onClick={() => scrollToPanel("workspace-folder-create-panel")} type="button">새 폴더</button>
-            <button onClick={prepareResearchWorkspace} type="button">Research 폴더 준비</button>
             <button onClick={onRefreshFiles} type="button">파일 새로고침</button>
             <button onClick={() => onNavigate("chat")} type="button">채팅에서 파일 생성 요청</button>
           </>
         ) : null}
       </section>
 
+      {target === "computer" ? (
+        <ComputerUsePanel
+          allowlistDraft={computerUseAllowlistDraft}
+          clickSelector={computerUseClickSelector}
+          detail={computerUseDetail}
+          error={computerUseError}
+          loading={computerUseLoading}
+          navigationUrl={computerUseNavigationUrl}
+          settings={computerUseSettings}
+          onAllowlistDraftChange={onComputerUseAllowlistDraftChange}
+          onApprove={onApproveComputerUseAction}
+          onClick={onClickComputerUseSession}
+          onCloseSession={onCloseComputerUseSession}
+          onCreateSession={onCreateComputerUseSession}
+          onDeny={onDenyComputerUseAction}
+          onNavigate={onNavigateComputerUseSession}
+          onRiskyClick={onRiskyClickComputerUseSession}
+          onSensitiveType={onSensitiveTypeComputerUseSession}
+          onClickSelectorChange={onComputerUseClickSelectorChange}
+          onNavigationUrlChange={onComputerUseNavigationUrlChange}
+          onSaveSettings={onSaveComputerUseSettings}
+          onScreenshot={onScreenshotComputerUseSession}
+          onToggleEnabled={onToggleComputerUseEnabled}
+        />
+      ) : null}
+
       {target === "workflow" ? (
         <div className="cockpit-section-grid cockpit-section-grid--workflow">
           <section className="cockpit-section-card cockpit-section-card--wide">
+            <p className="cockpit-muted">
+              OpenCode is the only execution path. Use Chat for file inspection or edits; workflow keeps run and task
+              timelines without separate Files, MCP, Skills, or Computer Use workspaces.
+            </p>
             <div className="cockpit-section-card__header">
               <div>
                 <p className="cockpit-eyebrow">선택된 Flow</p>
@@ -513,11 +819,48 @@ export function CockpitSectionView({
                   >
                     상세 불러오기
                   </button>
-                  {selectedOrFirstFlow.flow.status === "queued" || selectedOrFirstFlow.flow.status === "running" ? (
+                  {!isEditingSelectedFlow ? (
+                    <button
+                      aria-label="선택 Flow 수정"
+                      className="cockpit-mini-button"
+                      disabled={!selectedFlowCanEdit}
+                      onClick={() => beginFlowEdit()}
+                      type="button"
+                    >
+                      수정
+                    </button>
+                  ) : null}
+                  {isEditingSelectedFlow ? (
                     <>
                       <button
                         className="cockpit-mini-button"
+                        disabled={flowEditSteps.length >= MAX_FLOW_STEPS}
+                        onClick={addFlowEditStep}
+                        type="button"
+                      >
+                        단계 추가
+                      </button>
+                      <button
+                        className="cockpit-mini-button"
+                        disabled={!canSaveFlowEdit}
+                        onClick={saveFlowEdit}
+                        type="button"
+                      >
+                        변경 저장
+                      </button>
+                      <button className="cockpit-mini-button" onClick={resetFlowEdit} type="button">
+                        되돌리기
+                      </button>
+                    </>
+                  ) : null}
+                  {!isEditingSelectedFlow &&
+                  (selectedOrFirstFlow.flow.status === "queued" || selectedOrFirstFlow.flow.status === "running") ? (
+                    <>
+                      <button
+                        className="cockpit-mini-button"
+                        disabled={!selectedFlowCanStart}
                         onClick={() => onStartTaskFlow(selectedOrFirstFlow.flow.id)}
+                        title={!selectedFlowCanStart ? "단계를 1개 이상 추가해야 실행할 수 있습니다." : undefined}
                         type="button"
                       >
                         시작/평가
@@ -531,7 +874,18 @@ export function CockpitSectionView({
                       </button>
                     </>
                   ) : null}
-                  {selectedOrFirstFlow.flow.status === "failed" || selectedOrFirstFlow.flow.status === "cancelled" ? (
+                  {!isEditingSelectedFlow ? (
+                    <button
+                      className="cockpit-mini-button cockpit-mini-button--danger"
+                      disabled={selectedOrFirstFlow.flow.status === "running"}
+                      onClick={() => requestDeleteFlow(selectedOrFirstFlow.flow)}
+                      type="button"
+                    >
+                      Flow 삭제
+                    </button>
+                  ) : null}
+                  {!isEditingSelectedFlow &&
+                  (selectedOrFirstFlow.flow.status === "failed" || selectedOrFirstFlow.flow.status === "cancelled") ? (
                     <button
                       className="cockpit-mini-button"
                       onClick={() => onResumeTaskFlow(selectedOrFirstFlow.flow.id)}
@@ -547,49 +901,226 @@ export function CockpitSectionView({
                 </button>
               )}
             </div>
-            <div className="cockpit-step-stack cockpit-step-stack--section">
-              {(selectedOrFirstFlow?.steps.length ? selectedOrFirstFlow.steps : []).map((step, index) => (
-                <article className={`cockpit-step cockpit-step--${statusTone(step.status)}`} key={step.id}>
-                  <span className="cockpit-step__index">{index + 1}</span>
-                  <div>
-                    <strong>{step.title}</strong>
-                    <small>
-                      {step.stepKey}
-                      {step.task?.runId ? ` / run ${step.task.runId.slice(0, 8)}` : ""}
-                    </small>
-                  </div>
-                  <span className="cockpit-step__badge">{statusLabel(step.status)}</span>
-                  <div className="cockpit-step__actions">
-                    <button
-                      className="cockpit-mini-button"
-                      onClick={() => onRetryTaskFlowStep(selectedOrFirstFlow!.flow.id, step.id)}
-                      type="button"
-                    >
-                      재시도
-                    </button>
-                    {step.status !== "completed" && step.status !== "skipped" ? (
-                      <button
-                        className="cockpit-mini-button"
-                        onClick={() => onSkipTaskFlowStep(selectedOrFirstFlow!.flow.id, step.id)}
-                        type="button"
+            {selectedOrFirstFlow ? (
+              <p className={`cockpit-edit-hint ${selectedFlowCanEdit ? "is-ready" : "is-blocked"}`}>
+                {isEditingSelectedFlow
+                  ? "편집 중입니다. 드래그하거나 위/아래 버튼으로 단계 순서를 바꾼 뒤 변경 저장을 누르세요."
+                  : editBlockReason}
+              </p>
+            ) : null}
+            {isEditingSelectedFlow ? (
+              <div className="cockpit-flow-editor">
+                <div className="cockpit-flow-editor__steps">
+                  <label className="cockpit-field">
+                    <span>Flow 제목</span>
+                    <input
+                      aria-label="Flow 제목"
+                      onChange={(event) => setFlowEditTitle(event.target.value)}
+                      value={flowEditTitle}
+                    />
+                  </label>
+                  <div className="cockpit-step-stack cockpit-step-stack--section">
+                    {flowEditSteps.map((step, index) => (
+                      <article
+                        className={`cockpit-step cockpit-step--draft ${
+                          selectedFlowEditStepId === step.clientId ? "is-selected" : ""
+                        } ${draggingStepIndex === index ? "is-dragging" : ""}`}
+                        draggable
+                        key={step.clientId}
+                        onDragEnd={() => setDraggingStepIndex(null)}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDragStart={(event) => {
+                          setDraggingStepIndex(index);
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", step.clientId);
+                        }}
+                        onDrop={(event) => {
+                          event.preventDefault();
+                          if (draggingStepIndex !== null) {
+                            moveFlowEditStep(draggingStepIndex, index);
+                          }
+                          setDraggingStepIndex(null);
+                        }}
                       >
-                        건너뜀
-                      </button>
+                        <button
+                          className="cockpit-step__select"
+                          onClick={() => setSelectedFlowEditStepId(step.clientId)}
+                          type="button"
+                        >
+                          <span className="cockpit-step__index">{index + 1}</span>
+                          <span>
+                            <strong>{step.title.trim() || `Step ${index + 1}`}</strong>
+                            <small>{step.stepKey.trim() || `step-${index + 1}`}</small>
+                          </span>
+                        </button>
+                        <div className="cockpit-step__actions">
+                          <button
+                            className="cockpit-mini-button"
+                            onClick={() => setSelectedFlowEditStepId(step.clientId)}
+                            type="button"
+                          >
+                            수정
+                          </button>
+                          <button
+                            className="cockpit-mini-button"
+                            disabled={index === 0}
+                            onClick={() => moveFlowEditStep(index, index - 1)}
+                            type="button"
+                          >
+                            위
+                          </button>
+                          <button
+                            className="cockpit-mini-button"
+                            disabled={index === flowEditSteps.length - 1}
+                            onClick={() => moveFlowEditStep(index, index + 1)}
+                            type="button"
+                          >
+                            아래
+                          </button>
+                          <button
+                            className="cockpit-mini-button cockpit-mini-button--danger"
+                            onClick={() => deleteFlowEditStep(index)}
+                            type="button"
+                          >
+                            삭제
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                    {!flowEditSteps.length ? (
+                      <div className="cockpit-empty cockpit-empty--action">
+                        <strong>빈 워크플로우입니다.</strong>
+                        <span>단계 추가를 눌러 첫 번째 작업 단계를 작성하세요.</span>
+                        <button className="cockpit-mini-button" onClick={addFlowEditStep} type="button">
+                          단계 추가
+                        </button>
+                      </div>
                     ) : null}
                   </div>
-                </article>
-              ))}
-              {selectedOrFirstFlow && !selectedOrFirstFlow.steps.length ? (
-                <p className="cockpit-empty">상세 불러오기를 누르면 step, task, run 연결 정보가 표시됩니다.</p>
-              ) : null}
-            </div>
+                </div>
+                <aside className="cockpit-step-editor-panel">
+                  <div className="cockpit-inline-form__header">
+                    <strong>선택 단계 수정</strong>
+                    <span>{selectedFlowEditStep ? `${selectedFlowEditStepIndex + 1}번 단계` : "선택된 단계 없음"}</span>
+                  </div>
+                  {selectedFlowEditStep ? (
+                    <>
+                      <label className="cockpit-field">
+                        <span>Step Key</span>
+                        <input
+                          aria-label="선택 단계 Step Key"
+                          onChange={(event) =>
+                            updateFlowEditStep(selectedFlowEditStepIndex, "stepKey", event.target.value)
+                          }
+                          value={selectedFlowEditStep.stepKey}
+                        />
+                      </label>
+                      <label className="cockpit-field">
+                        <span>제목</span>
+                        <input
+                          aria-label="선택 단계 제목"
+                          onChange={(event) =>
+                            updateFlowEditStep(selectedFlowEditStepIndex, "title", event.target.value)
+                          }
+                          value={selectedFlowEditStep.title}
+                        />
+                      </label>
+                      <label className="cockpit-field">
+                        <span>프롬프트</span>
+                        <textarea
+                          aria-label="선택 단계 프롬프트"
+                          onChange={(event) =>
+                            updateFlowEditStep(selectedFlowEditStepIndex, "prompt", event.target.value)
+                          }
+                          rows={8}
+                          value={selectedFlowEditStep.prompt}
+                        />
+                      </label>
+                    </>
+                  ) : (
+                    <p className="cockpit-empty">왼쪽에서 단계를 선택하거나 새 단계를 추가하세요.</p>
+                  )}
+                  {flowEditValidationErrors.length ? (
+                    <div className="cockpit-validation-list" role="alert">
+                      {flowEditValidationErrors.slice(0, 4).map((error) => (
+                        <span key={error}>{error}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="cockpit-muted">빈 단계 없이 저장하면 실행 가능한 Flow가 됩니다. 단계가 0개인 Flow는 초안으로 남습니다.</p>
+                  )}
+                </aside>
+              </div>
+            ) : (
+              <div className="cockpit-step-stack cockpit-step-stack--section">
+                {(selectedOrFirstFlow?.steps.length ? selectedOrFirstFlow.steps : []).map((step, index) => (
+                  <article className={`cockpit-step cockpit-step--${statusTone(step.status)}`} key={step.id}>
+                    <span className="cockpit-step__index">{index + 1}</span>
+                    <div>
+                      <strong>{step.title}</strong>
+                      <small>
+                        {step.stepKey}
+                        {step.task?.runId ? ` / run ${step.task.runId.slice(0, 8)}` : ""}
+                      </small>
+                    </div>
+                    <span className="cockpit-step__badge">{statusLabel(step.status)}</span>
+                    <div className="cockpit-step__actions">
+                      {selectedFlowCanEdit ? (
+                        <button
+                          className="cockpit-mini-button"
+                          onClick={() => {
+                            beginFlowEdit(step.id);
+                          }}
+                          type="button"
+                        >
+                          수정
+                        </button>
+                      ) : null}
+                      <button
+                        className="cockpit-mini-button"
+                        onClick={() => onRetryTaskFlowStep(selectedOrFirstFlow!.flow.id, step.id)}
+                        type="button"
+                      >
+                        재시도
+                      </button>
+                      {step.status !== "completed" && step.status !== "skipped" ? (
+                        <button
+                          className="cockpit-mini-button"
+                          onClick={() => onSkipTaskFlowStep(selectedOrFirstFlow!.flow.id, step.id)}
+                          type="button"
+                        >
+                          건너뜀
+                        </button>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+                {selectedOrFirstFlow && !selectedOrFirstFlow.steps.length ? (
+                  <div className="cockpit-empty cockpit-empty--action">
+                    <strong>빈 워크플로우 공간입니다.</strong>
+                    <span>수정을 누른 뒤 단계 추가로 작업 흐름을 하나씩 작성하세요.</span>
+                    <button
+                      className="cockpit-mini-button"
+                      disabled={!selectedFlowCanEdit}
+                      onClick={() => beginFlowEdit()}
+                      type="button"
+                    >
+                      단계 작성 시작
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            )}
           </section>
 
           <section className="cockpit-section-card">
             <div className="cockpit-section-card__header">
-              <h2>Flow 생성</h2>
-              <span className="cockpit-pill">최대 8단계</span>
+              <h2>Outline으로 빠르게 만들기</h2>
+              <span className="cockpit-pill">보조 생성</span>
             </div>
+            <p className="cockpit-muted">
+              빈 Flow를 직접 작성하지 않고, 번호 목록이나 줄 단위 outline을 한 번에 단계로 변환할 때 사용합니다.
+            </p>
             <label className="cockpit-field">
               <span>제목</span>
               <input
@@ -621,7 +1152,7 @@ export function CockpitSectionView({
                 onClick={createFlowFromEditor}
                 type="button"
               >
-                Flow 생성
+                Outline으로 Flow 생성
               </button>
               <button className="cockpit-mini-button" onClick={createDefaultResearchFlow} type="button">
                 항공 연구 템플릿
@@ -637,10 +1168,34 @@ export function CockpitSectionView({
             <div className="cockpit-compact-list">
               {taskFlows.length ? (
                 taskFlows.slice(0, 8).map((flow) => (
-                  <article key={flow.id}>
-                    <button onClick={() => onSelectTaskFlow(flow.id)} type="button">
+                  <article className="cockpit-flow-list-item" key={flow.id}>
+                    <button
+                      className="cockpit-flow-list-item__main"
+                      onClick={() => onSelectTaskFlow(flow.id)}
+                      type="button"
+                    >
                       <strong>{flow.title}</strong>
                       <span>{statusLabel(flow.status)} / {formatTime(flow.updatedAt)}</span>
+                    </button>
+                    <button
+                      aria-label={`${flow.title} 수정`}
+                      className="cockpit-mini-button cockpit-flow-list-item__edit"
+                      disabled={flow.status !== "queued"}
+                      onClick={() => requestEditFlow(flow)}
+                      title={flow.status !== "queued" ? "대기 상태 Flow만 수정할 수 있습니다." : "Flow 수정"}
+                      type="button"
+                    >
+                      수정
+                    </button>
+                    <button
+                      aria-label={`${flow.title} 삭제`}
+                      className="cockpit-mini-button cockpit-mini-button--danger cockpit-flow-list-item__delete"
+                      disabled={flow.status === "running"}
+                      onClick={() => requestDeleteFlow(flow)}
+                      title={flow.status === "running" ? "실행 중인 Flow는 삭제할 수 없습니다." : "Flow 삭제"}
+                      type="button"
+                    >
+                      삭제
                     </button>
                   </article>
                 ))
@@ -945,67 +1500,19 @@ export function CockpitSectionView({
             </div>
             <div className="cockpit-inline-form" id="workspace-file-create-panel">
               <div className="cockpit-inline-form__header">
-                <strong>새 파일 만들기</strong>
-                <span>현재 선택된 {writableScope === "sandbox" ? "세션 샌드박스" : "공유 자료실"}에 UTF-8 텍스트 파일을 만듭니다.</span>
+                <strong>opencode 파일 작업 안내</strong>
+                <span>
+                  직접 파일 생성/수정 API는 opencode-only 모드에서 비활성화되어 있습니다. 채팅이나 워크플로우로 파일
+                  작업을 요청하면 opencode가 세션 워크스페이스에서 실행하고, 변경 파일은 실행 로그에 기록됩니다.
+                </span>
               </div>
-              <label className="cockpit-field">
-                <span>파일 경로</span>
-                <input
-                  onChange={(event) => setWorkspaceFilePath(event.target.value)}
-                  placeholder="예: notes.md 또는 research/summary.md"
-                  value={workspaceFilePath}
-                />
-              </label>
-              <label className="cockpit-field">
-                <span>초기 내용</span>
-                <textarea
-                  onChange={(event) => setWorkspaceFileContent(event.target.value)}
-                  placeholder="# Notes"
-                  rows={5}
-                  value={workspaceFileContent}
-                />
-              </label>
               <div className="cockpit-section-actions">
-                <button
-                  className="cockpit-mini-button"
-                  disabled={!workspaceFilePath.trim()}
-                  onClick={createWorkspaceFileFromForm}
-                  type="button"
-                >
-                  파일 만들기
-                </button>
                 <button className="cockpit-mini-button" onClick={() => onNavigate("chat")} type="button">
-                  에이전트에게 작성 요청
+                  채팅에서 파일 작업 요청
                 </button>
-              </div>
-            </div>
-            <div className="cockpit-inline-form cockpit-inline-form--compact" id="workspace-folder-create-panel">
-              <div className="cockpit-inline-form__header">
-                <strong>새 폴더 만들기</strong>
-                <span>작업 산출물을 정리할 폴더를 먼저 준비할 수 있습니다.</span>
-              </div>
-              <div className="cockpit-form-grid">
-                <label className="cockpit-field">
-                  <span>폴더 경로</span>
-                  <input
-                    onChange={(event) => setWorkspaceFolderPath(event.target.value)}
-                    placeholder="예: research 또는 outputs/cad"
-                    value={workspaceFolderPath}
-                  />
-                </label>
-                <div className="cockpit-section-actions cockpit-section-actions--align-end">
-                  <button
-                    className="cockpit-mini-button"
-                    disabled={!workspaceFolderPath.trim()}
-                    onClick={createWorkspaceFolderFromForm}
-                    type="button"
-                  >
-                    폴더 만들기
-                  </button>
-                  <button className="cockpit-mini-button" onClick={prepareResearchWorkspace} type="button">
-                    Research 폴더 준비
-                  </button>
-                </div>
+                <button className="cockpit-mini-button" onClick={onRefreshFiles} type="button">
+                  실행 로그 새로고침
+                </button>
               </div>
             </div>
             <div className="cockpit-file-browser">

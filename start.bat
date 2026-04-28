@@ -10,8 +10,8 @@ set "DEV_WEB_PORT=5173"
 set "API_URL=http://%APP_HOST%:%API_PORT%"
 set "WEB_URL=%API_URL%"
 
-echo [Unified Agent] Starting local single-server stack...
-echo [Unified Agent] Root: %CD%
+echo [AetherOps] Starting local single-server stack...
+echo [AetherOps] Root: %CD%
 
 call :find_package_manager
 if errorlevel 1 exit /b %errorlevel%
@@ -53,8 +53,8 @@ if errorlevel 1 (
   exit /b %errorlevel%
 )
 
-echo [INFO] Launching Unified Agent server on %API_URL% ...
-start "Unified Agent Server" /D "%CD%" "%ComSpec%" /c set "PORT=%API_PORT%" ^&^& call "%PM_CMD%" exec -- tsx server/index.ts
+echo [INFO] Launching AetherOps server on %API_URL% ...
+start "AetherOps Server" /D "%CD%" "%ComSpec%" /c set "PORT=%API_PORT%" ^&^& call "%PM_CMD%" exec -- tsx server/index.ts
 
 call :wait_for_url "%API_URL%/api/providers" "API server"
 if errorlevel 1 exit /b %errorlevel%
@@ -66,11 +66,11 @@ echo [INFO] Opening browser: %WEB_URL%
 start "" "%WEB_URL%"
 
 echo.
-echo [OK] Unified Agent is running.
+echo [OK] AetherOps is running.
 echo      API: %API_URL%
 echo      UI : %WEB_URL%
 echo.
-echo Close the "Unified Agent Server" window to stop the app.
+echo Close the "AetherOps Server" window to stop the app.
 echo This launcher window will close automatically.
 exit /b 0
 
@@ -125,7 +125,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$isThisProject=$cmd -like ('*' + $root + '*');" ^
   "$isKnownDev=$cmd -like '*server/index.ts*' -or $cmd -like '*vite*5173*' -or $cmd -like '*dist/server/index.js*';" ^
   "if($isThisProject -or $isKnownDev){" ^
-  "  Write-Host ('[INFO] Stopping previous Unified Agent process on port %CHECK_PORT%: PID ' + $ownerPid);" ^
+  "  Write-Host ('[INFO] Stopping previous AetherOps process on port %CHECK_PORT%: PID ' + $ownerPid);" ^
   "  Stop-Process -Id $ownerPid -Force;" ^
   "  Start-Sleep -Milliseconds 800;" ^
   "  exit 0" ^

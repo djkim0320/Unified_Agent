@@ -1,6 +1,6 @@
 # Agent Operator Guide
 
-Detailed working guide for AI agents contributing to `Unified_Agent`.
+Detailed working guide for AI agents contributing to `AetherOps`.
 
 If you need task-by-task routing, use [`agent-change-playbook.md`](agent-change-playbook.md) after this file.
 
@@ -44,6 +44,18 @@ The stable mental model is:
 
 `agent -> session(conversation) -> run -> task`
 
+## 2.2 Workspace Engine
+
+AetherOps is the local control plane. It owns sessions, persistence, task flows, heartbeats, approvals, memory, and run/audit events. Actual workspace execution is routed through an `AgentEngine` abstraction.
+
+- Runtime engine: `OpenCodeEngine`, backed by the official `opencode` CLI through the embedded `opencode-ai` package.
+- Tests use an opencode-shaped deterministic command harness so coverage still exercises the same engine boundary without requiring a local opencode install.
+- Engine selection flags are no longer used; the old provider/tool fallback path has been removed from gateway wiring.
+- Launcher resolution prefers `OPENCODE_BIN` when explicitly set, then the project-local `node_modules/opencode-ai/bin/opencode` launcher, then a global `opencode` command.
+- Status and operations: `GET /api/engine/status`, `POST /api/engine/opencode/refresh-models`, `GET /api/engine/runs/:runId`.
+
+The opencode engine always runs inside the active conversation sandbox and uses an allowlisted process environment. It records command metadata, JSON event summaries, external session ids when available, changed files, and exit state into workspace run events.
+
 ## 2.1 Source Of Truth
 
 Do not guess where data lives. The main sources of truth are:
@@ -83,7 +95,9 @@ This is the main place to inspect when behavior spans providers, tasks, memory, 
 
 ### Runtime
 
-[`server/lib/agent-runtime.ts`](../server/lib/agent-runtime.ts) is the core execution loop:
+[`server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts) now calls the configured `AgentEngine` for foreground chat, detached tasks, heartbeats, task-flow steps, and sub-agents.
+
+The old provider/tool loop remains in [`server/lib/agent-runtime.ts`](../server/lib/agent-runtime.ts) only as isolated reference/test coverage. It is not wired into chat, tasks, flows, heartbeat, or sub-agent execution:
 
 1. create run
 2. plan tool step
@@ -102,8 +116,8 @@ For foreground chat, the path is:
 
 1. `POST /api/chat/stream` in [`../server/app.ts`](../server/app.ts)
 2. `gateway.runForegroundTurn(...)`
-3. `runAgentTurn(...)`
-4. tool registry + plugin skill guidance + memory context
+3. configured `AgentEngine.runTurn(...)`
+4. opencode CLI workspace execution with plugin skill guidance and memory context embedded into the engine prompt
 5. run event persistence
 6. SSE back to the client
 
@@ -113,10 +127,21 @@ For detached tasks, the path is:
 2. task record creation
 3. `taskManager.runTask(...)`
 4. `executeDetachedTask(...)` in [`../server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts)
-5. `runAgentTurn(...)`
+5. `AgentEngine.runTurn(...)`
 6. assistant result appended back into the session
 
 ### Tools
+
+### Computer Use
+
+Computer Use is implemented as an opt-in controlled browser harness. It is intentionally not unrestricted OS desktop automation.
+
+- Settings and observability live under `/api/computer-use/*`.
+- The default policy allows localhost/127.0.0.1 and blocks arbitrary external domains unless allowlisted.
+- Sensitive typing, destructive clicks, submission-like actions, uploads/downloads, and allowlisted external navigation require approval records.
+- Screenshots are private artifacts under `workspace/computer-use-artifacts/`; they are not served as public static files.
+- Agent planner access is gated: `computer.browser.*` tools are hidden unless Computer Use is enabled.
+- Provider-native OpenAI computer tool integration is reserved behind the capability field `computerUseMode`; the current working path is `custom-browser-harness`.
 
 Typed tools are registered via:
 

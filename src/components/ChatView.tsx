@@ -87,7 +87,7 @@ export function ChatView(props: ChatViewProps) {
                 </>
               ) : (
                 <div className="chat-response">
-                  <p className="chat-response__label">통합 에이전트</p>
+                  <p className="chat-response__label">AetherOps</p>
                   <div className="chat-response__body">
                     {renderMessageBody(message.content)}
                     {message.id === lastAssistantMessageId && props.changedFiles.length ? (
@@ -109,7 +109,7 @@ export function ChatView(props: ChatViewProps) {
           {showPlanPreview ? (
             <article className="chat-entry chat-entry--assistant cockpit-inline-plan">
               <div className="chat-response">
-                <p className="chat-response__label">통합 에이전트 · 실행 계획 미리보기</p>
+                <p className="chat-response__label">AetherOps · 실행 계획 미리보기</p>
                 <div className="chat-response__body">
                   <p>요청을 장기 작업 흐름으로 분해할 준비가 되어 있습니다. 실행하면 아래 단계가 추적 패널에 연결됩니다.</p>
                   <div className="cockpit-inline-plan__steps">
@@ -129,7 +129,7 @@ export function ChatView(props: ChatViewProps) {
           {props.pendingAssistantText ? (
             <article className="chat-entry chat-entry--assistant">
               <div className="chat-response is-pending">
-                <p className="chat-response__label">통합 에이전트</p>
+                <p className="chat-response__label">AetherOps</p>
                 <div className="chat-response__body">{renderMessageBody(props.pendingAssistantText)}</div>
               </div>
             </article>
@@ -138,7 +138,7 @@ export function ChatView(props: ChatViewProps) {
           {props.loading && !props.pendingAssistantText ? (
             <article className="chat-entry chat-entry--assistant">
               <div className="chat-response is-pending">
-                <p className="chat-response__label">통합 에이전트</p>
+                <p className="chat-response__label">AetherOps</p>
                 <div className="chat-response__body">
                   <p>응답을 준비하고 있습니다...</p>
                 </div>

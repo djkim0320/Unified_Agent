@@ -227,6 +227,7 @@ function createTaskStore() {
         flowId: string;
         stepKey: string;
         dependencyStepKey?: string | null;
+        position?: number;
         title: string;
         prompt: string;
       }) {
@@ -238,6 +239,7 @@ function createTaskStore() {
           taskId: null,
           stepKey: input.stepKey,
           dependencyStepKey: input.dependencyStepKey ?? null,
+          position: input.position ?? flowStepSequence - 1,
           title: input.title,
           prompt: input.prompt,
           status: "queued",
@@ -254,7 +256,7 @@ function createTaskStore() {
       listTaskFlowSteps(flowId: string) {
         return [...flowSteps.values()]
           .filter((step) => step.flowId === flowId)
-          .sort((left, right) => left.createdAt - right.createdAt);
+          .sort((left, right) => left.position - right.position || left.createdAt - right.createdAt);
       },
       transitionTaskFlowStep(input: {
         stepId: string;

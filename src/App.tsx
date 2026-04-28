@@ -6,19 +6,14 @@ import {
   createAgentTask,
   cancelSubagentSession,
   cancelTaskFlow,
-  createAgentSkill,
   createSubagentSession,
   createTaskFlow,
-  createMcpServerProfile,
-  createWorkspaceFile,
-  createWorkspaceFolder,
+  deleteTaskFlow,
   getAgentStandingOrders,
-  getAgentMemory,
   getAgentHeartbeat,
   getAgentSoul,
+  getEngineStatus,
   getConversationMessages,
-  getWorkspaceFile,
-  getWorkspaceTree,
   importCodexCliAuth,
   listAgentTasks,
   listAgents,
@@ -35,17 +30,19 @@ import {
   logoutCodex,
   resumeTaskFlow,
   retryTaskFlowStep,
+  refreshOpenCodeModels,
   saveAgentStandingOrders,
   saveAgent,
   saveAgentHeartbeat,
   saveAgentSoul,
   saveConversation,
+  saveTaskFlowSteps,
   saveProviderAccount,
   startCodexOAuth,
+  startOpenCodeAuthLogin,
   skipTaskFlowStep,
   startTaskFlow,
   triggerAgentHeartbeat,
-  searchAgentMemory,
   getTaskFlow,
   streamChat,
   testProvider,
@@ -63,6 +60,7 @@ import { Composer } from "./components/Composer";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConversationList, type CockpitNavTarget } from "./components/ConversationList";
 import { ProviderSettingsDialog } from "./components/ProviderSettingsDialog";
+import { useComputerUse } from "./hooks/useComputerUse";
 import { getModelOption } from "./model-catalog";
 import { getReasoningLabel, normalizeReasoningLevel } from "./reasoning-options";
 import {
@@ -86,6 +84,7 @@ import {
   type StreamEventPayloadMap,
   type TaskEventRecord,
   type TaskFlowRecord,
+  type TaskFlowStepDraft,
   type TaskFlowStepDetail,
   type TaskRecord,
   type WorkspaceFileRecord,
@@ -93,53 +92,32 @@ import {
   type WorkspaceRunRecord,
   type WorkspaceScope,
   type WorkspaceTreeNode,
+  type EngineStatusRecord,
 } from "./types";
-
-function createEmptyDrafts(): Record<ProviderKind, ProviderDraft> {
-  return {
-    openai: { apiKey: "", baseUrl: "" },
-    anthropic: { apiKey: "", baseUrl: "" },
-    gemini: { apiKey: "", baseUrl: "" },
-    ollama: { apiKey: "", baseUrl: "http://127.0.0.1:11434" },
-    "openai-codex": { apiKey: "", baseUrl: "" },
-  };
-}
-
-function createModelMap() {
-  return {
-    openai: [defaultModels.openai],
-    anthropic: [defaultModels.anthropic],
-    gemini: [defaultModels.gemini],
-    ollama: [defaultModels.ollama],
-    "openai-codex": [defaultModels["openai-codex"]],
-  } satisfies Record<ProviderKind, string[]>;
-}
-
-function createLoadingMap(initialValue: boolean) {
-  return {
-    openai: initialValue,
-    anthropic: initialValue,
-    gemini: initialValue,
-    ollama: initialValue,
-    "openai-codex": initialValue,
-  } satisfies Record<ProviderKind, boolean>;
-}
-
-function createErrorMap(): Record<ProviderKind, string | null> {
-  return {
-    openai: null,
-    anthropic: null,
-    gemini: null,
-    ollama: null,
-    "openai-codex": null,
-  } satisfies Record<ProviderKind, string | null>;
-}
+import {
+  abortRef,
+  beginRequest,
+  createAgentHeartbeatDraft,
+  createAgentSoulDraft,
+  createEmptyDrafts,
+  createErrorMap,
+  createLiveEvent,
+  createLoadingMap,
+  createModelMap,
+  DEFAULT_NEW_CONVERSATION_TITLE,
+  displayAppNotice,
+  displayConversationTitle,
+  getOptimisticMessageId,
+  mergeConversationList,
+  mergeProviderDrafts,
+  pickConversationProvider,
+} from "./appStateUtils";
 
 function createAgentDraft(agent: AgentRecord | null): AgentDraft {
   const providerKind = agent?.providerKind ?? "openai";
   const model = agent?.model ?? defaultModels[providerKind];
   return {
-    name: agent?.name ?? "새 에이전트",
+    name: agent?.name ?? "기본 에이전트",
     providerKind,
     model,
     reasoningLevel: normalizeReasoningLevel(
@@ -150,103 +128,6 @@ function createAgentDraft(agent: AgentRecord | null): AgentDraft {
   };
 }
 
-function createAgentSoulDraft(soul: AgentSoulRecord | null): AgentSoulDraft {
-  return soul?.content ?? "";
-}
-
-function createAgentHeartbeatDraft(heartbeat: AgentHeartbeatRecord | null): AgentHeartbeatDraft {
-  return {
-    enabled: heartbeat?.enabled ?? false,
-    intervalMinutes: String(heartbeat?.intervalMinutes ?? 60),
-    instructions: heartbeat?.instructions ?? "",
-  };
-}
-
-function mergeConversationList(
-  conversations: ConversationRecord[],
-  conversation: ConversationRecord,
-) {
-  return [...conversations.filter((item) => item.id !== conversation.id), conversation].sort(
-    (left, right) => right.updatedAt - left.updatedAt,
-  );
-}
-
-function mergeProviderDrafts(
-  providers: ProviderSummary[],
-  currentDrafts: Record<ProviderKind, ProviderDraft>,
-) {
-  const nextDrafts = createEmptyDrafts();
-
-  for (const provider of providers) {
-    if (provider.kind === "ollama") {
-      const metadataBaseUrl =
-        typeof provider.metadata.baseUrl === "string" ? provider.metadata.baseUrl : "";
-      nextDrafts.ollama.baseUrl =
-        currentDrafts.ollama.baseUrl || metadataBaseUrl || "http://127.0.0.1:11434";
-      continue;
-    }
-
-    nextDrafts[provider.kind].apiKey = currentDrafts[provider.kind].apiKey;
-  }
-
-  return nextDrafts;
-}
-
-function getOptimisticMessageId() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return `temp-${Date.now()}`;
-}
-
-function isProviderEnabled(provider: ProviderSummary | null | undefined) {
-  return Boolean(provider && (provider.configured || provider.status !== "disconnected"));
-}
-
-function pickConversationProvider(
-  providers: ProviderSummary[],
-  preferredProviderKind?: ProviderKind,
-) {
-  if (preferredProviderKind) {
-    return preferredProviderKind;
-  }
-
-  const firstEnabled = providers.find((provider) => isProviderEnabled(provider));
-  return firstEnabled?.kind ?? "openai";
-}
-
-function createLiveEvent(
-  eventType: WorkspaceRunEventRecord["eventType"],
-  payload: Record<string, unknown>,
-) {
-  return {
-    id: `live-${Date.now()}-${Math.random()}`,
-    runId: "live",
-    eventType,
-    payload,
-    createdAt: Date.now(),
-  } satisfies WorkspaceRunEventRecord;
-}
-
-function abortRef(controllerRef: { current: AbortController | null }) {
-  controllerRef.current?.abort();
-  controllerRef.current = null;
-}
-
-function beginRequest(
-  seqRef: { current: number },
-  controllerRef: { current: AbortController | null },
-) {
-  abortRef(controllerRef);
-  const controller = new AbortController();
-  controllerRef.current = controller;
-  seqRef.current += 1;
-  return {
-    controller,
-    seq: seqRef.current,
-  };
-}
-
 export default function App() {
   const [activeSection, setActiveSection] = useState<"chat" | "workspace">("chat");
   const [activeNavTarget, setActiveNavTarget] = useState<CockpitNavTarget>("chat");
@@ -254,6 +135,8 @@ export default function App() {
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
   const [activeAgent, setActiveAgent] = useState<AgentRecord | null>(null);
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
+  const [engineStatus, setEngineStatus] = useState<EngineStatusRecord | null>(null);
+  const [engineStatusLoading, setEngineStatusLoading] = useState(false);
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [activeConversation, setActiveConversation] = useState<ConversationRecord | null>(null);
@@ -268,6 +151,29 @@ export default function App() {
   const [pendingAssistantText, setPendingAssistantText] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
+  const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const {
+    computerUseAllowlistDraft,
+    computerUseClickSelector,
+    computerUseDetail,
+    computerUseError,
+    computerUseLoading,
+    computerUseNavigationUrl,
+    computerUseSettings,
+    handleApproveComputerUseAction,
+    handleClickComputerUseSession,
+    handleCloseComputerUseSession,
+    handleCreateComputerUseSession,
+    handleDenyComputerUseAction,
+    handleNavigateComputerUseSession,
+    handleSaveComputerUseSettings,
+    handleScreenshotComputerUseSession,
+    handleSensitiveTypeComputerUseSession,
+    handleToggleComputerUseEnabled,
+    setComputerUseAllowlistDraft,
+    setComputerUseClickSelector,
+    setComputerUseNavigationUrl,
+  } = useComputerUse({ activeAgentId, activeConversationId });
   const [providerDrafts, setProviderDrafts] = useState<Record<ProviderKind, ProviderDraft>>(
     createEmptyDrafts(),
   );
@@ -393,6 +299,36 @@ export default function App() {
   }, [selectedTaskFlowId]);
 
   useEffect(() => {
+    if (typeof fetch !== "function") {
+      return;
+    }
+
+    let cancelled = false;
+    const checkBackendHealth = async () => {
+      try {
+        const response = await fetch("/api/health", { cache: "no-store" });
+        if (!cancelled) {
+          setBackendOnline(response.ok);
+        }
+      } catch {
+        if (!cancelled) {
+          setBackendOnline(false);
+        }
+      }
+    };
+
+    void checkBackendHealth();
+    const intervalId = window.setInterval(() => {
+      void checkBackendHealth();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!activeAgentId) {
       setSelectedTaskFlowId(null);
       setSelectedTaskFlow(null);
@@ -483,6 +419,20 @@ export default function App() {
     setProviderDrafts((currentDrafts) => mergeProviderDrafts(response.providers, currentDrafts));
   }
 
+  async function refreshEngineStatus() {
+    setEngineStatusLoading(true);
+    try {
+      const response = await getEngineStatus();
+      setEngineStatus(response);
+      return response;
+    } catch (error: any) {
+      setAppNotice(error instanceof Error ? error.message : "실행 엔진 상태를 불러오지 못했습니다.");
+      return null;
+    } finally {
+      setEngineStatusLoading(false);
+    }
+  }
+
   async function refreshAgents(preferredAgentId?: string | null) {
     const response = await listAgents();
     setAgents(response.agents);
@@ -544,7 +494,7 @@ export default function App() {
       providerKind,
       model,
       reasoningLevel,
-      title: "새 채팅",
+      title: DEFAULT_NEW_CONVERSATION_TITLE,
     });
 
     setConversations((current) => mergeConversationList(current, response.conversation));
@@ -588,34 +538,11 @@ export default function App() {
     }
   }
   async function refreshWorkspaceTree(conversationId: string, scope: WorkspaceScope) {
-    const request = beginRequest(workspaceTreeSeqRef, workspaceTreeControllerRef);
-    setWorkspaceTreeLoading(true);
-
-    try {
-      const response = await getWorkspaceTree({
-        conversationId,
-        scope,
-        maxDepth: 4,
-        signal: request.controller.signal,
-      });
-
-      if (request.controller.signal.aborted || workspaceTreeSeqRef.current !== request.seq) {
-        return;
-      }
-
-      setWorkspaceTree(response.tree);
-    } catch (error) {
-      if (request.controller.signal.aborted || workspaceTreeSeqRef.current !== request.seq) {
-        return;
-      }
-
-      setAppNotice(error instanceof Error ? error.message : "워크스페이스 트리를 불러오지 못했습니다.");
-    } finally {
-      if (workspaceTreeSeqRef.current === request.seq) {
-        setWorkspaceTreeLoading(false);
-        abortRef(workspaceTreeControllerRef);
-      }
-    }
+    void conversationId;
+    void scope;
+    setWorkspaceTree([]);
+    setWorkspaceFile(null);
+    setWorkspaceTreeLoading(false);
   }
 
   async function refreshWorkspaceRuns(conversationId: string, preferredRunId?: string | null) {
@@ -689,7 +616,7 @@ export default function App() {
       if (request.controller.signal.aborted || tasksSeqRef.current !== request.seq) {
         return;
       }
-      setAppNotice(error instanceof Error ? error.message : "태스크 목록을 불러오지 못했습니다.");
+      setAppNotice(error instanceof Error ? error.message : "작업 목록을 불러오지 못했습니다.");
     } finally {
       if (tasksSeqRef.current === request.seq) {
         abortRef(tasksControllerRef);
@@ -723,7 +650,7 @@ export default function App() {
         return;
       }
 
-      setAppNotice(error instanceof Error ? error.message : "태스크 이벤트를 불러오지 못했습니다.");
+      setAppNotice(error instanceof Error ? error.message : "작업 이벤트를 불러오지 못했습니다.");
     } finally {
       if (taskEventsSeqRef.current === request.seq) {
         abortRef(taskEventsControllerRef);
@@ -732,24 +659,10 @@ export default function App() {
   }
 
   async function refreshAgentMemory(agentId: string) {
-    const request = beginRequest(memorySeqRef, memoryControllerRef);
-
-    try {
-      const response = await getAgentMemory(agentId, request.controller.signal);
-      if (request.controller.signal.aborted || memorySeqRef.current !== request.seq || activeAgentIdRef.current !== agentId) {
-        return;
-      }
-      setAgentMemory(response.memory);
-    } catch (error) {
-      if (request.controller.signal.aborted || memorySeqRef.current !== request.seq) {
-        return;
-      }
-      setAppNotice(error instanceof Error ? error.message : "메모리를 불러오지 못했습니다.");
-    } finally {
-      if (memorySeqRef.current === request.seq) {
-        abortRef(memoryControllerRef);
-      }
-    }
+    void agentId;
+    memorySeqRef.current += 1;
+    abortRef(memoryControllerRef);
+    setAgentMemory(null);
   }
 
   async function refreshAgentSoul(agentId: string) {
@@ -799,7 +712,7 @@ export default function App() {
         return;
       }
 
-      setAppNotice(error instanceof Error ? error.message : "Failed to load standing orders.");
+      setAppNotice(error instanceof Error ? error.message : "상시 지침을 불러오지 못했습니다.");
     } finally {
       if (standingOrdersSeqRef.current === request.seq) {
         abortRef(standingOrdersControllerRef);
@@ -809,40 +722,19 @@ export default function App() {
 
   async function refreshMemorySearch(agentId: string, query: string) {
     const trimmedQuery = query.trim();
-    const request = beginRequest(memorySearchSeqRef, memorySearchControllerRef);
+    void agentId;
+    memorySearchSeqRef.current += 1;
+    abortRef(memorySearchControllerRef);
 
     if (!trimmedQuery) {
       setMemorySearchResults([]);
       setMemorySearchLoading(false);
-      abortRef(memorySearchControllerRef);
       return;
     }
 
-    setMemorySearchLoading(true);
-
-    try {
-      const response = await searchAgentMemory(agentId, { query: trimmedQuery, maxResults: 20 }, request.controller.signal);
-      if (
-        request.controller.signal.aborted ||
-        memorySearchSeqRef.current !== request.seq ||
-        activeAgentIdRef.current !== agentId
-      ) {
-        return;
-      }
-
-      setMemorySearchResults(response.results);
-    } catch (error) {
-      if (request.controller.signal.aborted || memorySearchSeqRef.current !== request.seq) {
-        return;
-      }
-
-      setAppNotice(error instanceof Error ? error.message : "Failed to search agent memory.");
-    } finally {
-      if (memorySearchSeqRef.current === request.seq) {
-        setMemorySearchLoading(false);
-        abortRef(memorySearchControllerRef);
-      }
-    }
+    setMemorySearchResults([]);
+    setMemorySearchLoading(false);
+    setAppNotice("메모리 파일 검색은 opencode-only 모드에서 제거되었습니다. 필요한 내용은 채팅이나 워크플로우로 opencode에 요청하세요.");
   }
 
   async function refreshSubagentSessions(sessionId: string) {
@@ -867,7 +759,7 @@ export default function App() {
         return;
       }
 
-      setAppNotice(error instanceof Error ? error.message : "Failed to load sub-agent sessions.");
+      setAppNotice(error instanceof Error ? error.message : "하위 에이전트 세션을 불러오지 못했습니다.");
     } finally {
       if (subagentSessionsSeqRef.current === request.seq) {
         abortRef(subagentSessionsControllerRef);
@@ -905,7 +797,7 @@ export default function App() {
         return;
       }
 
-      setAppNotice(error instanceof Error ? error.message : "Failed to load task flows.");
+      setAppNotice(error instanceof Error ? error.message : "작업 흐름을 불러오지 못했습니다.");
     } finally {
       if (taskFlowsSeqRef.current === request.seq) {
         abortRef(taskFlowsControllerRef);
@@ -939,7 +831,7 @@ export default function App() {
         return;
       }
 
-      setAppNotice(error instanceof Error ? error.message : "Failed to load task flow details.");
+      setAppNotice(error instanceof Error ? error.message : "작업 흐름 상세 정보를 불러오지 못했습니다.");
     } finally {
       if (taskFlowDetailSeqRef.current === request.seq) {
         abortRef(taskFlowDetailControllerRef);
@@ -1063,38 +955,16 @@ export default function App() {
   }
 
   async function openWorkspaceFile(path: string) {
+    void path;
+    workspaceFileSeqRef.current += 1;
     if (!activeConversationId) {
       return;
     }
 
-    const request = beginRequest(workspaceFileSeqRef, workspaceFileControllerRef);
-    setWorkspaceFileLoading(true);
-
-    try {
-      const response = await getWorkspaceFile({
-        conversationId: activeConversationId,
-        scope: workspaceScope,
-        path,
-        signal: request.controller.signal,
-      });
-
-      if (request.controller.signal.aborted || workspaceFileSeqRef.current !== request.seq) {
-        return;
-      }
-
-      setWorkspaceFile(response.file);
-    } catch (error) {
-      if (request.controller.signal.aborted || workspaceFileSeqRef.current !== request.seq) {
-        return;
-      }
-
-      setAppNotice(error instanceof Error ? error.message : "파일을 불러오지 못했습니다.");
-    } finally {
-      if (workspaceFileSeqRef.current === request.seq) {
-        setWorkspaceFileLoading(false);
-        abortRef(workspaceFileControllerRef);
-      }
-    }
+    setWorkspaceFile(null);
+    setWorkspaceFileLoading(false);
+    setAppNotice("File browsing is retired in opencode-only mode. Ask opencode in Chat to inspect or edit files.");
+    return;
   }
 
   async function updateConversation(patch: Partial<ConversationRecord>) {
@@ -1144,6 +1014,7 @@ export default function App() {
     void (async () => {
       try {
         await refreshProviders();
+        await refreshEngineStatus();
         const loadedAgents = await refreshAgents();
         await refreshPlatformMetadata(loadedAgents[0]?.id ?? null);
       } catch (error) {
@@ -1271,10 +1142,9 @@ export default function App() {
       return;
     }
 
-    void refreshWorkspaceTree(activeConversationId, workspaceScope);
     void refreshWorkspaceRuns(activeConversationId, selectedRunIdRef.current);
     setWorkspaceFile(null);
-  }, [activeConversationId, workspaceScope]);
+  }, [activeConversationId]);
 
   useEffect(() => {
     if (!activeConversationId) {
@@ -1395,6 +1265,7 @@ export default function App() {
       }
 
       await refreshProviders();
+      await refreshEngineStatus();
       setAppNotice(`${providerLabels[kind]} 설정을 저장했습니다.`);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "프로바이더 설정 저장에 실패했습니다.");
@@ -1442,14 +1313,18 @@ export default function App() {
   }
 
   function handleCockpitNavigate(target: CockpitNavTarget) {
-    setActiveNavTarget(target);
+    const nextTarget: CockpitNavTarget =
+      target === "computer" || target === "mcp" || target === "skills" || target === "files"
+        ? "workflow"
+        : target;
+    setActiveNavTarget(nextTarget);
 
-    if (target === "chat") {
+    if (nextTarget === "chat") {
       setActiveSection("chat");
       return;
     }
 
-    if (target === "settings") {
+    if (nextTarget === "settings") {
       handleOpenProviderSettings();
       return;
     }
@@ -1459,7 +1334,7 @@ export default function App() {
 
   async function handleSaveAgentDefaults() {
     if (!activeAgentId) {
-      setAppNotice("수정할 에이전트를 선택하세요.");
+      setAppNotice("수정할 에이전트를 먼저 선택하세요.");
       return;
     }
 
@@ -1512,7 +1387,7 @@ export default function App() {
 
   async function handleSaveStandingOrders() {
     if (!activeAgentId) {
-      setAppNotice("Please select an agent first.");
+      setAppNotice("에이전트를 먼저 선택하세요.");
       return;
     }
 
@@ -1525,10 +1400,10 @@ export default function App() {
       if (activeAgentIdRef.current === agentId) {
         setStandingOrders(response.standingOrders);
         setStandingOrdersDraft(response.standingOrders.content);
-        setAppNotice("Standing orders saved.");
+        setAppNotice("상시 지침을 저장했습니다.");
       }
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Failed to save standing orders.");
+      setAppNotice(error instanceof Error ? error.message : "상시 지침 저장에 실패했습니다.");
     } finally {
       setSavingStandingOrders(false);
     }
@@ -1653,7 +1528,7 @@ export default function App() {
 
   async function handleCreateSubagentSession(payload: { title?: string; prompt: string }) {
     if (!activeConversation || !activeAgentId) {
-      setAppNotice("Please select a conversation first.");
+      setAppNotice("대화를 먼저 선택하세요.");
       return;
     }
 
@@ -1676,10 +1551,10 @@ export default function App() {
         ),
       );
       setConversations((current) => mergeConversationList(current, response.session));
-      setAppNotice("Sub-agent session created.");
+      setAppNotice("하위 에이전트 세션을 만들었습니다.");
       void refreshSubagentSessions(conversation.id);
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Failed to create a sub-agent session.");
+      setAppNotice(error instanceof Error ? error.message : "하위 에이전트 세션 생성에 실패했습니다.");
     }
   }
 
@@ -1690,7 +1565,7 @@ export default function App() {
         void refreshSubagentSessions(activeConversationIdRef.current);
       }
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Failed to cancel the sub-agent session.");
+      setAppNotice(error instanceof Error ? error.message : "하위 에이전트 세션 취소에 실패했습니다.");
     }
   }
 
@@ -1705,7 +1580,7 @@ export default function App() {
     }>;
   }) {
     if (!activeAgentId) {
-      setAppNotice("Please select an agent first.");
+      setAppNotice("에이전트를 먼저 선택하세요.");
       return;
     }
 
@@ -1715,15 +1590,7 @@ export default function App() {
         conversationId: activeConversationId ?? null,
         title: payload.title,
         autoStart: payload.autoStart ?? true,
-        steps: payload.steps.length
-          ? payload.steps
-          : [
-              {
-                stepKey: "step-1",
-                title: payload.title,
-                prompt: payload.title,
-              },
-            ],
+        steps: payload.steps,
       });
       if (activeAgentIdRef.current !== agentId) {
         return;
@@ -1735,11 +1602,11 @@ export default function App() {
       );
       setSelectedTaskFlowId(response.flow.id);
       setSelectedTaskFlow({ flow: response.flow, steps: response.steps });
-      setAppNotice("Task flow created.");
+      setAppNotice("작업 흐름을 만들었습니다.");
       void refreshTaskFlows(agentId, response.flow.id);
       void refreshTaskFlowDetail(agentId, response.flow.id);
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Failed to create a task flow.");
+      setAppNotice(error instanceof Error ? error.message : "작업 흐름 생성에 실패했습니다.");
     }
   }
 
@@ -1748,21 +1615,12 @@ export default function App() {
     content: string;
     scope?: "agent" | "shared";
   }) {
+    void payload;
     if (!activeAgentId) {
       setAppNotice("스킬을 추가할 에이전트를 먼저 선택하세요.");
       return;
     }
-
-    const agentId = activeAgentId;
-    try {
-      await createAgentSkill(agentId, payload);
-      if (activeAgentIdRef.current === agentId) {
-        await refreshPlatformMetadata(agentId);
-        setAppNotice(`스킬 "${payload.name}"을 로컬 카탈로그에 추가했습니다.`);
-      }
-    } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "스킬 추가에 실패했습니다.");
-    }
+    setAppNotice("AetherOps 내부 스킬 저장소는 opencode-only 모드에서 비활성화되었습니다. 스킬/도구는 opencode 설정 또는 MCP로 연결해 주세요.");
   }
 
   async function handleCreateMcpServerProfile(payload: {
@@ -1772,66 +1630,8 @@ export default function App() {
     description?: string;
     enabled?: boolean;
   }) {
-    try {
-      await createMcpServerProfile(payload);
-      await refreshPlatformMetadata(activeAgentId);
-      setAppNotice(`MCP 브리지 프로필 "${payload.label}"을 로컬 메타데이터에 추가했습니다.`);
-    } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "MCP 브리지 프로필 추가에 실패했습니다.");
-    }
-  }
-
-  async function handleCreateWorkspaceFile(payload: {
-    scope: Extract<WorkspaceScope, "sandbox" | "shared">;
-    path: string;
-    content?: string;
-    overwrite?: boolean;
-  }) {
-    if (!activeConversationId) {
-      setAppNotice("파일을 만들 세션을 먼저 선택하세요.");
-      return;
-    }
-
-    const conversationId = activeConversationId;
-    try {
-      const response = await createWorkspaceFile({
-        conversationId,
-        scope: payload.scope,
-        path: payload.path,
-        content: payload.content,
-        overwrite: payload.overwrite,
-      });
-      setWorkspaceScope(response.file.scope);
-      setWorkspaceFile(response.file);
-      await refreshWorkspaceTree(conversationId, response.file.scope);
-      setAppNotice(`파일 "${response.file.path}"을 만들었습니다.`);
-    } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "워크스페이스 파일 생성에 실패했습니다.");
-    }
-  }
-
-  async function handleCreateWorkspaceFolder(payload: {
-    scope: Extract<WorkspaceScope, "sandbox" | "shared">;
-    path: string;
-  }) {
-    if (!activeConversationId) {
-      setAppNotice("폴더를 만들 세션을 먼저 선택하세요.");
-      return;
-    }
-
-    const conversationId = activeConversationId;
-    try {
-      const response = await createWorkspaceFolder({
-        conversationId,
-        scope: payload.scope,
-        path: payload.path,
-      });
-      setWorkspaceScope(response.folder.scope);
-      await refreshWorkspaceTree(conversationId, response.folder.scope);
-      setAppNotice(`폴더 "${response.folder.path}"을 만들었습니다.`);
-    } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "워크스페이스 폴더 생성에 실패했습니다.");
-    }
+    void payload;
+    setAppNotice("AetherOps 내부 MCP 프로필 저장은 opencode-only 모드에서 비활성화되었습니다. opencode의 MCP 설정 파일에 서버를 연결해 주세요.");
   }
 
   async function handleTaskFlowControl(
@@ -1852,7 +1652,7 @@ export default function App() {
       void refreshTaskFlows(agentId, response.flow.id);
       void refreshTaskFlowDetail(agentId, response.flow.id);
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : `Failed to ${action} the task flow.`);
+      setAppNotice(error instanceof Error ? error.message : `작업 흐름 ${action} 동작에 실패했습니다.`);
     }
   }
 
@@ -1878,7 +1678,7 @@ export default function App() {
       void refreshTaskFlows(agentId, response.flow.id);
       void refreshTaskFlowDetail(agentId, response.flow.id);
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : `Failed to ${action} the task flow step.`);
+      setAppNotice(error instanceof Error ? error.message : `작업 흐름 단계 ${action} 동작에 실패했습니다.`);
     }
   }
 
@@ -1897,11 +1697,76 @@ export default function App() {
         void refreshTaskFlows(agentId, selectedTaskFlowIdRef.current === flowId ? null : selectedTaskFlowIdRef.current);
       }
     } catch (error) {
-      setAppNotice(error instanceof Error ? error.message : "Failed to cancel the task flow.");
+      setAppNotice(error instanceof Error ? error.message : "작업 흐름 취소에 실패했습니다.");
+    }
+  }
+
+  async function handleSaveTaskFlowSteps(
+    flowId: string,
+    steps: TaskFlowStepDraft[],
+    title?: string,
+  ) {
+    if (!activeAgentId) {
+      return;
+    }
+
+    const agentId = activeAgentId;
+    try {
+      const response = await saveTaskFlowSteps(flowId, steps, title);
+      if (activeAgentIdRef.current !== agentId || response.flow.id !== flowId) {
+        return;
+      }
+
+      selectedTaskFlowIdRef.current = response.flow.id;
+      setSelectedTaskFlowId(response.flow.id);
+      setSelectedTaskFlow({ flow: response.flow, steps: response.steps });
+      setTaskFlows((current) =>
+        [response.flow, ...current.filter((flow) => flow.id !== response.flow.id)].sort(
+          (left, right) => right.updatedAt - left.updatedAt,
+        ),
+      );
+      setAppNotice("Flow 단계를 저장했습니다.");
+      void refreshTaskFlows(agentId, response.flow.id);
+      void refreshTaskFlowDetail(agentId, response.flow.id);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Flow 단계 저장에 실패했습니다.");
+    }
+  }
+
+  async function handleDeleteTaskFlow(flowId: string) {
+    if (!activeAgentId) {
+      return;
+    }
+
+    const agentId = activeAgentId;
+    try {
+      await deleteTaskFlow(flowId);
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+
+      const wasSelected = selectedTaskFlowIdRef.current === flowId;
+      const remaining = taskFlows.filter((flow) => flow.id !== flowId);
+      const nextFlowId =
+        wasSelected || !remaining.some((flow) => flow.id === selectedTaskFlowIdRef.current)
+          ? remaining[0]?.id ?? null
+          : selectedTaskFlowIdRef.current;
+
+      selectedTaskFlowIdRef.current = nextFlowId;
+      setTaskFlows(remaining);
+      setSelectedTaskFlowId(nextFlowId);
+      if (!nextFlowId || wasSelected) {
+        setSelectedTaskFlow(null);
+      }
+      setAppNotice("Flow를 삭제했습니다.");
+      void refreshTaskFlows(agentId, nextFlowId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Flow 삭제에 실패했습니다.");
     }
   }
 
   function handleSelectTaskFlow(flowId: string) {
+    selectedTaskFlowIdRef.current = flowId;
     setSelectedTaskFlowId(flowId);
   }
 
@@ -1944,12 +1809,40 @@ export default function App() {
     }
   }
 
+  async function handleRefreshOpenCodeModels() {
+    setEngineStatusLoading(true);
+    try {
+      const result = await refreshOpenCodeModels();
+      setAppNotice(result.message);
+      await refreshEngineStatus();
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "opencode 모델 갱신에 실패했습니다.");
+    } finally {
+      setEngineStatusLoading(false);
+    }
+  }
+
+  async function handleConnectOpenCodeOAuth() {
+    setEngineStatusLoading(true);
+    try {
+      const result = await startOpenCodeAuthLogin({ provider: "openai", launch: true });
+      setAppNotice(result.message);
+      await refreshEngineStatus();
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "opencode OAuth 연결을 시작하지 못했습니다.");
+    } finally {
+      setEngineStatusLoading(false);
+    }
+  }
+
   async function handleConnectCodex() {
     try {
-      setAppNotice("공식 Codex OAuth 흐름을 시작합니다...");
+      setAppNotice("공식 Codex OAuth 흐름을 시작합니다.");
       const response = await startCodexOAuth(window.location.origin);
       await refreshProviders();
-      setAppNotice(response.message);
+      const opencodeResult = await startOpenCodeAuthLogin({ provider: "openai", launch: true });
+      await refreshEngineStatus();
+      setAppNotice(`${response.message} ${opencodeResult.message}`);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex OAuth 시작에 실패했습니다.");
     }
@@ -1959,7 +1852,9 @@ export default function App() {
     try {
       await importCodexCliAuth();
       await refreshProviders();
-      setAppNotice("Codex CLI 인증 정보를 가져왔습니다.");
+      const opencodeResult = await startOpenCodeAuthLogin({ provider: "openai", launch: true });
+      await refreshEngineStatus();
+      setAppNotice(`Codex CLI 인증 정보를 가져왔습니다. ${opencodeResult.message}`);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex CLI 인증 가져오기에 실패했습니다.");
     }
@@ -1969,6 +1864,7 @@ export default function App() {
     try {
       await logoutCodex();
       await refreshProviders();
+      await refreshEngineStatus();
       setAppNotice("OpenAI Codex 연결을 해제했습니다.");
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex 로그아웃에 실패했습니다.");
@@ -2042,7 +1938,6 @@ export default function App() {
               setSelectedRunId(completePayload.runId);
             }
             void refreshWorkspaceRuns(conversation.id, completePayload.runId);
-            void refreshWorkspaceTree(conversation.id, workspaceScope);
             return;
           }
 
@@ -2189,53 +2084,23 @@ export default function App() {
 
       <main className="chat-panel">
         <header className="chat-panel__topbar">
-          <div className="chat-panel__global-brand" aria-label="통합 에이전트">
+          <div className="chat-panel__global-brand" aria-label="AetherOps">
             <span className="chat-panel__brand-mark">◇</span>
-            <strong>통합 에이전트</strong>
+            <strong>AetherOps</strong>
             <span className="chat-panel__mode-pill">
               <span aria-hidden="true" />
               로컬 모드
             </span>
           </div>
 
-          <div className="chat-panel__model-switcher">
-            <span className="chat-panel__current-model">
-              {activeModelOption?.label ?? "모델을 불러오는 중..."}
-            </span>
-            <nav className="chat-panel__tabs" aria-label="워크스페이스 탭">
-              <button
-                className={`chat-panel__tab ${activeSection === "chat" ? "is-active" : ""}`}
-                onClick={() => {
-                  setActiveNavTarget("chat");
-                  setActiveSection("chat");
-                }}
-                type="button"
-              >
-                채팅
-              </button>
-              <button
-                className={`chat-panel__tab ${activeSection === "workspace" ? "is-active" : ""}`}
-                onClick={() => {
-                  setActiveNavTarget("workflow");
-                  setActiveSection("workspace");
-                }}
-                type="button"
-              >
-                워크스페이스
-              </button>
-            </nav>
-          </div>
-
           <div className="chat-panel__actions">
             <ConnectionStatus
+              backendOnline={backendOnline}
               modelCount={activeModelCount}
               modelsError={activeModelsError}
               modelsLoading={activeModelsLoading}
               provider={activeProvider}
             />
-            <button className="ghost-button" onClick={handleOpenProviderSettings} type="button">
-              프로바이더
-            </button>
           </div>
         </header>
 
@@ -2244,7 +2109,7 @@ export default function App() {
         >
           <div className="chat-panel__intro" aria-hidden={activeSection === "chat"}>
             <p className="eyebrow">{activeSection === "chat" ? "대화" : "워크스페이스"}</p>
-            <h1>{activeConversation?.title ?? "새 채팅"}</h1>
+            <h1>{displayConversationTitle(activeConversation?.title)}</h1>
             <p className="chat-panel__intro-copy">
               {activeSection === "chat"
                 ? "대화와 공통 에이전트 런타임을 통해 파일 작업, 명령 실행, 연구 흐름을 함께 다룰 수 있습니다."
@@ -2264,48 +2129,16 @@ export default function App() {
             ) : null}
           </div>
 
-          {appNotice ? <div className="app-notice">{appNotice}</div> : null}
+          {appNotice ? <div className="app-notice">{displayAppNotice(appNotice)}</div> : null}
 
           {activeSection === "chat" ? (
             <>
               <div className="cockpit-chat-grid">
                 <section className="cockpit-chat-card">
-                  <div className="cockpit-chat-card__tabs">
-                    <button
-                      aria-pressed="true"
-                      className="is-active"
-                      onClick={() => handleCockpitNavigate("chat")}
-                      type="button"
-                    >
-                      채팅
-                    </button>
-                    <button
-                      onClick={() => {
-                        if (activeConversationId) {
-                          void loadConversation(activeConversationId);
-                        }
-                        handleCockpitNavigate("chat");
-                      }}
-                      type="button"
-                    >
-                      {activeConversation?.title ?? "새 프로젝트"}
-                    </button>
-                    <button
-                      aria-label="새 세션 만들기"
-                      onClick={() => {
-                        setActiveNavTarget("chat");
-                        setActiveSection("chat");
-                        void createConversationThread(activeConversation?.providerKind, activeAgentId);
-                      }}
-                      type="button"
-                    >
-                      +
-                    </button>
-                  </div>
                   {messages.length === 0 && !pendingAssistantText ? (
                     <div className="cockpit-chat-card__intro">
                       <p className="eyebrow">중앙 도구 호출 에이전트</p>
-                      <h1>{activeConversation?.title ?? "새 채팅"}</h1>
+                      <h1>{displayConversationTitle(activeConversation?.title)}</h1>
                       <p>
                         {activeAgent?.name ?? "기본 에이전트"}가 파일, 워크플로우, MCP, 스킬을 조합해 작업합니다.
                         현재 모델은 {activeModelOption?.label ?? activeConversation?.model ?? "선택 안 됨"} 입니다.
@@ -2356,12 +2189,31 @@ export default function App() {
               activeAgent={activeAgent}
               activeConversation={activeConversation}
               changedFiles={changedFiles}
+              computerUseAllowlistDraft={computerUseAllowlistDraft}
+              computerUseClickSelector={computerUseClickSelector}
+              computerUseDetail={computerUseDetail}
+              computerUseError={computerUseError}
+              computerUseLoading={computerUseLoading}
+              computerUseNavigationUrl={computerUseNavigationUrl}
+              computerUseSettings={computerUseSettings}
               file={workspaceFile}
               liveEvents={liveEvents}
               memory={agentMemory}
               modelLabel={activeModelOption?.label ?? activeConversation?.model ?? "선택 안 됨"}
               onCancelTaskFlow={(flowId) => {
                 void handleCancelTaskFlow(flowId);
+              }}
+              onApproveComputerUseAction={(event) => {
+                void handleApproveComputerUseAction(event);
+              }}
+              onCloseComputerUseSession={() => {
+                void handleCloseComputerUseSession();
+              }}
+              onComputerUseAllowlistDraftChange={setComputerUseAllowlistDraft}
+              onComputerUseClickSelectorChange={setComputerUseClickSelector}
+              onComputerUseNavigationUrlChange={setComputerUseNavigationUrl}
+              onCreateComputerUseSession={() => {
+                void handleCreateComputerUseSession();
               }}
               onCreateConversation={() => {
                 setActiveNavTarget("chat");
@@ -2371,19 +2223,35 @@ export default function App() {
               onCreateTaskFlow={(payload) => {
                 void handleCreateTaskFlow(payload);
               }}
+              onDeleteTaskFlow={(flowId) => {
+                void handleDeleteTaskFlow(flowId);
+              }}
               onCreateSkill={(payload) => {
                 void handleCreateSkill(payload);
               }}
               onCreateMcpServerProfile={(payload) => {
                 void handleCreateMcpServerProfile(payload);
               }}
-              onCreateWorkspaceFile={(payload) => {
-                void handleCreateWorkspaceFile(payload);
-              }}
-              onCreateWorkspaceFolder={(payload) => {
-                void handleCreateWorkspaceFolder(payload);
+              onDenyComputerUseAction={(event) => {
+                void handleDenyComputerUseAction(event);
               }}
               onNavigate={handleCockpitNavigate}
+              onNavigateComputerUseSession={() => {
+                void handleNavigateComputerUseSession();
+              }}
+              onClickComputerUseSession={() => {
+                void handleClickComputerUseSession();
+              }}
+              onRiskyClickComputerUseSession={() => {
+                void handleClickComputerUseSession({
+                  visibleText: "delete validation",
+                  mayDelete: true,
+                  mayChangeState: true,
+                });
+              }}
+              onSensitiveTypeComputerUseSession={() => {
+                void handleSensitiveTypeComputerUseSession();
+              }}
               onOpenAgentSettings={handleOpenAgentSettings}
               onOpenProviderSettings={handleOpenProviderSettings}
               onRefreshFiles={() => {
@@ -2407,6 +2275,9 @@ export default function App() {
               onSelectTaskFlow={(flowId) => {
                 handleSelectTaskFlow(flowId);
               }}
+              onSaveTaskFlowSteps={(flowId, steps, title) => {
+                void handleSaveTaskFlowSteps(flowId, steps, title);
+              }}
               onResumeTaskFlow={(flowId) => {
                 void handleTaskFlowControl(flowId, "resume");
               }}
@@ -2418,6 +2289,15 @@ export default function App() {
               }}
               onStartTaskFlow={(flowId) => {
                 void handleTaskFlowControl(flowId, "start");
+              }}
+              onSaveComputerUseSettings={() => {
+                void handleSaveComputerUseSettings();
+              }}
+              onScreenshotComputerUseSession={() => {
+                void handleScreenshotComputerUseSession();
+              }}
+              onToggleComputerUseEnabled={() => {
+                void handleToggleComputerUseEnabled();
               }}
               platformMetadata={platformMetadata}
               platformMetadataLoading={platformMetadataLoading}
@@ -2473,10 +2353,15 @@ export default function App() {
 
       <ProviderSettingsDialog
         drafts={providerDrafts}
+        engineStatus={engineStatus}
+        engineStatusLoading={engineStatusLoading}
         notice={appNotice}
         onClose={() => setSettingsOpen(false)}
         onConnectCodex={() => {
           void handleConnectCodex();
+        }}
+        onConnectOpenCodeOAuth={() => {
+          void handleConnectOpenCodeOAuth();
         }}
         onDraftChange={(kind, field, value) => {
           setProviderDrafts((current) => ({
@@ -2492,6 +2377,12 @@ export default function App() {
         }}
         onLogoutCodex={() => {
           void handleLogoutCodex();
+        }}
+        onRefreshEngineStatus={() => {
+          void refreshEngineStatus();
+        }}
+        onRefreshOpenCodeModels={() => {
+          void handleRefreshOpenCodeModels();
         }}
         onSave={(kind) => {
           void handleSaveProvider(kind as Exclude<ProviderKind, "openai-codex">);

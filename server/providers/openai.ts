@@ -110,7 +110,7 @@ async function generateText(params: {
 export const openAIAdapter: ProviderAdapter<"openai"> = {
   kind: "openai",
   label: "OpenAI",
-  defaultModel: "gpt-5.4",
+  defaultModel: "gpt-5.5",
 
   async listModels(secret) {
     const config = assertConfigured(secret);

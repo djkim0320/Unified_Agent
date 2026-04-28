@@ -4,12 +4,30 @@ import path from "node:path";
 
 const KEY_FILE = "secret.key";
 
+function bestEffortPrivateMode(filePath: string) {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Some mounted filesystems do not support chmod. Encryption still works; permissions are best effort.
+  }
+}
+
 function ensureKeyFile(dataDir: string): Buffer {
   fs.mkdirSync(dataDir, { recursive: true });
   const keyPath = path.join(dataDir, KEY_FILE);
   if (!fs.existsSync(keyPath)) {
-    fs.writeFileSync(keyPath, crypto.randomBytes(32));
+    // Do not delete this file unless you intentionally want to make encrypted provider
+    // secrets unrecoverable. It is the local AES-GCM root key for provider credentials.
+    fs.writeFileSync(keyPath, crypto.randomBytes(32), {
+      mode: 0o600,
+      flag: "wx",
+    });
   }
+  bestEffortPrivateMode(keyPath);
   const key = fs.readFileSync(keyPath);
   if (key.length !== 32) {
     throw new Error("Invalid encryption key length");

@@ -1,16 +1,10 @@
-import { createMemoryManager } from "./memory-manager.js";
-import { createPluginManager } from "./plugin-manager.js";
-import { runAgentTurn } from "./agent-runtime.js";
 import { createTaskManager } from "./task-manager.js";
-import { createToolRegistry } from "./tool-registry.js";
-import { corePlugin, registerCoreTools } from "../plugins/core.js";
-import { getProviderAdapter } from "../provider-registry.js";
+import { createOpenCodeEngine } from "./opencode-engine.js";
 import type {
   AgentRecord,
   ChatMessage,
   ConversationRecord,
   HeartbeatLogRecord,
-  MemorySearchResult,
   ProviderKind,
   ProviderSecret,
   ReasoningLevel,
@@ -19,14 +13,13 @@ import type {
   TaskFlowStepRecord,
   TaskRecord,
   WorkspaceRunEventRecord,
+  WorkspaceRunRecord,
 } from "../types.js";
-import type { createBrowserRuntime } from "./browser-runtime.js";
 import type { createWorkspaceManager } from "./workspace.js";
 
 export function createAgentGateway(params: {
   projectRoot: string;
   workspace: ReturnType<typeof createWorkspaceManager>;
-  browserRuntime: ReturnType<typeof createBrowserRuntime>;
   store: {
     getAgent: (agentId: string) => AgentRecord | null;
     getConversation: (conversationId: string) => ConversationRecord | null;
@@ -62,10 +55,42 @@ export function createAgentGateway(params: {
     }) => { id: string };
     createWorkspaceRun: (input: {
       conversationId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
       providerKind: ProviderKind;
       model: string;
       userMessage: string;
-    }) => { id: string };
+      phase?: "accepted" | "planning" | "tool_execution" | "synthesizing";
+      checkpoint?: {
+        stepIndex: number;
+        maxSteps: number;
+        userMessage: string;
+        toolHistory: Array<{ tool: string; result: string }>;
+        changedFiles: string[];
+        runMode: "foreground" | "detached" | "heartbeat" | "subagent";
+        lastToolName: string | null;
+      } | null;
+      resumeToken?: string | null;
+    }) => WorkspaceRunRecord;
+    patchWorkspaceRun?: (input: {
+      runId: string;
+      taskId?: string | null;
+      parentRunId?: string | null;
+      phase?: "accepted" | "planning" | "tool_execution" | "synthesizing" | "completed" | "failed" | "cancelled" | null;
+      checkpoint?: {
+        stepIndex: number;
+        maxSteps: number;
+        userMessage: string;
+        toolHistory: Array<{ tool: string; result: string }>;
+        changedFiles: string[];
+        runMode: "foreground" | "detached" | "heartbeat" | "subagent";
+        lastToolName: string | null;
+      } | null;
+      resumeToken?: string | null;
+    }) => unknown;
+    getWorkspaceRun?: (runId: string) => WorkspaceRunRecord | null;
+    listWorkspaceRuns?: (conversationId: string) => WorkspaceRunRecord[];
+    listWorkspaceRunEvents?: (conversationId: string, runId: string) => WorkspaceRunEventRecord[];
     appendWorkspaceRunEvent: (input: {
       runId: string;
       eventType: "status" | "tool_call" | "tool_result" | "error" | "run_complete" | "run_failed" | "run_cancelled";
@@ -139,17 +164,6 @@ export function createAgentGateway(params: {
       eventType: "queued" | "running" | "status" | "completed" | "failed" | "timed_out" | "cancelled" | "result_delivered";
       payload: Record<string, unknown>;
     }) => unknown;
-    replaceMemoryIndex?: (
-      agentId: string,
-      entries: Array<{
-        path: string;
-        kind: MemorySearchResult["kind"];
-        line: number;
-        reason: string;
-        text: string;
-      }>,
-    ) => number;
-    searchMemoryIndex?: (agentId: string, query: string, maxResults?: number) => MemorySearchResult[];
     createTaskFlow?: (input: {
       agentId: string;
       conversationId: string;
@@ -161,6 +175,7 @@ export function createAgentGateway(params: {
     listTaskFlows?: (agentId: string) => TaskFlowRecord[];
     transitionTaskFlow?: (input: {
       flowId: string;
+      title?: string;
       status?: TaskFlowRecord["status"];
       resultSummary?: string | null;
       errorText?: string | null;
@@ -173,6 +188,7 @@ export function createAgentGateway(params: {
       flowId: string;
       stepKey: string;
       dependencyStepKey?: string | null;
+      position?: number;
       title: string;
       prompt: string;
     }) => TaskFlowStepRecord;
@@ -189,22 +205,12 @@ export function createAgentGateway(params: {
   };
   resolveSecret: (kind: ProviderKind) => Promise<ProviderSecret<ProviderKind> | null>;
 }) {
-  const toolRegistry = createToolRegistry();
-  registerCoreTools(toolRegistry);
-  const pluginManager = createPluginManager({
+  let taskManager: ReturnType<typeof createTaskManager>;
+
+  const agentEngine = createOpenCodeEngine({
     projectRoot: params.projectRoot,
-    builtInPlugins: [corePlugin],
-  });
-  const memoryIndexStore =
-    params.store.replaceMemoryIndex && params.store.searchMemoryIndex
-      ? {
-          replaceMemoryIndex: params.store.replaceMemoryIndex.bind(params.store),
-          searchMemoryIndex: params.store.searchMemoryIndex.bind(params.store),
-        }
-      : undefined;
-  const memoryManager = createMemoryManager({
     workspace: params.workspace,
-    store: memoryIndexStore,
+    store: params.store,
   });
 
   function resolveHeartbeatConversation(agent: AgentRecord) {
@@ -261,12 +267,6 @@ export function createAgentGateway(params: {
       throw new Error("Detached task session or agent was not found.");
     }
 
-    const adapter = getProviderAdapter(paramsInput.task.providerKind);
-    const secret = await params.resolveSecret(paramsInput.task.providerKind);
-    if (!secret) {
-      throw new Error(`${adapter.label} must be configured before running this task.`);
-    }
-
     const messages: ChatMessage[] = params.store.listMessages(conversation.id).map((message) => ({
       role: message.role,
       content: message.content,
@@ -276,10 +276,9 @@ export function createAgentGateway(params: {
       content: paramsInput.task.prompt,
     });
 
-    const result = await runAgentTurn({
+    const result = await agentEngine.runTurn({
       agent,
-      adapter: adapter as never,
-      secret: secret as never,
+      conversation,
       providerKind: paramsInput.task.providerKind,
       model: paramsInput.task.model,
       reasoningLevel: paramsInput.task.reasoningLevel,
@@ -287,19 +286,6 @@ export function createAgentGateway(params: {
       agentId: agent.id,
       userMessage: paramsInput.task.prompt,
       messages,
-      workspace: params.workspace,
-      browserRuntime: params.browserRuntime,
-      memoryManager,
-      pluginManager,
-      toolRegistry,
-      taskManager,
-      sessionManager: {
-        spawnSubagentSession,
-      },
-      flowManager: {
-        createFlow,
-      },
-      store: params.store,
       signal: paramsInput.signal,
       isDetachedTask: paramsInput.task.taskKind !== "heartbeat" && paramsInput.task.taskKind !== "subagent",
       isHeartbeatRun: paramsInput.task.taskKind === "heartbeat",
@@ -318,21 +304,8 @@ export function createAgentGateway(params: {
         });
       },
     });
-    if (
-      paramsInput.task.taskKind === "detached" ||
-      paramsInput.task.taskKind === "subagent" ||
-      paramsInput.task.taskKind === "flow_step"
-    ) {
-      memoryManager.captureOutcome({
-        agentId: agent.id,
-        taskTitle: paramsInput.task.title,
-        assistantText: result.assistantText,
-      });
-    }
     return result;
   }
-
-  let taskManager: ReturnType<typeof createTaskManager>;
 
   async function queueHeartbeatTask(input: {
     agentId: string;
@@ -483,6 +456,9 @@ export function createAgentGateway(params: {
     if (!conversation || conversation.agentId !== input.agentId) {
       throw new Error("Session not found for task flow.");
     }
+    if ((input.autoStart ?? true) && input.steps.length === 0) {
+      throw new Error("Empty task flows must be created with autoStart=false.");
+    }
     const flow = params.store.createTaskFlow({
       agentId: input.agentId,
       conversationId: input.conversationId,
@@ -490,11 +466,12 @@ export function createAgentGateway(params: {
       triggerSource: "manual",
       originRunId: input.originRunId ?? null,
     });
-    const steps = input.steps.map((step) =>
+    const steps = input.steps.map((step, index) =>
       params.store.createTaskFlowStep!({
         flowId: flow.id,
         stepKey: step.stepKey,
         dependencyStepKey: step.dependencyStepKey ?? null,
+        position: index,
         title: step.title,
         prompt: step.prompt,
       }),
@@ -542,16 +519,9 @@ export function createAgentGateway(params: {
     if (!agent) {
       throw new Error("Agent not found.");
     }
-    const adapter = getProviderAdapter(paramsInput.providerKind);
-    const secret = await params.resolveSecret(paramsInput.providerKind);
-    if (!secret) {
-      throw new Error(`${adapter.label} must be configured first.`);
-    }
-
-    return runAgentTurn({
+    return agentEngine.runTurn({
       agent,
-      adapter: adapter as never,
-      secret: secret as never,
+      conversation,
       providerKind: paramsInput.providerKind,
       model: paramsInput.model,
       reasoningLevel: paramsInput.reasoningLevel,
@@ -562,19 +532,6 @@ export function createAgentGateway(params: {
         role: message.role,
         content: message.content,
       })),
-      workspace: params.workspace,
-      browserRuntime: params.browserRuntime,
-      memoryManager,
-      pluginManager,
-      toolRegistry,
-      taskManager,
-      sessionManager: {
-        spawnSubagentSession,
-      },
-      flowManager: {
-        createFlow,
-      },
-      store: params.store,
       sendEvent: paramsInput.sendEvent,
       signal: paramsInput.signal,
       unsafeShellEnabled: paramsInput.unsafeShellEnabled,
@@ -583,10 +540,8 @@ export function createAgentGateway(params: {
   }
 
   return {
-    toolRegistry,
-    pluginManager,
-    memoryManager,
     taskManager,
+    agentEngine,
     queueHeartbeatTask,
     spawnSubagentSession,
     createFlow,

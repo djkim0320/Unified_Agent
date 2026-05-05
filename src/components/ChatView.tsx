@@ -56,7 +56,7 @@ export function ChatView(props: ChatViewProps) {
           <h2>어떤 작업을 시작할까요?</h2>
           <p>
             요구사항 분석, 워크플로우 생성, 파일 작성, 자료 조사처럼 결과가 분명한 작업을 요청해 주세요.
-            도구 호출과 승인 흐름은 조종석 패널에 함께 기록됩니다.
+            opencode 실행 이벤트와 변경 파일은 조종석 패널에 함께 기록됩니다.
           </p>
 
           <div className="chat-view__starter-grid" aria-hidden="true">
@@ -65,12 +65,12 @@ export function ChatView(props: ChatViewProps) {
               <span>요구사항, 조사, 후보안 비교, 실행 계획을 단계별 flow로 분해합니다.</span>
             </div>
             <div className="chat-view__starter-card">
-              <strong>도구 호출</strong>
-              <span>파일 읽기, 검색, MCP, 스킬 실행을 안전하게 추적합니다.</span>
+              <strong>opencode 실행</strong>
+              <span>파일 조사, 코드 변경, 명령 실행 결과를 run timeline으로 추적합니다.</span>
             </div>
             <div className="chat-view__starter-card">
-              <strong>승인 대기</strong>
-              <span>파일 쓰기와 외부 side effect는 승인 후 진행합니다.</span>
+              <strong>연결 상태</strong>
+              <span>API/OAuth 설정과 엔진 상태를 분리해서 확인하고 실행 실패를 빠르게 파악합니다.</span>
             </div>
           </div>
         </div>

@@ -1,6 +1,8 @@
 import { createAbortError } from "./process-control.js";
+import { isEngineRunError } from "./agent-engine.js";
 import type {
   AgentHeartbeatRecord,
+  AutomationRuleRecord,
   ConversationRecord,
   HeartbeatLogRecord,
   HeartbeatTriggerSource,
@@ -64,6 +66,7 @@ export function createTaskManager(params: {
       taskFlowId?: string | null;
       flowStepKey?: string | null;
       originRunId?: string | null;
+      automationRuleId?: string | null;
     }) => TaskRecord;
     getTask: (taskId: string) => TaskRecord | null;
     listTasks: (agentId: string) => TaskRecord[];
@@ -71,6 +74,12 @@ export function createTaskManager(params: {
     getConversation?: (conversationId: string) => ConversationRecord | null;
     listAgents?: () => Array<{ id: string }>;
     listHeartbeatLogs?: (agentId: string) => HeartbeatLogRecord[];
+    listDueAutomationRules?: (timestamp: number) => AutomationRuleRecord[];
+    enqueueAutomationRuleTask?: (
+      ruleId: string,
+      timestamp?: number,
+      force?: boolean,
+    ) => { rule: AutomationRuleRecord; task: TaskRecord; enqueued: boolean } | null;
     transitionHeartbeatLog?: (input: {
       id: string;
       taskId?: string | null;
@@ -346,6 +355,10 @@ export function createTaskManager(params: {
     if (task.taskKind !== "subagent" || !params.store.getConversation) {
       return;
     }
+    const trimmedAssistantText = assistantText.trim();
+    if (!trimmedAssistantText) {
+      return;
+    }
     const childConversation = params.store.getConversation(task.conversationId);
     const parentConversationId = childConversation?.parentConversationId ?? null;
     if (!childConversation || !parentConversationId) {
@@ -358,7 +371,7 @@ export function createTaskManager(params: {
       content: [
         `[Sub-agent complete: ${childConversation.title}]`,
         "",
-        assistantText.trim(),
+        trimmedAssistantText,
       ].join("\n"),
     });
   }
@@ -433,16 +446,31 @@ export function createTaskManager(params: {
       return params.store.getTaskFlow?.(flowId) ?? null;
     }
 
+    const conversation = params.store.getConversation?.(flow.conversationId) ?? null;
+    if (!conversation) {
+      const message = "Cannot start task flow because the linked session no longer exists.";
+      params.store.transitionTaskFlowStep?.({
+        stepId: nextStep.id,
+        status: "failed",
+        completedAt: Date.now(),
+      });
+      params.store.transitionTaskFlow({
+        flowId,
+        status: "failed",
+        errorText: message,
+        completedAt: Date.now(),
+      });
+      return params.store.getTaskFlow?.(flowId) ?? null;
+    }
+
     const task = await enqueueDetachedTask({
       agentId: flow.agentId,
       conversationId: flow.conversationId,
       title: nextStep.title,
       prompt: nextStep.prompt,
-      providerKind:
-        params.store.getConversation?.(flow.conversationId)?.providerKind ?? "openai",
-      model: params.store.getConversation?.(flow.conversationId)?.model ?? "gpt-5.4",
-      reasoningLevel:
-        params.store.getConversation?.(flow.conversationId)?.reasoningLevel ?? "medium",
+      providerKind: conversation.providerKind,
+      model: conversation.model,
+      reasoningLevel: conversation.reasoningLevel,
       taskKind: "flow_step",
       taskFlowId: flow.id,
       flowStepKey: nextStep.stepKey,
@@ -630,31 +658,36 @@ export function createTaskManager(params: {
         nestingDepth: task.nestingDepth ?? 0,
       });
 
-      const message = params.store.appendMessage({
-        conversationId: task.conversationId,
-        role: "assistant",
-        content: [taskCompletionPrefix(taskKind), "", result.assistantText.trim()].join("\n"),
-      });
+      const assistantText = result.assistantText.trim();
+      const message = assistantText
+        ? params.store.appendMessage({
+            conversationId: task.conversationId,
+            role: "assistant",
+            content: [taskCompletionPrefix(taskKind), "", assistantText].join("\n"),
+          })
+        : null;
       params.store.transitionTask({
         taskId,
         status: "completed",
         eventType: "completed",
         payload: {
           runId: result.runId,
-          messageId: message.id,
+          messageId: message?.id ?? null,
+          assistantTextPresent: Boolean(assistantText),
         },
         runId: result.runId,
-        resultText: result.assistantText,
+        resultText: assistantText || null,
       });
       params.store.appendTaskEvent({
         taskId,
         eventType: "result_delivered",
         payload: {
-          messageId: message.id,
+          messageId: message?.id ?? null,
+          assistantTextPresent: Boolean(assistantText),
         },
       });
-      announceSubagentCompletion(task, result.assistantText);
-      transitionFlowForTask(task, "completed", result.assistantText);
+      announceSubagentCompletion(task, assistantText);
+      transitionFlowForTask(task, "completed", assistantText);
       if (heartbeatLog && params.store.transitionHeartbeatLog) {
         params.store.transitionHeartbeatLog({
           id: heartbeatLog.id,
@@ -666,8 +699,8 @@ export function createTaskManager(params: {
     } catch (error) {
       const status: TaskStatus = controller.signal.aborted
         ? "cancelled"
-        : error instanceof Error && /timed out/i.test(error.message)
-          ? "timed_out"
+        : isEngineRunError(error) && error.taskStatus
+          ? error.taskStatus
           : "failed";
       params.store.transitionTask({
         taskId,
@@ -806,6 +839,25 @@ export function createTaskManager(params: {
             await params.scheduleHeartbeatRun({
               agentId,
               triggerSource: "scheduler",
+            });
+          }
+        }
+      }
+
+      if (params.store.listDueAutomationRules && params.store.enqueueAutomationRuleTask) {
+        for (const rule of params.store.listDueAutomationRules(now)) {
+          const result = params.store.enqueueAutomationRuleTask(rule.id, now, false);
+          if (result?.enqueued) {
+            params.store.appendTaskEvent({
+              taskId: result.task.id,
+              eventType: "status",
+              payload: {
+                phase: "automation_rule",
+                message: "자동화 규칙에 의해 예약 작업이 생성되었습니다.",
+                automationRuleId: rule.id,
+                automationTitle: rule.title,
+                nextRunAt: result.rule.nextRunAt,
+              },
             });
           }
         }

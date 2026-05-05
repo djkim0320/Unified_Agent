@@ -10,11 +10,14 @@ interface ConnectionStatusProps {
 
 export function ConnectionStatus(props: ConnectionStatusProps) {
   const backendOffline = props.backendOnline === false;
-  const statusLabel = backendOffline ? "서버 오프라인" : "정상";
-  const statusClass = backendOffline ? "is-backend-offline" : "is-connected";
+  const backendChecking = props.backendOnline === null || props.backendOnline === undefined;
+  const statusLabel = backendOffline ? "서버 오프라인" : backendChecking ? "서버 확인 중" : "정상";
+  const statusClass = backendOffline ? "is-backend-offline" : backendChecking ? "is-checking" : "is-connected";
   const summaryText = backendOffline
     ? "백엔드 서버 응답이 없습니다."
-    : props.modelsLoading
+    : backendChecking
+      ? "백엔드 연결 상태를 확인하는 중입니다."
+      : props.modelsLoading
       ? "모델 목록을 확인하는 중입니다."
       : `${props.modelCount}개 모델 사용 가능`;
 

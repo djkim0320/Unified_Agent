@@ -3,18 +3,19 @@ import {
   cancelAgentTask,
   cancelSubagentSession,
   cancelTaskFlow,
+  createAgentAutomationRule,
   createAgentTask,
   createSubagentSession,
   createTaskFlow,
   deleteAgent,
+  deleteAgentAutomationRule,
   deleteTaskFlow,
-  getAgentMemory,
   getAgentHeartbeat,
+  getEngineRun,
   getAgentSoul,
   getAgentStandingOrders,
-  getWorkspaceFile,
-  getWorkspaceTree,
   listChannels,
+  listAgentAutomationRules,
   listAgentTasks,
   listHeartbeatLogs,
   listPlatformMetadata,
@@ -22,22 +23,21 @@ import {
   listSubagentSessions,
   listTaskEvents,
   listTaskFlows,
-  listTools,
   listWorkspaceRunEvents,
   saveAgentStandingOrders,
   saveAgentHeartbeat,
   saveAgentSoul,
   saveTaskFlowSteps,
-  searchAgentMemory,
   resumeTaskFlow,
   retryTaskFlowStep,
   skipTaskFlowStep,
   startTaskFlow,
+  triggerAgentAutomationRule,
   triggerAgentHeartbeat,
+  updateAgentAutomationRule,
   getTaskFlow,
   startOpenCodeAuthLogin,
   streamChat,
-  writeAgentMemory,
 } from "./api";
 
 function createSseResponse(body: string) {
@@ -134,57 +134,19 @@ describe("api helpers", () => {
     );
   });
 
-  it("includes conversationId when fetching workspace tree and file payloads", async () => {
+  it("includes conversationId when fetching engine run summaries", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ scope: "sandbox", path: ".", tree: [] }), {
+      new Response(JSON.stringify({ engineRun: { runId: "run-123", engineKind: "opencode" } }), {
         headers: {
           "Content-Type": "application/json",
         },
       }),
     );
-    await getWorkspaceTree({
-      conversationId: "11111111-1111-4111-8111-111111111111",
-      scope: "sandbox",
-      path: "docs",
-      maxDepth: 2,
-    });
+
+    await getEngineRun("11111111-1111-4111-8111-111111111111", "run-123");
 
     expect(fetch).toHaveBeenCalledWith(
-      "/api/workspace/tree?conversationId=11111111-1111-4111-8111-111111111111&scope=sandbox&path=docs&maxDepth=2",
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          "Content-Type": "application/json",
-        }),
-      }),
-    );
-
-    vi.mocked(fetch).mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          file: {
-            scope: "sandbox",
-            path: "docs/readme.md",
-            content: "# readme",
-            binary: false,
-            unsupportedEncoding: false,
-            encoding: "utf-8",
-          },
-        }),
-        {
-          headers: {
-            "Content-Type": "application/json",
-          },
-        },
-      ),
-    );
-    await getWorkspaceFile({
-      conversationId: "11111111-1111-4111-8111-111111111111",
-      scope: "sandbox",
-      path: "docs/readme.md",
-    });
-
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/workspace/file?conversationId=11111111-1111-4111-8111-111111111111&scope=sandbox&path=docs%2Freadme.md",
+      "/api/engine/runs/run-123?conversationId=11111111-1111-4111-8111-111111111111",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",
@@ -193,9 +155,9 @@ describe("api helpers", () => {
     );
   });
 
-  it("uses scoped agent task and memory endpoints", async () => {
+  it("uses scoped agent task endpoints", async () => {
     vi.mocked(fetch).mockImplementation(async () =>
-      new Response(JSON.stringify({ ok: true, task: {}, tasks: [], events: [], memory: {} }), {
+      new Response(JSON.stringify({ ok: true, task: {}, tasks: [], events: [] }), {
         headers: {
           "Content-Type": "application/json",
         },
@@ -206,8 +168,6 @@ describe("api helpers", () => {
     await createAgentTask("agent-1", { prompt: "do work" });
     await cancelAgentTask("agent-1", "task-1");
     await listTaskEvents("agent-1", "task-1");
-    await getAgentMemory("agent-1");
-    await writeAgentMemory("agent-1", { content: "remember this", target: "durable" });
 
     expect(fetch).toHaveBeenNthCalledWith(
       1,
@@ -241,9 +201,31 @@ describe("api helpers", () => {
         }),
       }),
     );
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("uses scoped agent automation rule endpoints", async () => {
+    vi.mocked(fetch).mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: true, rule: {}, rules: [], task: {} }), {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
+    await listAgentAutomationRules("agent-1");
+    await createAgentAutomationRule("agent-1", {
+      title: "Daily sweep",
+      prompt: "Summarize state",
+      intervalMinutes: 60,
+    });
+    await updateAgentAutomationRule("agent-1", "rule-1", { enabled: false });
+    await triggerAgentAutomationRule("agent-1", "rule-1");
+    await deleteAgentAutomationRule("agent-1", "rule-1");
+
     expect(fetch).toHaveBeenNthCalledWith(
-      5,
-      "/api/agents/agent-1/memory",
+      1,
+      "/api/agents/agent-1/automation-rules",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",
@@ -251,11 +233,24 @@ describe("api helpers", () => {
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      6,
-      "/api/agents/agent-1/memory",
-      expect.objectContaining({
-        method: "POST",
-      }),
+      2,
+      "/api/agents/agent-1/automation-rules",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      "/api/agents/agent-1/automation-rules/rule-1",
+      expect.objectContaining({ method: "PATCH" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      4,
+      "/api/agents/agent-1/automation-rules/rule-1/trigger",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      5,
+      "/api/agents/agent-1/automation-rules/rule-1",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 
@@ -403,17 +398,12 @@ describe("api helpers", () => {
     );
   });
 
-  it("uses standing orders, memory search, sub-agent, and task flow endpoints", async () => {
+  it("uses standing orders, sub-agent, and task flow endpoints", async () => {
     vi.mocked(fetch).mockImplementation(async (input: string | URL | Request) => {
       const url = input.toString();
       const method = input instanceof Request ? input.method : "GET";
       if (url.endsWith("/standing-orders")) {
         return new Response(JSON.stringify({ standingOrders: { path: "standing-orders.md", content: "# orders" } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      if (url.includes("/memory/search")) {
-        return new Response(JSON.stringify({ results: [{ path: "MEMORY.md", excerpt: "keep it short" }] }), {
           headers: { "Content-Type": "application/json" },
         });
       }
@@ -534,7 +524,6 @@ describe("api helpers", () => {
 
     await getAgentStandingOrders("agent-1");
     await saveAgentStandingOrders("agent-1", { content: "# orders" });
-    await searchAgentMemory("agent-1", { query: "note", maxResults: 5 });
     await listSubagentSessions("conversation-1");
     await createSubagentSession("conversation-1", { prompt: "help me" });
     await cancelSubagentSession("conversation-2");
@@ -571,7 +560,7 @@ describe("api helpers", () => {
     );
     expect(fetch).toHaveBeenNthCalledWith(
       3,
-      "/api/agents/agent-1/memory/search?query=note&maxResults=5",
+      "/api/sessions/conversation-1/subagents",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",
@@ -582,27 +571,18 @@ describe("api helpers", () => {
       4,
       "/api/sessions/conversation-1/subagents",
       expect.objectContaining({
-        headers: expect.objectContaining({
-          "Content-Type": "application/json",
-        }),
-      }),
-    );
-    expect(fetch).toHaveBeenNthCalledWith(
-      5,
-      "/api/sessions/conversation-1/subagents",
-      expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      6,
+      5,
       "/api/subagents/conversation-2/cancel",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      7,
+      6,
       "/api/agents/agent-1/flows",
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -611,14 +591,14 @@ describe("api helpers", () => {
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      8,
+      7,
       "/api/agents/agent-1/flows",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      9,
+      8,
       "/api/flows/flow-1",
       expect.objectContaining({
         headers: expect.objectContaining({
@@ -627,7 +607,7 @@ describe("api helpers", () => {
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      10,
+      9,
       "/api/flows/flow-1/steps",
       expect.objectContaining({
         method: "PUT",
@@ -635,42 +615,42 @@ describe("api helpers", () => {
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      11,
+      10,
       "/api/flows/flow-1",
       expect.objectContaining({
         method: "DELETE",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      12,
+      11,
       "/api/flows/flow-1/cancel",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      13,
+      12,
       "/api/flows/flow-1/start",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      14,
+      13,
       "/api/flows/flow-1/resume",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      15,
+      14,
       "/api/flows/flow-1/steps/step-1/retry",
       expect.objectContaining({
         method: "POST",
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
-      16,
+      15,
       "/api/flows/flow-1/steps/step-1/skip",
       expect.objectContaining({
         method: "POST",
@@ -686,11 +666,6 @@ describe("api helpers", () => {
           headers: { "Content-Type": "application/json" },
         });
       }
-      if (url === "/api/tools") {
-        return new Response(JSON.stringify({ tools: [] }), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
       if (url === "/api/channels") {
         return new Response(JSON.stringify({ channels: [] }), {
           headers: { "Content-Type": "application/json" },
@@ -703,7 +678,6 @@ describe("api helpers", () => {
 
     await deleteAgent("agent-1");
     await listPlugins();
-    await listTools();
     await listChannels();
     const metadata = await listPlatformMetadata();
 
@@ -722,14 +696,6 @@ describe("api helpers", () => {
     );
     expect(fetch).toHaveBeenCalledWith(
       "/api/plugins",
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          "Content-Type": "application/json",
-        }),
-      }),
-    );
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/tools",
       expect.objectContaining({
         headers: expect.objectContaining({
           "Content-Type": "application/json",

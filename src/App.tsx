@@ -3,11 +3,13 @@ import {
   cancelAgentTask,
   deleteConversation,
   deleteAgent,
+  createAgentAutomationRule,
   createAgentTask,
   cancelSubagentSession,
   cancelTaskFlow,
   createSubagentSession,
   createTaskFlow,
+  deleteAgentAutomationRule,
   deleteTaskFlow,
   getAgentStandingOrders,
   getAgentHeartbeat,
@@ -15,6 +17,7 @@ import {
   getEngineStatus,
   getConversationMessages,
   importCodexCliAuth,
+  listAgentAutomationRules,
   listAgentTasks,
   listAgents,
   listConversations,
@@ -42,7 +45,9 @@ import {
   startOpenCodeAuthLogin,
   skipTaskFlowStep,
   startTaskFlow,
+  triggerAgentAutomationRule,
   triggerAgentHeartbeat,
+  updateAgentAutomationRule,
   getTaskFlow,
   streamChat,
   testProvider,
@@ -60,7 +65,7 @@ import { Composer } from "./components/Composer";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConversationList, type CockpitNavTarget } from "./components/ConversationList";
 import { ProviderSettingsDialog } from "./components/ProviderSettingsDialog";
-import { useComputerUse } from "./hooks/useComputerUse";
+import { SettingsSectionView } from "./components/SettingsSectionView";
 import { getModelOption } from "./model-catalog";
 import { getReasoningLabel, normalizeReasoningLevel } from "./reasoning-options";
 import {
@@ -68,14 +73,13 @@ import {
   defaultReasoningLevels,
   providerKinds,
   providerLabels,
-  type AgentMemoryRecord,
   type AgentRecord,
   type AgentHeartbeatRecord,
+  type AutomationRuleRecord,
   type ConversationRecord,
   type DisplayMessage,
   type HeartbeatLogRecord,
   type AgentSoulRecord,
-  type MemorySearchResult,
   type ProviderDraft,
   type ProviderKind,
   type PlatformMetadata,
@@ -87,11 +91,8 @@ import {
   type TaskFlowStepDraft,
   type TaskFlowStepDetail,
   type TaskRecord,
-  type WorkspaceFileRecord,
   type WorkspaceRunEventRecord,
   type WorkspaceRunRecord,
-  type WorkspaceScope,
-  type WorkspaceTreeNode,
   type EngineStatusRecord,
 } from "./types";
 import {
@@ -128,8 +129,10 @@ function createAgentDraft(agent: AgentRecord | null): AgentDraft {
   };
 }
 
+type AppSection = "chat" | "workflow" | "settings";
+
 export default function App() {
-  const [activeSection, setActiveSection] = useState<"chat" | "workspace">("chat");
+  const [activeSection, setActiveSection] = useState<AppSection>("chat");
   const [activeNavTarget, setActiveNavTarget] = useState<CockpitNavTarget>("chat");
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
@@ -152,28 +155,6 @@ export default function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
-  const {
-    computerUseAllowlistDraft,
-    computerUseClickSelector,
-    computerUseDetail,
-    computerUseError,
-    computerUseLoading,
-    computerUseNavigationUrl,
-    computerUseSettings,
-    handleApproveComputerUseAction,
-    handleClickComputerUseSession,
-    handleCloseComputerUseSession,
-    handleCreateComputerUseSession,
-    handleDenyComputerUseAction,
-    handleNavigateComputerUseSession,
-    handleSaveComputerUseSettings,
-    handleScreenshotComputerUseSession,
-    handleSensitiveTypeComputerUseSession,
-    handleToggleComputerUseEnabled,
-    setComputerUseAllowlistDraft,
-    setComputerUseClickSelector,
-    setComputerUseNavigationUrl,
-  } = useComputerUse({ activeAgentId, activeConversationId });
   const [providerDrafts, setProviderDrafts] = useState<Record<ProviderKind, ProviderDraft>>(
     createEmptyDrafts(),
   );
@@ -188,8 +169,6 @@ export default function App() {
   );
   const [standingOrders, setStandingOrders] = useState<StandingOrdersRecord | null>(null);
   const [standingOrdersDraft, setStandingOrdersDraft] = useState("");
-  const [memorySearchResults, setMemorySearchResults] = useState<MemorySearchResult[]>([]);
-  const [memorySearchLoading, setMemorySearchLoading] = useState(false);
   const [subagentSessions, setSubagentSessions] = useState<ConversationRecord[]>([]);
   const [taskFlows, setTaskFlows] = useState<TaskFlowRecord[]>([]);
   const [selectedTaskFlowId, setSelectedTaskFlowId] = useState<string | null>(null);
@@ -198,29 +177,25 @@ export default function App() {
     steps: TaskFlowStepDetail[];
   } | null>(null);
   const [heartbeatLogs, setHeartbeatLogs] = useState<HeartbeatLogRecord[]>([]);
+  const [automationRules, setAutomationRules] = useState<AutomationRuleRecord[]>([]);
+  const [heartbeatTriggering, setHeartbeatTriggering] = useState(false);
+  const [triggeringAutomationRuleIds, setTriggeringAutomationRuleIds] = useState<string[]>([]);
+  const [providerAuthAction, setProviderAuthAction] = useState<string | null>(null);
   const [savingAgent, setSavingAgent] = useState(false);
   const [savingStandingOrders, setSavingStandingOrders] = useState(false);
   const [deletingAgentId, setDeletingAgentId] = useState<string | null>(null);
   const [savingKind, setSavingKind] = useState<ProviderKind | null>(null);
   const [testingKind, setTestingKind] = useState<ProviderKind | null>(null);
   const [streaming, setStreaming] = useState(false);
-  const [workspaceScope, setWorkspaceScope] = useState<WorkspaceScope>("sandbox");
-  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode[]>([]);
-  const [workspaceFile, setWorkspaceFile] = useState<WorkspaceFileRecord | null>(null);
   const [workspaceRuns, setWorkspaceRuns] = useState<WorkspaceRunRecord[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
-  const [agentMemory, setAgentMemory] = useState<AgentMemoryRecord | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [taskEvents, setTaskEvents] = useState<TaskEventRecord[]>([]);
   const [platformMetadata, setPlatformMetadata] = useState<PlatformMetadata | null>(null);
-  const [platformMetadataLoading, setPlatformMetadataLoading] = useState(false);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
-  const [workspaceTreeLoading, setWorkspaceTreeLoading] = useState(false);
-  const [workspaceRunsLoading, setWorkspaceRunsLoading] = useState(false);
-  const [workspaceFileLoading, setWorkspaceFileLoading] = useState(false);
 
   const activeConversationIdRef = useRef<string | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
@@ -233,26 +208,25 @@ export default function App() {
   const conversationListControllerRef = useRef<AbortController | null>(null);
   const conversationLoadSeqRef = useRef(0);
   const conversationLoadControllerRef = useRef<AbortController | null>(null);
-  const workspaceTreeSeqRef = useRef(0);
-  const workspaceTreeControllerRef = useRef<AbortController | null>(null);
   const workspaceRunsSeqRef = useRef(0);
   const workspaceRunsControllerRef = useRef<AbortController | null>(null);
   const tasksSeqRef = useRef(0);
   const tasksControllerRef = useRef<AbortController | null>(null);
   const taskEventsSeqRef = useRef(0);
   const taskEventsControllerRef = useRef<AbortController | null>(null);
-  const memorySeqRef = useRef(0);
-  const memoryControllerRef = useRef<AbortController | null>(null);
   const soulSeqRef = useRef(0);
   const soulControllerRef = useRef<AbortController | null>(null);
   const heartbeatSeqRef = useRef(0);
   const heartbeatControllerRef = useRef<AbortController | null>(null);
   const heartbeatLogsSeqRef = useRef(0);
   const heartbeatLogsControllerRef = useRef<AbortController | null>(null);
+  const automationRulesSeqRef = useRef(0);
+  const automationRulesControllerRef = useRef<AbortController | null>(null);
+  const heartbeatTriggeringRef = useRef(false);
+  const triggeringAutomationRuleIdsRef = useRef<Set<string>>(new Set());
+  const providerAuthActionRef = useRef<string | null>(null);
   const standingOrdersSeqRef = useRef(0);
   const standingOrdersControllerRef = useRef<AbortController | null>(null);
-  const memorySearchSeqRef = useRef(0);
-  const memorySearchControllerRef = useRef<AbortController | null>(null);
   const subagentSessionsSeqRef = useRef(0);
   const subagentSessionsControllerRef = useRef<AbortController | null>(null);
   const taskFlowsSeqRef = useRef(0);
@@ -263,8 +237,6 @@ export default function App() {
   const platformMetadataControllerRef = useRef<AbortController | null>(null);
   const workspaceEventsSeqRef = useRef(0);
   const workspaceEventsControllerRef = useRef<AbortController | null>(null);
-  const workspaceFileSeqRef = useRef(0);
-  const workspaceFileControllerRef = useRef<AbortController | null>(null);
   const streamSeqRef = useRef(0);
   const streamControllerRef = useRef<AbortController | null>(null);
 
@@ -352,12 +324,11 @@ export default function App() {
     abortConversationScopedRequests();
     abortRef(tasksControllerRef);
     abortRef(taskEventsControllerRef);
-    abortRef(memoryControllerRef);
     abortRef(soulControllerRef);
     abortRef(heartbeatControllerRef);
     abortRef(heartbeatLogsControllerRef);
+    abortRef(automationRulesControllerRef);
     abortRef(standingOrdersControllerRef);
-    abortRef(memorySearchControllerRef);
     abortRef(taskFlowsControllerRef);
     abortRef(taskFlowDetailControllerRef);
   }
@@ -369,10 +340,8 @@ export default function App() {
 
   function abortConversationScopedRequests() {
     abortRef(conversationLoadControllerRef);
-    abortRef(workspaceTreeControllerRef);
     abortRef(workspaceRunsControllerRef);
     abortRef(workspaceEventsControllerRef);
-    abortRef(workspaceFileControllerRef);
     abortRef(streamControllerRef);
     abortRef(subagentSessionsControllerRef);
   }
@@ -380,16 +349,11 @@ export default function App() {
   function resetConversationWorkspaceState() {
     selectedRunIdRef.current = null;
     manualRunSelectionRef.current = false;
-    setWorkspaceTree([]);
-    setWorkspaceFile(null);
     setWorkspaceRuns([]);
     setSelectedRunId(null);
     setWorkspaceRunEvents([]);
     setLiveEvents([]);
     setChangedFiles([]);
-    setWorkspaceTreeLoading(false);
-    setWorkspaceRunsLoading(false);
-    setWorkspaceFileLoading(false);
     setSubagentSessions([]);
   }
 
@@ -399,16 +363,14 @@ export default function App() {
     selectedTaskFlowIdRef.current = null;
     setSelectedTaskFlowId(null);
     setTasks([]);
-    setAgentMemory(null);
     setAgentSoul(null);
     setAgentHeartbeat(null);
     setStandingOrders(null);
     setStandingOrdersDraft("");
-    setMemorySearchResults([]);
-    setMemorySearchLoading(false);
     setTaskFlows([]);
     setSelectedTaskFlow(null);
     setHeartbeatLogs([]);
+    setAutomationRules([]);
     setSelectedTaskId(null);
     setTaskEvents([]);
   }
@@ -537,17 +499,8 @@ export default function App() {
       }
     }
   }
-  async function refreshWorkspaceTree(conversationId: string, scope: WorkspaceScope) {
-    void conversationId;
-    void scope;
-    setWorkspaceTree([]);
-    setWorkspaceFile(null);
-    setWorkspaceTreeLoading(false);
-  }
-
   async function refreshWorkspaceRuns(conversationId: string, preferredRunId?: string | null) {
     const request = beginRequest(workspaceRunsSeqRef, workspaceRunsControllerRef);
-    setWorkspaceRunsLoading(true);
 
     try {
       const response = await listWorkspaceRuns(conversationId, request.controller.signal);
@@ -587,7 +540,6 @@ export default function App() {
       setAppNotice(error instanceof Error ? error.message : "실행 로그를 불러오지 못했습니다.");
     } finally {
       if (workspaceRunsSeqRef.current === request.seq) {
-        setWorkspaceRunsLoading(false);
         abortRef(workspaceRunsControllerRef);
       }
     }
@@ -658,13 +610,6 @@ export default function App() {
     }
   }
 
-  async function refreshAgentMemory(agentId: string) {
-    void agentId;
-    memorySeqRef.current += 1;
-    abortRef(memoryControllerRef);
-    setAgentMemory(null);
-  }
-
   async function refreshAgentSoul(agentId: string) {
     const request = beginRequest(soulSeqRef, soulControllerRef);
 
@@ -718,23 +663,6 @@ export default function App() {
         abortRef(standingOrdersControllerRef);
       }
     }
-  }
-
-  async function refreshMemorySearch(agentId: string, query: string) {
-    const trimmedQuery = query.trim();
-    void agentId;
-    memorySearchSeqRef.current += 1;
-    abortRef(memorySearchControllerRef);
-
-    if (!trimmedQuery) {
-      setMemorySearchResults([]);
-      setMemorySearchLoading(false);
-      return;
-    }
-
-    setMemorySearchResults([]);
-    setMemorySearchLoading(false);
-    setAppNotice("메모리 파일 검색은 opencode-only 모드에서 제거되었습니다. 필요한 내용은 채팅이나 워크플로우로 opencode에 요청하세요.");
   }
 
   async function refreshSubagentSessions(sessionId: string) {
@@ -893,9 +821,35 @@ export default function App() {
     }
   }
 
+  async function refreshAutomationRules(agentId: string) {
+    const request = beginRequest(automationRulesSeqRef, automationRulesControllerRef);
+
+    try {
+      const response = await listAgentAutomationRules(agentId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        automationRulesSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId
+      ) {
+        return;
+      }
+
+      setAutomationRules(response.rules);
+    } catch (error) {
+      if (request.controller.signal.aborted || automationRulesSeqRef.current !== request.seq) {
+        return;
+      }
+
+      setAppNotice(error instanceof Error ? error.message : "자동화 규칙을 불러오지 못했습니다.");
+    } finally {
+      if (automationRulesSeqRef.current === request.seq) {
+        abortRef(automationRulesControllerRef);
+      }
+    }
+  }
+
   async function refreshPlatformMetadata(agentId = activeAgentIdRef.current) {
     const request = beginRequest(platformMetadataSeqRef, platformMetadataControllerRef);
-    setPlatformMetadataLoading(true);
 
     try {
       const response = await listPlatformMetadata(agentId, request.controller.signal);
@@ -914,7 +868,6 @@ export default function App() {
       setAppNotice(error instanceof Error ? error.message : "플랫폼 정보를 불러오지 못했습니다.");
     } finally {
       if (platformMetadataSeqRef.current === request.seq) {
-        setPlatformMetadataLoading(false);
         abortRef(platformMetadataControllerRef);
       }
     }
@@ -952,19 +905,6 @@ export default function App() {
         abortRef(workspaceEventsControllerRef);
       }
     }
-  }
-
-  async function openWorkspaceFile(path: string) {
-    void path;
-    workspaceFileSeqRef.current += 1;
-    if (!activeConversationId) {
-      return;
-    }
-
-    setWorkspaceFile(null);
-    setWorkspaceFileLoading(false);
-    setAppNotice("File browsing is retired in opencode-only mode. Ask opencode in Chat to inspect or edit files.");
-    return;
   }
 
   async function updateConversation(patch: Partial<ConversationRecord>) {
@@ -1074,10 +1014,9 @@ export default function App() {
       setAgentSoul(null);
       setAgentHeartbeat(null);
       setHeartbeatLogs([]);
+      setAutomationRules([]);
       setStandingOrders(null);
       setStandingOrdersDraft("");
-      setMemorySearchResults([]);
-      setMemorySearchLoading(false);
       setTaskFlows([]);
       setSelectedTaskFlowId(null);
       setSelectedTaskFlow(null);
@@ -1100,11 +1039,11 @@ export default function App() {
       void refreshAgentSoul(activeAgentId);
       void refreshAgentHeartbeat(activeAgentId);
       void refreshHeartbeatLogs(activeAgentId);
+      void refreshAutomationRules(activeAgentId);
       void refreshStandingOrders(activeAgentId);
       void refreshTaskFlows(activeAgentId);
       const loadedConversations = await refreshConversationList(null, activeAgentId);
       void refreshAgentTasks(activeAgentId);
-      void refreshAgentMemory(activeAgentId);
       if (loadedConversations.length === 0) {
         await createConversationThread(undefined, activeAgentId);
       }
@@ -1143,7 +1082,6 @@ export default function App() {
     }
 
     void refreshWorkspaceRuns(activeConversationId, selectedRunIdRef.current);
-    setWorkspaceFile(null);
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -1228,9 +1166,7 @@ export default function App() {
   const activeModelsError = activeConversation
     ? modelErrorsByProvider[activeConversation.providerKind]
     : null;
-  const workspaceLoading = workspaceTreeLoading || workspaceRunsLoading || workspaceFileLoading;
-  const activeWorkspaceTarget: Exclude<CockpitNavTarget, "chat" | "settings"> =
-    activeNavTarget === "chat" || activeNavTarget === "settings" ? "workflow" : activeNavTarget;
+  const activeWorkspaceTarget = "workflow" as const;
   const activeProviderLabel = activeConversation
     ? providersByKind[activeConversation.providerKind]?.label ?? activeConversation.providerKind
     : "선택 안 됨";
@@ -1313,23 +1249,19 @@ export default function App() {
   }
 
   function handleCockpitNavigate(target: CockpitNavTarget) {
-    const nextTarget: CockpitNavTarget =
-      target === "computer" || target === "mcp" || target === "skills" || target === "files"
-        ? "workflow"
-        : target;
-    setActiveNavTarget(nextTarget);
+    setActiveNavTarget(target);
 
-    if (nextTarget === "chat") {
+    if (target === "chat") {
       setActiveSection("chat");
       return;
     }
 
-    if (nextTarget === "settings") {
-      handleOpenProviderSettings();
+    if (target === "settings") {
+      setActiveSection("settings");
       return;
     }
 
-    setActiveSection("workspace");
+    setActiveSection("workflow");
   }
 
   async function handleSaveAgentDefaults() {
@@ -1518,14 +1450,6 @@ export default function App() {
     }
   }
 
-  async function handleMemorySearch(query: string) {
-    if (!activeAgentId) {
-      return;
-    }
-
-    await refreshMemorySearch(activeAgentId, query);
-  }
-
   async function handleCreateSubagentSession(payload: { title?: string; prompt: string }) {
     if (!activeConversation || !activeAgentId) {
       setAppNotice("대화를 먼저 선택하세요.");
@@ -1608,30 +1532,6 @@ export default function App() {
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "작업 흐름 생성에 실패했습니다.");
     }
-  }
-
-  async function handleCreateSkill(payload: {
-    name: string;
-    content: string;
-    scope?: "agent" | "shared";
-  }) {
-    void payload;
-    if (!activeAgentId) {
-      setAppNotice("스킬을 추가할 에이전트를 먼저 선택하세요.");
-      return;
-    }
-    setAppNotice("AetherOps 내부 스킬 저장소는 opencode-only 모드에서 비활성화되었습니다. 스킬/도구는 opencode 설정 또는 MCP로 연결해 주세요.");
-  }
-
-  async function handleCreateMcpServerProfile(payload: {
-    label: string;
-    transport?: "stdio" | "http" | "mock";
-    command?: string;
-    description?: string;
-    enabled?: boolean;
-  }) {
-    void payload;
-    setAppNotice("AetherOps 내부 MCP 프로필 저장은 opencode-only 모드에서 비활성화되었습니다. opencode의 MCP 설정 파일에 서버를 연결해 주세요.");
   }
 
   async function handleTaskFlowControl(
@@ -1775,8 +1675,14 @@ export default function App() {
       setAppNotice("에이전트를 먼저 선택하세요.");
       return;
     }
+    if (heartbeatTriggeringRef.current) {
+      setAppNotice("Heartbeat 실행 요청을 이미 처리 중입니다.");
+      return;
+    }
 
     const agentId = activeAgentId;
+    heartbeatTriggeringRef.current = true;
+    setHeartbeatTriggering(true);
     try {
       const response = await triggerAgentHeartbeat(agentId);
       const nextLog = response.log ?? response.heartbeatLog ?? null;
@@ -1793,6 +1699,121 @@ export default function App() {
       void refreshHeartbeatLogs(agentId);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Heartbeat 실행에 실패했습니다.");
+    } finally {
+      heartbeatTriggeringRef.current = false;
+      setHeartbeatTriggering(false);
+    }
+  }
+
+  async function handleCreateAutomationRule(payload: {
+    title: string;
+    prompt: string;
+    intervalMinutes: number;
+    enabled: boolean;
+  }) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    try {
+      const response = await createAgentAutomationRule(agentId, {
+        ...payload,
+        conversationId: activeConversationIdRef.current,
+        providerKind: activeConversation?.providerKind ?? activeAgent?.providerKind,
+        model: activeConversation?.model ?? activeAgent?.model,
+        reasoningLevel: activeConversation?.reasoningLevel ?? activeAgent?.reasoningLevel,
+      });
+      if (activeAgentIdRef.current === agentId) {
+        setAutomationRules((current) => [response.rule, ...current.filter((rule) => rule.id !== response.rule.id)]);
+        setAppNotice("자동화 규칙을 만들었습니다.");
+      }
+      void refreshAutomationRules(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "자동화 규칙을 만들지 못했습니다.");
+    }
+  }
+
+  async function handleUpdateAutomationRule(
+    ruleId: string,
+    payload: Partial<{
+      title: string;
+      prompt: string;
+      intervalMinutes: number;
+      enabled: boolean;
+    }>,
+  ) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    try {
+      const response = await updateAgentAutomationRule(agentId, ruleId, payload);
+      if (response.rule && activeAgentIdRef.current === agentId) {
+        setAutomationRules((current) =>
+          current.map((rule) => (rule.id === response.rule!.id ? response.rule! : rule)),
+        );
+      }
+      setAppNotice("자동화 규칙을 저장했습니다.");
+      void refreshAutomationRules(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "자동화 규칙을 저장하지 못했습니다.");
+    }
+  }
+
+  async function handleDeleteAutomationRule(ruleId: string) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    if (!window.confirm("이 자동화 규칙을 삭제할까요? 과거 작업 로그는 유지됩니다.")) {
+      return;
+    }
+    const agentId = activeAgentId;
+    try {
+      await deleteAgentAutomationRule(agentId, ruleId);
+      if (activeAgentIdRef.current === agentId) {
+        setAutomationRules((current) => current.filter((rule) => rule.id !== ruleId));
+        setAppNotice("자동화 규칙을 삭제했습니다.");
+      }
+      void refreshAutomationRules(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "자동화 규칙을 삭제하지 못했습니다.");
+    }
+  }
+
+  async function handleTriggerAutomationRule(ruleId: string) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    if (triggeringAutomationRuleIdsRef.current.has(ruleId)) {
+      setAppNotice("이 자동화 규칙은 이미 실행 요청을 처리 중입니다.");
+      return;
+    }
+    const agentId = activeAgentId;
+    triggeringAutomationRuleIdsRef.current = new Set(triggeringAutomationRuleIdsRef.current).add(ruleId);
+    setTriggeringAutomationRuleIds(Array.from(triggeringAutomationRuleIdsRef.current));
+    try {
+      const response = await triggerAgentAutomationRule(agentId, ruleId);
+      if (activeAgentIdRef.current === agentId) {
+        setAutomationRules((current) =>
+          current.map((rule) => (rule.id === response.rule.id ? response.rule : rule)),
+        );
+        setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+        setSelectedTaskId(response.task.id);
+        setAppNotice(response.message ?? "자동화 규칙을 즉시 실행했습니다.");
+      }
+      void refreshAutomationRules(agentId);
+      void refreshAgentTasks(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "자동화 규칙을 실행하지 못했습니다.");
+    } finally {
+      const nextPendingRuleIds = new Set(triggeringAutomationRuleIdsRef.current);
+      nextPendingRuleIds.delete(ruleId);
+      triggeringAutomationRuleIdsRef.current = nextPendingRuleIds;
+      setTriggeringAutomationRuleIds(Array.from(nextPendingRuleIds));
     }
   }
 
@@ -1822,7 +1843,28 @@ export default function App() {
     }
   }
 
+  function beginProviderAuthAction(action: string) {
+    if (providerAuthActionRef.current) {
+      setAppNotice("다른 인증 작업을 처리 중입니다. 잠시 후 다시 시도하세요.");
+      return false;
+    }
+    providerAuthActionRef.current = action;
+    setProviderAuthAction(action);
+    return true;
+  }
+
+  function finishProviderAuthAction(action: string) {
+    if (providerAuthActionRef.current === action) {
+      providerAuthActionRef.current = null;
+      setProviderAuthAction(null);
+    }
+  }
+
   async function handleConnectOpenCodeOAuth() {
+    const action = "opencode-oauth";
+    if (!beginProviderAuthAction(action)) {
+      return;
+    }
     setEngineStatusLoading(true);
     try {
       const result = await startOpenCodeAuthLogin({ provider: "openai", launch: true });
@@ -1832,10 +1874,15 @@ export default function App() {
       setAppNotice(error instanceof Error ? error.message : "opencode OAuth 연결을 시작하지 못했습니다.");
     } finally {
       setEngineStatusLoading(false);
+      finishProviderAuthAction(action);
     }
   }
 
   async function handleConnectCodex() {
+    const action = "codex-oauth";
+    if (!beginProviderAuthAction(action)) {
+      return;
+    }
     try {
       setAppNotice("공식 Codex OAuth 흐름을 시작합니다.");
       const response = await startCodexOAuth(window.location.origin);
@@ -1845,10 +1892,16 @@ export default function App() {
       setAppNotice(`${response.message} ${opencodeResult.message}`);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex OAuth 시작에 실패했습니다.");
+    } finally {
+      finishProviderAuthAction(action);
     }
   }
 
   async function handleImportCodex() {
+    const action = "codex-import";
+    if (!beginProviderAuthAction(action)) {
+      return;
+    }
     try {
       await importCodexCliAuth();
       await refreshProviders();
@@ -1857,10 +1910,16 @@ export default function App() {
       setAppNotice(`Codex CLI 인증 정보를 가져왔습니다. ${opencodeResult.message}`);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex CLI 인증 가져오기에 실패했습니다.");
+    } finally {
+      finishProviderAuthAction(action);
     }
   }
 
   async function handleLogoutCodex() {
+    const action = "codex-logout";
+    if (!beginProviderAuthAction(action)) {
+      return;
+    }
     try {
       await logoutCodex();
       await refreshProviders();
@@ -1868,6 +1927,8 @@ export default function App() {
       setAppNotice("OpenAI Codex 연결을 해제했습니다.");
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "Codex 로그아웃에 실패했습니다.");
+    } finally {
+      finishProviderAuthAction(action);
     }
   }
 
@@ -1918,16 +1979,6 @@ export default function App() {
 
           if (eventName === "status") {
             setLiveEvents((current) => [...current, createLiveEvent("status", payload)]);
-            return;
-          }
-
-          if (eventName === "tool_call") {
-            setLiveEvents((current) => [...current, createLiveEvent("tool_call", payload)]);
-            return;
-          }
-
-          if (eventName === "tool_result") {
-            setLiveEvents((current) => [...current, createLiveEvent("tool_result", payload)]);
             return;
           }
 
@@ -2042,7 +2093,7 @@ export default function App() {
       providerKind={activeConversation.providerKind}
       providers={providers}
       reasoningLevel={activeConversation.reasoningLevel}
-      section={activeSection}
+      section={activeSection === "chat" ? "chat" : "workspace"}
     />
   ) : null;
 
@@ -2105,15 +2156,21 @@ export default function App() {
         </header>
 
         <section
-          className={`chat-panel__canvas ${activeSection === "workspace" ? "is-workspace" : "is-cockpit"}`}
+          className={`chat-panel__canvas ${activeSection === "chat" ? "is-cockpit" : "is-workspace"} ${
+            activeSection === "settings" ? "is-settings" : ""
+          }`}
         >
           <div className="chat-panel__intro" aria-hidden={activeSection === "chat"}>
-            <p className="eyebrow">{activeSection === "chat" ? "대화" : "워크스페이스"}</p>
+            <p className="eyebrow">
+              {activeSection === "chat" ? "대화" : activeSection === "settings" ? "설정" : "워크플로우"}
+            </p>
             <h1>{displayConversationTitle(activeConversation?.title)}</h1>
             <p className="chat-panel__intro-copy">
               {activeSection === "chat"
-                ? "대화와 공통 에이전트 런타임을 통해 파일 작업, 명령 실행, 연구 흐름을 함께 다룰 수 있습니다."
-                : "현재 대화의 샌드박스와 실행 로그를 바로 확인할 수 있습니다."}
+                ? "대화는 opencode 실행 엔진을 통해 파일 작업, 명령 실행, 연구 흐름을 처리합니다."
+                : activeSection === "settings"
+                  ? "로컬 API/OAuth 연결, opencode 엔진, 자동화 정책을 한 화면에서 관리합니다."
+                  : "긴 작업 Flow, 단계 편집, 실행 로그를 한 화면에서 관제합니다."}
             </p>
             {activeConversation ? (
               <p className="chat-panel__intro-copy">
@@ -2137,10 +2194,11 @@ export default function App() {
                 <section className="cockpit-chat-card">
                   {messages.length === 0 && !pendingAssistantText ? (
                     <div className="cockpit-chat-card__intro">
-                      <p className="eyebrow">중앙 도구 호출 에이전트</p>
+                      <p className="eyebrow">opencode 워크스페이스 관제 에이전트</p>
                       <h1>{displayConversationTitle(activeConversation?.title)}</h1>
                       <p>
-                        {activeAgent?.name ?? "기본 에이전트"}가 파일, 워크플로우, MCP, 스킬을 조합해 작업합니다.
+                        {activeAgent?.name ?? "기본 에이전트"}가 opencode 실행 엔진으로 세션 워크스페이스와
+                        워크플로우를 처리합니다.
                         현재 모델은 {activeModelOption?.label ?? activeConversation?.model ?? "선택 안 됨"} 입니다.
                       </p>
                     </div>
@@ -2184,36 +2242,14 @@ export default function App() {
                 taskFlows={taskFlows}
               />
             </>
-          ) : (
+          ) : activeSection === "workflow" ? (
             <CockpitSectionView
               activeAgent={activeAgent}
               activeConversation={activeConversation}
-              changedFiles={changedFiles}
-              computerUseAllowlistDraft={computerUseAllowlistDraft}
-              computerUseClickSelector={computerUseClickSelector}
-              computerUseDetail={computerUseDetail}
-              computerUseError={computerUseError}
-              computerUseLoading={computerUseLoading}
-              computerUseNavigationUrl={computerUseNavigationUrl}
-              computerUseSettings={computerUseSettings}
-              file={workspaceFile}
               liveEvents={liveEvents}
-              memory={agentMemory}
               modelLabel={activeModelOption?.label ?? activeConversation?.model ?? "선택 안 됨"}
               onCancelTaskFlow={(flowId) => {
                 void handleCancelTaskFlow(flowId);
-              }}
-              onApproveComputerUseAction={(event) => {
-                void handleApproveComputerUseAction(event);
-              }}
-              onCloseComputerUseSession={() => {
-                void handleCloseComputerUseSession();
-              }}
-              onComputerUseAllowlistDraftChange={setComputerUseAllowlistDraft}
-              onComputerUseClickSelectorChange={setComputerUseClickSelector}
-              onComputerUseNavigationUrlChange={setComputerUseNavigationUrl}
-              onCreateComputerUseSession={() => {
-                void handleCreateComputerUseSession();
               }}
               onCreateConversation={() => {
                 setActiveNavTarget("chat");
@@ -2226,51 +2262,11 @@ export default function App() {
               onDeleteTaskFlow={(flowId) => {
                 void handleDeleteTaskFlow(flowId);
               }}
-              onCreateSkill={(payload) => {
-                void handleCreateSkill(payload);
-              }}
-              onCreateMcpServerProfile={(payload) => {
-                void handleCreateMcpServerProfile(payload);
-              }}
-              onDenyComputerUseAction={(event) => {
-                void handleDenyComputerUseAction(event);
-              }}
               onNavigate={handleCockpitNavigate}
-              onNavigateComputerUseSession={() => {
-                void handleNavigateComputerUseSession();
-              }}
-              onClickComputerUseSession={() => {
-                void handleClickComputerUseSession();
-              }}
-              onRiskyClickComputerUseSession={() => {
-                void handleClickComputerUseSession({
-                  visibleText: "delete validation",
-                  mayDelete: true,
-                  mayChangeState: true,
-                });
-              }}
-              onSensitiveTypeComputerUseSession={() => {
-                void handleSensitiveTypeComputerUseSession();
-              }}
               onOpenAgentSettings={handleOpenAgentSettings}
               onOpenProviderSettings={handleOpenProviderSettings}
-              onRefreshFiles={() => {
-                if (activeConversationId) {
-                  void refreshWorkspaceTree(activeConversationId, workspaceScope);
-                }
-              }}
               onRefreshPlatformMetadata={() => {
                 void refreshPlatformMetadata(activeAgentId);
-              }}
-              onScopeChange={(scope) => {
-                setWorkspaceScope(scope);
-                setWorkspaceFile(null);
-                if (activeConversationId) {
-                  void refreshWorkspaceTree(activeConversationId, scope);
-                }
-              }}
-              onSelectFile={(path) => {
-                void openWorkspaceFile(path);
               }}
               onSelectTaskFlow={(flowId) => {
                 handleSelectTaskFlow(flowId);
@@ -2290,28 +2286,68 @@ export default function App() {
               onStartTaskFlow={(flowId) => {
                 void handleTaskFlowControl(flowId, "start");
               }}
-              onSaveComputerUseSettings={() => {
-                void handleSaveComputerUseSettings();
-              }}
-              onScreenshotComputerUseSession={() => {
-                void handleScreenshotComputerUseSession();
-              }}
-              onToggleComputerUseEnabled={() => {
-                void handleToggleComputerUseEnabled();
-              }}
-              platformMetadata={platformMetadata}
-              platformMetadataLoading={platformMetadataLoading}
               providerLabel={activeProviderLabel}
               reasoningLabel={activeReasoningLabel}
               runEvents={workspaceRunEvents}
               runs={workspaceRuns}
-              scope={workspaceScope}
               selectedTaskFlow={selectedTaskFlow}
               target={activeWorkspaceTarget}
               taskFlows={taskFlows}
               tasks={tasks}
-              tree={workspaceTree}
-              workspaceLoading={workspaceLoading}
+            />
+          ) : (
+            <SettingsSectionView
+              activeAgent={activeAgent}
+              activeConversation={activeConversation}
+              backendOnline={backendOnline}
+              engineStatus={engineStatus}
+              engineStatusLoading={engineStatusLoading}
+              heartbeat={agentHeartbeat}
+              heartbeatLogs={heartbeatLogs}
+              heartbeatTriggering={heartbeatTriggering}
+              automationRules={automationRules}
+              providerAuthPending={Boolean(providerAuthAction)}
+              triggeringAutomationRuleIds={triggeringAutomationRuleIds}
+              onConnectCodex={() => {
+                void handleConnectCodex();
+              }}
+              onConnectOpenCodeOAuth={() => {
+                void handleConnectOpenCodeOAuth();
+              }}
+              onImportCodex={() => {
+                void handleImportCodex();
+              }}
+              onLogoutCodex={() => {
+                void handleLogoutCodex();
+              }}
+              onOpenAgentSettings={handleOpenAgentSettings}
+              onOpenProviderSettings={handleOpenProviderSettings}
+              onRefreshEngineStatus={() => {
+                void refreshEngineStatus();
+              }}
+              onRefreshOpenCodeModels={() => {
+                void handleRefreshOpenCodeModels();
+              }}
+              onRefreshPlatformMetadata={() => {
+                void refreshPlatformMetadata(activeAgentId);
+              }}
+              onTriggerHeartbeat={() => {
+                void handleTriggerHeartbeat();
+              }}
+              onCreateAutomationRule={(payload) => {
+                void handleCreateAutomationRule(payload);
+              }}
+              onUpdateAutomationRule={(ruleId, payload) => {
+                void handleUpdateAutomationRule(ruleId, payload);
+              }}
+              onDeleteAutomationRule={(ruleId) => {
+                void handleDeleteAutomationRule(ruleId);
+              }}
+              onTriggerAutomationRule={(ruleId) => {
+                void handleTriggerAutomationRule(ruleId);
+              }}
+              platformMetadata={platformMetadata}
+              providers={providers}
             />
           )}
         </section>
@@ -2392,6 +2428,7 @@ export default function App() {
         }}
         open={settingsOpen}
         providers={providers}
+        providerAuthPending={Boolean(providerAuthAction)}
         savingKind={savingKind}
         testingKind={testingKind}
       />

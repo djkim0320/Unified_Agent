@@ -24,6 +24,7 @@ interface ProviderSettingsDialogProps {
   onTest: (kind: ProviderKind) => void;
   open: boolean;
   providers: ProviderSummary[];
+  providerAuthPending: boolean;
   savingKind: ProviderKind | null;
   testingKind: ProviderKind | null;
 }
@@ -104,6 +105,7 @@ export function ProviderSettingsDialog({
   onTest,
   open,
   providers,
+  providerAuthPending,
   savingKind,
   testingKind,
 }: ProviderSettingsDialogProps) {
@@ -214,11 +216,11 @@ export function ProviderSettingsDialog({
             </button>
             <button
               className="provider-button provider-button--primary"
-              disabled={engineStatusLoading || !engineStatus?.available}
+              disabled={engineStatusLoading || providerAuthPending || !engineStatus?.available}
               onClick={onConnectOpenCodeOAuth}
               type="button"
             >
-              opencode OAuth 연결
+              {providerAuthPending ? "연결 처리 중..." : "opencode OAuth 연결"}
             </button>
           </div>
         </section>
@@ -263,13 +265,15 @@ export function ProviderSettingsDialog({
                     <div className="provider-card__actions provider-card__actions--stacked">
                       <button
                         className="provider-button provider-button--primary provider-button--full"
+                        disabled={providerAuthPending}
                         onClick={onConnectCodex}
                         type="button"
                       >
-                        OpenAI 로그인으로 Codex 연결
+                        {providerAuthPending ? "연결 처리 중..." : "OpenAI 로그인으로 Codex 연결"}
                       </button>
                       <button
                         className="provider-button provider-button--secondary"
+                        disabled={providerAuthPending}
                         onClick={onImportCodex}
                         type="button"
                       >
@@ -277,6 +281,7 @@ export function ProviderSettingsDialog({
                       </button>
                       <button
                         className="provider-button provider-button--secondary"
+                        disabled={providerAuthPending || engineStatusLoading || !engineStatus?.available}
                         onClick={onConnectOpenCodeOAuth}
                         type="button"
                       >
@@ -292,6 +297,7 @@ export function ProviderSettingsDialog({
                       </button>
                       <button
                         className="provider-button provider-button--danger provider-button--full"
+                        disabled={providerAuthPending}
                         onClick={onLogoutCodex}
                         type="button"
                       >

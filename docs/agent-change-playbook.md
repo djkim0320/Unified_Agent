@@ -14,10 +14,10 @@ Route your change to the narrowest layer first:
 
 - persistence in `server/db.ts`
 - API contracts in `server/app.ts` and `src/api.ts`
-- runtime behavior in `server/lib/agent-runtime.ts`
-- tool registration in `server/lib/tool-registry.ts` and `server/plugins/core.ts`
+- opencode execution behavior in `server/lib/opencode-engine.ts`, `server/lib/agent-engine.ts`, and `server/lib/agent-gateway.ts`
+- external tool/MCP behavior in opencode configuration, not an AetherOps runtime
 - workspace safety in `server/lib/workspace.ts`
-- top-level UI state in `src/App.tsx`
+- cockpit UI state in `src/App.tsx`, `src/components/CockpitSectionView.tsx`, and `src/components/CockpitPanels.tsx`
 
 ## 2. Common Task Recipes
 
@@ -62,82 +62,65 @@ Minimum tests:
 - `npm.cmd exec -- vitest run --config vitest.server.config.ts server/db.test.ts`
 - `server/app.test.ts` if route behavior depends on the changed shape
 
-### C. Change the agent loop or tool calling
+### C. Change opencode execution or run bridging
 
 Touch:
 
-- [`../server/lib/agent-runtime.ts`](../server/lib/agent-runtime.ts)
-- [`../server/lib/agent-step.ts`](../server/lib/agent-step.ts)
+- [`../server/lib/opencode-engine.ts`](../server/lib/opencode-engine.ts)
+- [`../server/lib/agent-engine.ts`](../server/lib/agent-engine.ts)
+- [`../server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts)
+- [`../server/lib/task-manager.ts`](../server/lib/task-manager.ts) if detached execution or flows are affected
 - provider adapter if the change is provider-specific
 
 Do not forget:
 
 - run events
 - cancellation propagation
-- max-step and deadline behavior
-- finalization path
+- deadline and abort behavior
+- final assistant text and changed-file summaries
+- no provider/tool fallback when opencode fails
 
 Minimum tests:
 
-- `npm.cmd exec -- vitest run --config vitest.server.config.ts server/lib/agent-runtime.test.ts`
+- `npm.cmd exec -- vitest run --config vitest.server.config.ts server/lib/opencode-engine.test.ts server/lib/task-manager.test.ts`
 
 Manual check:
 
-- run a chat that triggers at least one tool call and reaches a final answer
+- run a chat that reaches a terminal opencode run and records the expected run events
 
-### D. Add or change a tool
+### D. Add or change a tool/MCP capability
 
-Touch:
+Do not add a new AetherOps internal tool runtime. Configure filesystem, command, browser, and MCP behavior in opencode or an opencode MCP integration.
 
-- [`../server/lib/tool-registry.ts`](../server/lib/tool-registry.ts)
-- [`../server/plugins/core.ts`](../server/plugins/core.ts) or the owning plugin
-- runtime tests if planner guidance or tool execution semantics changed
+Touch only if the AetherOps cockpit needs metadata or compatibility behavior:
 
-Keep these fields coherent:
-
-- `name`
-- `description`
-- `permission`
-- `schema`
-- `example`
-- `execute`
-
-Do not hide tool behavior in ad hoc runtime switches.
+- [`../server/routes/platform.routes.ts`](../server/routes/platform.routes.ts)
+- [`../src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
+- [`../src/components/CockpitPanels.tsx`](../src/components/CockpitPanels.tsx)
 
 Minimum tests:
 
-- runtime test that the tool is visible to planning
-- execution test for success and validation failure
+- route/component tests for visible metadata or `410 Gone` compatibility behavior
 
-### E. Change plugin or skill loading
+### E. Change skills, plugins, or persistent instructions
 
-Touch:
-
-- [`../server/lib/plugin-manager.ts`](../server/lib/plugin-manager.ts)
-- [`../server/plugins/core.ts`](../server/plugins/core.ts)
-- [`../server/app.ts`](../server/app.ts) if metadata routes changed
-- [`../src/App.tsx`](../src/App.tsx) if platform metadata display changed
-
-Remember:
-
-- built-in plugin metadata and local plugin manifests must coexist
-- shared skills live under `workspace/shared/skills/`
-- agent skills live under `workspace/agents/<agentId>/skills/`
-
-### F. Change memory behavior
+Internal skill/plugin execution was removed. Put repeatable behavior in agent standing orders, workflow step prompts, or opencode configuration.
 
 Touch:
 
-- [`../server/lib/memory-manager.ts`](../server/lib/memory-manager.ts)
-- [`../server/lib/workspace.ts`](../server/lib/workspace.ts) if file layout or search changes
-- routes in [`../server/app.ts`](../server/app.ts) if memory API payloads changed
+- [`../server/lib/workspace.ts`](../server/lib/workspace.ts) for standing-order file layout
+- [`../server/app.ts`](../server/app.ts) if compatibility route behavior changed
+- [`../src/App.tsx`](../src/App.tsx) or cockpit components if visible metadata changed
 
-Source of truth:
+### F. Change persistent working context
 
-- `workspace/agents/<agentId>/MEMORY.md`
-- `workspace/agents/<agentId>/memory/YYYY-MM-DD.md`
+AetherOps no longer has a separate memory tool path. Use session history, agent standing orders, task-flow prompts, and opencode workspace artifacts.
 
-Do not move durable memory into hidden prompt state.
+Touch:
+
+- [`../server/lib/workspace.ts`](../server/lib/workspace.ts) for agent guide/control files
+- [`../server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts) if prompt context assembly changed
+- [`../server/app.ts`](../server/app.ts) if removed memory routes changed
 
 ### G. Change detached task behavior
 
@@ -146,21 +129,23 @@ Touch:
 - [`../server/lib/task-manager.ts`](../server/lib/task-manager.ts)
 - [`../server/db.ts`](../server/db.ts)
 - [`../server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts) if detached execution flow changed
-- frontend task consumers in [`../src/App.tsx`](../src/App.tsx) and [`../src/components/WorkspaceView.tsx`](../src/components/WorkspaceView.tsx)
+- frontend task consumers in [`../src/App.tsx`](../src/App.tsx), [`../src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx), and [`../src/components/CockpitPanels.tsx`](../src/components/CockpitPanels.tsx)
 
 Check:
 
 - `queued -> running -> terminal` lifecycle
+- task kinds are `detached`, `heartbeat`, `continuation`, `scheduled`, `subagent`, and `flow_step`
+- terminal statuses are `completed`, `failed`, `timed_out`, and `cancelled`
 - task events stay append-only and scoped
 - result delivery back into the originating session still works
 
-### H. Change workspace sandbox or file preview
+### H. Change opencode sandbox or changed-file reporting
 
 Touch:
 
 - [`../server/lib/workspace.ts`](../server/lib/workspace.ts)
-- [`../server/app.ts`](../server/app.ts) for workspace routes
-- [`../src/components/WorkspaceView.tsx`](../src/components/WorkspaceView.tsx)
+- [`../server/routes/workspace.routes.ts`](../server/routes/workspace.routes.ts) for removed workspace route compatibility
+- [`../src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
 
 Do not break:
 
@@ -168,13 +153,13 @@ Do not break:
 - symlink/junction rejection
 - read-only access without implicit directory creation
 - relative-path-only responses in normal mode
-- unsupported encoding handling
+- direct workspace CRUD routes returning `410 Gone`
 
 Minimum tests:
 
 - `npm.cmd exec -- vitest run --config vitest.server.config.ts server/lib/workspace.test.ts`
 
-### I. Change frontend agent/session/workspace state
+### I. Change frontend agent/session/cockpit state
 
 Touch:
 
@@ -187,7 +172,7 @@ State rules:
 - agent switch must reset or refetch scoped state
 - stale async responses must not overwrite newer selections
 - selected run/task must remain stable after refresh
-- workspace UI must not display host absolute paths
+- cockpit file/log panels must not display host absolute paths
 
 Minimum tests:
 
@@ -241,7 +226,7 @@ Run:
 
 ## 4. Browser Validation Recipe
 
-Use this when you need end-to-end proof that chat, runtime, and workspace still connect.
+Use this when you need end-to-end proof that chat, opencode execution, and cockpit logs still connect.
 
 1. Start source backend on `127.0.0.1:8787`
 2. Start Vite on `127.0.0.1:5173`
@@ -252,15 +237,14 @@ Use this when you need end-to-end proof that chat, runtime, and workspace still 
 ```text
 Create hello_browser.ts in the current session workspace with exactly:
 export const browserCheck = (): string => 'ok';
-Use the write_file tool.
 ```
 
 Expected result:
 
-- chat shows tool activity
+- chat shows opencode run activity
 - run timeline reaches a terminal status
-- workspace tree shows `hello_browser.ts`
-- the file contents match exactly
+- cockpit changed-file list shows `hello_browser.ts`
+- opencode created the file in the active session sandbox
 
 ## 5. Common Failure Modes
 
@@ -285,20 +269,20 @@ Likely causes:
 - agent/session selection did not reset dependent state
 - `src/api.ts` and the route payload drifted
 
-### Tool calling suddenly regressed
+### opencode execution suddenly regressed
 
 Likely causes:
 
-- registry metadata no longer matches runtime behavior
-- planner guidance lost the tool example or schema shape
-- provider-specific structured calling path drifted from fallback JSON path
+- opencode auth/config/model selection drifted from the selected AetherOps provider profile
+- the run prompt lost required session, flow, or standing-order context
+- opencode exited without JSON assistant events; inspect run events instead of fabricating a fallback response
 
-### Memory behavior looks inconsistent
+### Context behavior looks inconsistent
 
 Likely causes:
 
-- file-backed source of truth was bypassed
-- durable and daily memory were mixed up
+- standing orders or workflow step prompts were not included in the opencode run context
+- the selected conversation sandbox or opencode session id was not reused as expected
 - agent scope was lost during request wiring
 
 ## 6. Definition Of Done
@@ -309,5 +293,5 @@ Before closing work, confirm:
 - the route, client helper, and types agree
 - agent/session ownership still holds
 - platform metadata is still scoped correctly
-- browser/manual verification was done if the change crossed chat + runtime + workspace
+- browser/manual verification was done if the change crossed chat + opencode execution + cockpit logs
 - docs were updated if the task changed a stable workflow or public route

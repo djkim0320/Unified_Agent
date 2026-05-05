@@ -65,6 +65,20 @@ describe("OpenCodeEngine", () => {
     }
   });
 
+  it("keeps opencode permission bypass opt-in and testable", () => {
+    expect(openCodeEngineTestUtils.shouldAutoApproveOpenCodePermissions({} as NodeJS.ProcessEnv)).toBe(false);
+    expect(
+      openCodeEngineTestUtils.shouldAutoApproveOpenCodePermissions({
+        AETHEROPS_OPENCODE_AUTO_APPROVE: "true",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+    expect(
+      openCodeEngineTestUtils.shouldAutoApproveOpenCodePermissions({
+        AETHEROPS_OPENCODE_DANGEROUS_SKIP_PERMISSIONS: "1",
+      } as NodeJS.ProcessEnv),
+    ).toBe(true);
+  });
+
   it("builds runtime-only opencode credential config from AetherOps provider secrets", () => {
     const credentialSync = buildOpenCodeCredentialSync({
       selectedProviderKind: "openai",
@@ -133,6 +147,39 @@ describe("OpenCodeEngine", () => {
         process.env.OPENCODE_BIN = previous;
       }
     }
+  });
+
+  it("closes stdin for spawned opencode commands so non-interactive runs do not hang", async () => {
+    const stdinSensitiveScript = path.join(projectRoot, "stdin-sensitive-opencode.js");
+    fs.writeFileSync(
+      stdinSensitiveScript,
+      [
+        "process.stdin.resume();",
+        "process.stdin.on('end', () => {",
+        "  console.log(JSON.stringify({ type: 'assistant', text: 'stdin closed' }));",
+        "  process.exit(0);",
+        "});",
+        "setTimeout(() => {}, 10000);",
+      ].join("\n"),
+      "utf8",
+    );
+    const runner = openCodeEngineTestUtils.createRunnerForLauncher({
+      command: process.execPath,
+      argsPrefix: [stdinSensitiveScript],
+      displayName: "stdin-sensitive-opencode",
+      source: "test-harness",
+      managedPackageVersion: null,
+    });
+
+    const result = await runner.runStreaming(["run"], {
+      cwd: projectRoot,
+      env: buildOpenCodeEnvironment(),
+      timeoutMs: 2_000,
+    });
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("stdin closed");
   });
 
   it("reports a structured unavailable status when the CLI cannot run", async () => {
@@ -238,6 +285,36 @@ describe("OpenCodeEngine", () => {
     expect(result.command).toContain("--provider openai");
   });
 
+  it("fails prompt construction instead of silently dropping workspace guidance", () => {
+    const { agent, conversation } = createConversation();
+    const workspace = createWorkspaceManager(projectRoot);
+    const brokenWorkspace = {
+      ...workspace,
+      readGuides() {
+        throw new Error("guide read failed");
+      },
+    } as ReturnType<typeof createWorkspaceManager>;
+
+    expect(() =>
+      openCodeEngineTestUtils.buildPrompt({
+        input: {
+          agent,
+          conversation,
+          providerKind: conversation.providerKind,
+          model: conversation.model,
+          reasoningLevel: conversation.reasoningLevel,
+          conversationId: conversation.id,
+          agentId: agent.id,
+          userMessage: "Probe",
+          messages: store.listMessages(conversation.id),
+          sendEvent() {},
+        },
+        workspacePath: ".",
+        workspace: brokenWorkspace,
+      }),
+    ).toThrow("guide read failed");
+  });
+
   it("runs opencode in the conversation sandbox and records engine metadata", async () => {
     const workspace = createWorkspaceManager(projectRoot);
     const { agent, conversation } = createConversation();
@@ -257,7 +334,7 @@ describe("OpenCodeEngine", () => {
         observed.env = options.env;
         fs.writeFileSync(path.join(options.cwd, "note.txt"), "created by opencode", "utf8");
         options.onStdoutChunk?.('{"type":"session","sessionID":"opencode-session-1"}\n');
-        options.onStdoutChunk?.('{"type":"assistant","text":"Done from opencode."}\n');
+        options.onStdoutChunk?.('{"type":"text","part":{"text":"Done from opencode."}}\n');
         return {
           exitCode: 0,
           stdout: "",
@@ -308,6 +385,253 @@ describe("OpenCodeEngine", () => {
     expect(workspace.readFile({ conversationId: conversation.id, scope: "sandbox", relativePath: "note.txt" }).content).toBe(
       "created by opencode",
     );
+  });
+
+  it("adds the opencode permission bypass flag only when explicitly enabled", async () => {
+    const previousAutoApprove = process.env.AETHEROPS_OPENCODE_AUTO_APPROVE;
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    const observedArgs: string[][] = [];
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming(args, options) {
+        observedArgs.push(args);
+        options.onStdoutChunk?.('{"type":"assistant","text":"Done."}\n');
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    try {
+      delete process.env.AETHEROPS_OPENCODE_AUTO_APPROVE;
+      await engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "No bypass",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      });
+      expect(observedArgs[0]).not.toContain("--dangerously-skip-permissions");
+
+      process.env.AETHEROPS_OPENCODE_AUTO_APPROVE = "true";
+      await engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "Use bypass",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      });
+      expect(observedArgs[1]).toContain("--dangerously-skip-permissions");
+    } finally {
+      if (previousAutoApprove === undefined) {
+        delete process.env.AETHEROPS_OPENCODE_AUTO_APPROVE;
+      } else {
+        process.env.AETHEROPS_OPENCODE_AUTO_APPROVE = previousAutoApprove;
+      }
+    }
+  });
+
+  it("fails non-JSON-only opencode output instead of fabricating assistant text", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming(_args, options) {
+        options.onStdoutChunk?.("plain stdout that is not an assistant response\n");
+        return {
+          exitCode: 0,
+          stdout: "plain stdout that is not an assistant response\n",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    await expect(
+      engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "Return no JSON assistant output",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+      message: "opencode completed without assistant text or workspace changes.",
+    });
+
+    const run = store.listWorkspaceRuns(conversation.id)[0];
+    const engineRun = await engine.getRunSummary(conversation.id, run.id);
+    expect(engineRun?.eventSummary.nonJsonOutputLineCount).toBe(1);
+    expect(engineRun?.eventSummary.nonJsonOutput).toContain("plain stdout");
+  });
+
+  it("fails opencode runs that emit JSON error events even when the process exits cleanly", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming(_args, options) {
+        options.onStdoutChunk?.(
+          JSON.stringify({
+            type: "error",
+            error: { data: { message: "Model not found: openai/missing-model." } },
+          }) + "\n",
+        );
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "ProviderModelNotFoundError",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    await expect(
+      engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "Run",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+      message: "Model not found: openai/missing-model.",
+    });
+
+    const run = store.listWorkspaceRuns(conversation.id)[0];
+    expect(run.status).toBe("failed");
+  });
+
+  it("fails empty opencode completions instead of reporting fake success", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming() {
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    await expect(
+      engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "Run",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+      message: "opencode completed without assistant text or workspace changes.",
+    });
   });
 
   it("marks failed CLI runs as failed workspace runs", async () => {
@@ -362,5 +686,65 @@ describe("OpenCodeEngine", () => {
     expect(run.status).toBe("failed");
     const events = store.listWorkspaceRunEvents(conversation.id, run.id);
     expect(events.some((event) => event.eventType === "run_failed")).toBe(true);
+  });
+
+  it("exposes timed-out opencode runs as structured engine errors", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming() {
+        return {
+          exitCode: 124,
+          stdout: "",
+          stderr: "",
+          timedOut: true,
+          cancelled: false,
+          errorMessage: "process exceeded timeout",
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    await expect(
+      engine.runTurn({
+        agent,
+        conversation,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        conversationId: conversation.id,
+        agentId: agent.id,
+        userMessage: "Run",
+        messages: store.listMessages(conversation.id),
+        sendEvent() {},
+      }),
+    ).rejects.toMatchObject({
+      status: "failed",
+      taskStatus: "timed_out",
+    });
+
+    const run = store.listWorkspaceRuns(conversation.id)[0];
+    const engineRun = await engine.getRunSummary(conversation.id, run.id);
+    expect(engineRun).toEqual(
+      expect.objectContaining({
+        status: "timed_out",
+      }),
+    );
   });
 });

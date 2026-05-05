@@ -9,6 +9,7 @@ import type {
   AgentRecord,
   AgentSoulRecord,
   ConversationRecord,
+  EngineStatusRecord,
   HeartbeatLogRecord,
   PlatformMetadata,
   ProviderSummary,
@@ -22,21 +23,22 @@ vi.mock("./api", () => ({
   cancelAgentTask: vi.fn(),
   cancelSubagentSession: vi.fn(),
   cancelTaskFlow: vi.fn(),
+  createAgentAutomationRule: vi.fn(),
   createAgentTask: vi.fn(),
   createSubagentSession: vi.fn(),
   createTaskFlow: vi.fn(),
   deleteAgent: vi.fn(),
+  deleteAgentAutomationRule: vi.fn(),
   deleteConversation: vi.fn(),
   deleteTaskFlow: vi.fn(),
   getAgentHeartbeat: vi.fn(),
-  getAgentMemory: vi.fn(),
   getAgentSoul: vi.fn(),
   getAgentStandingOrders: vi.fn(),
   getConversationMessages: vi.fn(),
+  getEngineStatus: vi.fn(),
   getTaskFlow: vi.fn(),
-  getWorkspaceFile: vi.fn(),
-  getWorkspaceTree: vi.fn(),
   importCodexCliAuth: vi.fn(),
+  listAgentAutomationRules: vi.fn(),
   listAgentTasks: vi.fn(),
   listAgents: vi.fn(),
   listConversations: vi.fn(),
@@ -52,6 +54,7 @@ vi.mock("./api", () => ({
   logoutCodex: vi.fn(),
   resumeTaskFlow: vi.fn(),
   retryTaskFlowStep: vi.fn(),
+  refreshOpenCodeModels: vi.fn(),
   saveAgent: vi.fn(),
   saveAgentHeartbeat: vi.fn(),
   saveAgentSoul: vi.fn(),
@@ -59,13 +62,15 @@ vi.mock("./api", () => ({
   saveConversation: vi.fn(),
   saveTaskFlowSteps: vi.fn(),
   saveProviderAccount: vi.fn(),
-  searchAgentMemory: vi.fn(),
   skipTaskFlowStep: vi.fn(),
   startCodexOAuth: vi.fn(),
+  startOpenCodeAuthLogin: vi.fn(),
   startTaskFlow: vi.fn(),
   streamChat: vi.fn(),
   testProvider: vi.fn(),
+  triggerAgentAutomationRule: vi.fn(),
   triggerAgentHeartbeat: vi.fn(),
+  updateAgentAutomationRule: vi.fn(),
 }));
 
 const providers: ProviderSummary[] = [
@@ -121,20 +126,46 @@ const providers: ProviderSummary[] = [
   },
 ];
 
+const engineStatus: EngineStatusRecord = {
+  engineKind: "opencode",
+  configuredEngineKind: "opencode",
+  available: true,
+  installed: true,
+  version: "0.0.0-test",
+  executable: "opencode",
+  executableSource: "test-harness",
+  managedPackageVersion: "0.0.0-test",
+  configDir: null,
+  authStatus: "available",
+  models: ["gpt-5.4"],
+  sessions: [],
+  lastFailure: null,
+  environment: {
+    autoUpdateDisabled: true,
+    pruneDisabled: true,
+    defaultPluginsDisabled: true,
+    autoApprovePermissions: false,
+  },
+  credentialSync: {
+    mode: "runtime-env",
+    configuredProviders: ["openai", "anthropic"],
+    entries: [
+      {
+        providerKind: "openai",
+        opencodeProvider: "openai",
+        authMode: "api_key",
+        configured: true,
+        runtimeEnvKeys: ["OPENAI_API_KEY"],
+        note: "test",
+      },
+    ],
+  },
+  opencodeAuthProviders: ["openai"],
+};
+
 const platformMetadata: PlatformMetadata = {
   plugins: [],
-  tools: [
-    {
-      name: "list_tree",
-      description: "List files.",
-      permission: "workspace",
-      risk: "low",
-      costHint: null,
-      concurrencyClass: "single",
-      batchable: true,
-      rolePolicy: null,
-    },
-  ],
+  tools: [],
   channels: [
     {
       kind: "webchat",
@@ -273,26 +304,31 @@ function mockDefaults() {
     conversation: firstConversation,
     messages: [],
   });
+  vi.mocked(api.getEngineStatus).mockResolvedValue(engineStatus);
+  vi.mocked(api.refreshOpenCodeModels).mockResolvedValue({
+    ok: true,
+    message: "모델 캐시를 갱신했습니다.",
+    models: ["gpt-5.4"],
+  });
+  vi.mocked(api.startOpenCodeAuthLogin).mockResolvedValue({
+    ok: true,
+    launched: false,
+    provider: "openai",
+    command: "opencode auth login openai",
+    message: "opencode OAuth 연결 명령을 준비했습니다.",
+  });
   vi.mocked(api.saveAgent).mockResolvedValue({ agent: defaultAgent });
+  vi.mocked(api.getAgentSoul).mockResolvedValue({ soul: defaultAgentSoul });
+  vi.mocked(api.getAgentHeartbeat).mockResolvedValue({ heartbeat: defaultAgentHeartbeat });
   vi.mocked(api.saveAgentSoul).mockResolvedValue({ soul: defaultAgentSoul });
   vi.mocked(api.saveAgentHeartbeat).mockResolvedValue({ heartbeat: defaultAgentHeartbeat });
   vi.mocked(api.saveAgentStandingOrders).mockResolvedValue({
-    standingOrders: { path: "standing-orders.md", content: "# orders" },
+    standingOrders: { path: "STANDING_ORDERS.md", content: "# orders" },
   });
   vi.mocked(api.saveConversation).mockResolvedValue({ conversation: firstConversation });
   vi.mocked(api.getAgentStandingOrders).mockResolvedValue({
-    standingOrders: { path: "standing-orders.md", content: "# orders" },
+    standingOrders: { path: "STANDING_ORDERS.md", content: "# orders" },
   });
-  vi.mocked(api.getAgentMemory).mockResolvedValue({
-    memory: {
-      agentId: defaultAgent.id,
-      durableMemoryPath: "MEMORY.md",
-      durableMemory: "# MEMORY\n",
-      dailyMemoryPath: "memory/2026-04-11.md",
-      dailyMemory: "# 2026-04-11\n",
-    },
-  });
-  vi.mocked(api.searchAgentMemory).mockResolvedValue({ results: [] });
   vi.mocked(api.listSubagentSessions).mockResolvedValue({ sessions: [] });
   vi.mocked(api.createSubagentSession).mockResolvedValue({
     session: {
@@ -310,6 +346,7 @@ function mockDefaults() {
       taskFlowId: null,
       flowStepKey: null,
       originRunId: null,
+      automationRuleId: null,
       taskKind: "detached",
       parentTaskId: null,
       nestingDepth: 0,
@@ -339,6 +376,49 @@ function mockDefaults() {
   vi.mocked(api.retryTaskFlowStep).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.skipTaskFlowStep).mockResolvedValue({ flow: selectedFlow, steps: selectedFlowSteps });
   vi.mocked(api.listHeartbeatLogs).mockResolvedValue({ logs: defaultHeartbeatLogs });
+  vi.mocked(api.listAgentAutomationRules).mockResolvedValue({ rules: [] });
+  vi.mocked(api.createAgentAutomationRule).mockResolvedValue({
+    rule: {
+      id: "automation-1",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      title: "Daily summary",
+      prompt: "Summarize state",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      enabled: true,
+      intervalMinutes: 60,
+      nextRunAt: 1,
+      lastRunAt: null,
+      lastTaskId: null,
+      runCount: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    conversation: firstConversation,
+  });
+  vi.mocked(api.updateAgentAutomationRule).mockImplementation(async (_agentId, _ruleId, payload) => ({
+    rule: {
+      id: "automation-1",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      title: payload.title ?? "Daily summary",
+      prompt: payload.prompt ?? "Summarize state",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      enabled: payload.enabled ?? true,
+      intervalMinutes: payload.intervalMinutes ?? 60,
+      nextRunAt: 1,
+      lastRunAt: null,
+      lastTaskId: null,
+      runCount: 0,
+      createdAt: 1,
+      updatedAt: 2,
+    },
+  }));
+  vi.mocked(api.deleteAgentAutomationRule).mockResolvedValue({ ok: true, ruleId: "automation-1" });
   vi.mocked(api.triggerAgentHeartbeat).mockResolvedValue({
     message: "Heartbeat ran.",
     heartbeat: defaultAgentHeartbeat,
@@ -346,17 +426,6 @@ function mockDefaults() {
   });
   vi.mocked(api.listWorkspaceRuns).mockResolvedValue({ runs: [latestRun] });
   vi.mocked(api.listWorkspaceRunEvents).mockResolvedValue({ events: latestRunEvents });
-  vi.mocked(api.getWorkspaceTree).mockResolvedValue({ scope: "sandbox", path: ".", tree: [] });
-  vi.mocked(api.getWorkspaceFile).mockResolvedValue({
-    file: {
-      scope: "sandbox",
-      path: "README.md",
-      content: "# README",
-      binary: false,
-      unsupportedEncoding: false,
-      encoding: "utf-8",
-    },
-  });
   vi.mocked(api.listAgentTasks).mockResolvedValue({ tasks: [] });
   vi.mocked(api.listTaskEvents).mockResolvedValue({ events: [] });
   vi.mocked(api.createAgentTask).mockResolvedValue({
@@ -368,6 +437,7 @@ function mockDefaults() {
       taskFlowId: null,
       flowStepKey: null,
       originRunId: null,
+      automationRuleId: null,
       taskKind: "detached",
       parentTaskId: null,
       nestingDepth: 0,
@@ -385,6 +455,52 @@ function mockDefaults() {
       updatedAt: 10,
     },
   });
+  vi.mocked(api.triggerAgentAutomationRule).mockResolvedValue({
+    rule: {
+      id: "automation-1",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      title: "Daily summary",
+      prompt: "Summarize state",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      enabled: true,
+      intervalMinutes: 60,
+      nextRunAt: 120,
+      lastRunAt: 60,
+      lastTaskId: "task-automation",
+      runCount: 1,
+      createdAt: 1,
+      updatedAt: 60,
+    },
+    task: {
+      id: "task-automation",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: null,
+      automationRuleId: "automation-1",
+      taskKind: "scheduled",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "[자동화] Daily summary",
+      prompt: "Summarize state",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      status: "queued",
+      resultText: null,
+      createdAt: 60,
+      startedAt: null,
+      completedAt: null,
+      scheduledFor: 60,
+      updatedAt: 60,
+    },
+    message: "자동화 규칙을 즉시 실행했습니다.",
+  });
   vi.mocked(api.cancelAgentTask).mockResolvedValue({
     task: {
       id: "task-running",
@@ -394,6 +510,7 @@ function mockDefaults() {
       taskFlowId: null,
       flowStepKey: null,
       originRunId: null,
+      automationRuleId: null,
       taskKind: "detached",
       parentTaskId: null,
       nestingDepth: 0,
@@ -441,16 +558,36 @@ describe("App frontend", () => {
     expect(await shell.findByLabelText("워크플로우 관제 패널")).toBeInTheDocument();
     expect(container.querySelector(".cockpit-chat-card__tabs")).not.toBeInTheDocument();
     expect(container.querySelector(".chat-panel__current-model")).not.toBeInTheDocument();
-    expect(api.getWorkspaceTree).not.toHaveBeenCalled();
-    expect(api.getWorkspaceFile).not.toHaveBeenCalled();
-    expect(api.getAgentMemory).not.toHaveBeenCalled();
-    expect(api.searchAgentMemory).not.toHaveBeenCalled();
     expect(shell.queryByRole("button", { name: "프로바이더" })).not.toBeInTheDocument();
 
     await user.click(await shell.findByRole("button", { name: "워크플로우" }));
 
     expect(await shell.findByRole("heading", { name: "워크플로우 관제" })).toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "Outline으로 빠르게 만들기" })).toBeInTheDocument();
+  });
+
+  it("opens the settings tab as a cockpit page with working settings actions", async () => {
+    const { container } = render(<App />);
+    const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await shell.findByRole("heading", { name: firstConversation.title });
+    await user.click(await shell.findByRole("button", { name: "설정 탭" }));
+
+    expect(await shell.findByRole("heading", { name: "로컬 실행 환경을 한곳에서 관리합니다" })).toBeInTheDocument();
+    expect(await shell.findByRole("heading", { name: "opencode 엔진" })).toBeInTheDocument();
+    expect(await shell.findByRole("heading", { name: "API / OAuth 연결" })).toBeInTheDocument();
+    expect(container.querySelector('[role="dialog"]')).not.toBeInTheDocument();
+    const settingsRegion = await shell.findByRole("region", { name: "설정 탭" });
+    const settingsControls = within(settingsRegion);
+
+    await user.click(settingsControls.getByRole("button", { name: "상태 새로고침" }));
+    await waitFor(() => {
+      expect(api.getEngineStatus).toHaveBeenCalled();
+    });
+
+    await user.click(settingsControls.getByRole("button", { name: "API 연결 관리" }));
+    expect(await waitFor(() => container.querySelector('[role="dialog"]'))).toBeInTheDocument();
   });
 
   it("opens the standing orders tab in agent settings", async () => {
@@ -467,9 +604,8 @@ describe("App frontend", () => {
       return node as HTMLElement;
     });
 
-    await user.click(within(dialog).getByRole("button", { name: "Standing Orders" }));
-    expect(within(dialog).getByRole("heading", { name: "Standing Orders" })).toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Standing orders content")).toBeInTheDocument();
+    expect(within(dialog).getByRole("heading", { name: "상시 지침" })).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("상시 지침 내용")).toBeInTheDocument();
   });
 
   it("saves standing orders from the agent settings dialog", async () => {
@@ -486,8 +622,7 @@ describe("App frontend", () => {
       return node as HTMLElement;
     });
 
-    await user.click(within(dialog).getByRole("button", { name: "Standing Orders" }));
-    await user.click(within(dialog).getByRole("button", { name: "Save standing orders" }));
+    await user.click(within(dialog).getByRole("button", { name: "상시 지침 저장" }));
 
     await waitFor(() => {
       expect(api.saveAgentStandingOrders).toHaveBeenCalledWith(defaultAgent.id, {

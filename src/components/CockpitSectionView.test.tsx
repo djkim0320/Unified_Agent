@@ -55,71 +55,35 @@ const steps: TaskFlowStepDetail[] = [
   },
 ];
 
-function renderWorkflow(
-  overrides: Partial<Parameters<typeof CockpitSectionView>[0]> = {},
-) {
+function renderWorkflow(overrides: Partial<Parameters<typeof CockpitSectionView>[0]> = {}) {
   return render(
     <CockpitSectionView
       activeAgent={null}
       activeConversation={null}
-      changedFiles={[]}
-      computerUseAllowlistDraft=""
-      computerUseClickSelector=""
-      computerUseDetail={null}
-      computerUseError={null}
-      computerUseLoading={false}
-      computerUseNavigationUrl=""
-      computerUseSettings={null}
-      file={null}
       liveEvents={[]}
-      memory={null}
       modelLabel="gpt-5.4"
-      onApproveComputerUseAction={vi.fn()}
       onCancelTaskFlow={vi.fn()}
-      onClickComputerUseSession={vi.fn()}
-      onCloseComputerUseSession={vi.fn()}
-      onComputerUseAllowlistDraftChange={vi.fn()}
-      onComputerUseClickSelectorChange={vi.fn()}
-      onComputerUseNavigationUrlChange={vi.fn()}
-      onCreateComputerUseSession={vi.fn()}
       onCreateConversation={vi.fn()}
-      onCreateMcpServerProfile={vi.fn()}
-      onCreateSkill={vi.fn()}
       onCreateTaskFlow={vi.fn()}
       onDeleteTaskFlow={vi.fn()}
-      onDenyComputerUseAction={vi.fn()}
       onNavigate={vi.fn()}
-      onNavigateComputerUseSession={vi.fn()}
       onOpenAgentSettings={vi.fn()}
       onOpenProviderSettings={vi.fn()}
-      onRefreshFiles={vi.fn()}
       onRefreshPlatformMetadata={vi.fn()}
       onResumeTaskFlow={vi.fn()}
       onRetryTaskFlowStep={vi.fn()}
-      onRiskyClickComputerUseSession={vi.fn()}
-      onSaveComputerUseSettings={vi.fn()}
       onSaveTaskFlowSteps={vi.fn()}
-      onScopeChange={vi.fn()}
-      onScreenshotComputerUseSession={vi.fn()}
-      onSelectFile={vi.fn()}
       onSelectTaskFlow={vi.fn()}
-      onSensitiveTypeComputerUseSession={vi.fn()}
       onSkipTaskFlowStep={vi.fn()}
       onStartTaskFlow={vi.fn()}
-      onToggleComputerUseEnabled={vi.fn()}
-      platformMetadata={null}
-      platformMetadataLoading={false}
       providerLabel="OpenAI"
       reasoningLabel="High"
       runEvents={null}
       runs={[]}
-      scope="sandbox"
       selectedTaskFlow={{ flow: queuedFlow, steps }}
       target="workflow"
       taskFlows={[queuedFlow]}
       tasks={[]}
-      tree={[]}
-      workspaceLoading={false}
       {...overrides}
     />,
   );
@@ -166,10 +130,10 @@ describe("CockpitSectionView workflow editor", () => {
     });
 
     expect(screen.getByRole("button", { name: "시작/평가" })).toBeDisabled();
-    expect(screen.getByText("빈 워크플로우 공간입니다.")).toBeInTheDocument();
+    expect(screen.getByText("빈 워크플로우 공간입니다. 수정 모드에서 단계를 추가하세요.")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "선택 Flow 수정" }));
-    expect(screen.getByText("빈 워크플로우입니다.")).toBeInTheDocument();
+    expect(screen.getByText("빈 워크플로우입니다. 단계 추가로 첫 단계를 작성하세요.")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "변경 저장" }));
 
     expect(onSaveTaskFlowSteps).toHaveBeenCalledWith(emptyFlow.id, [], "새 워크플로우");
@@ -258,18 +222,15 @@ describe("CockpitSectionView workflow editor", () => {
 });
 
 function createDataTransfer(): DataTransfer {
-  const data = new Map<string, string>();
   return {
     clearData: vi.fn(),
     dropEffect: "move",
     effectAllowed: "move",
     files: [] as unknown as FileList,
-    getData: vi.fn((format: string) => data.get(format) ?? ""),
+    getData: vi.fn(() => ""),
     items: [] as unknown as DataTransferItemList,
+    setData: vi.fn(),
     setDragImage: vi.fn(),
-    setData: vi.fn((format: string, value: string) => {
-      data.set(format, value);
-    }),
-    types: [] as unknown as readonly string[],
+    types: [],
   };
 }

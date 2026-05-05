@@ -68,6 +68,13 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function legacyGoneBody(feature: string) {
+  return {
+    error: `${feature} is not available in AetherOps opencode-only mode. Configure equivalent capabilities in opencode.`,
+    engineKind: "opencode",
+  };
+}
+
 function createFakeJwt(payload: Record<string, unknown>) {
   const encode = (value: Record<string, unknown>) =>
     Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -252,19 +259,22 @@ describe("createApp", () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
 
-    await supertest(app)
+    const settingsResponse = await supertest(app)
       .get("/api/computer-use/settings")
       .expect(410);
+    expect(settingsResponse.body).toEqual(legacyGoneBody("Custom Computer Use API"));
 
-    await request(app)
+    const writeSettingsResponse = await request(app)
       .put("/api/computer-use/settings")
       .send({ enabled: true })
       .expect(410);
+    expect(writeSettingsResponse.body).toEqual(legacyGoneBody("Custom Computer Use API"));
 
-    await request(app)
+    const sessionsResponse = await request(app)
       .post("/api/computer-use/sessions")
       .send({ allowedDomains: ["localhost"] })
       .expect(410);
+    expect(sessionsResponse.body).toEqual(legacyGoneBody("Custom Computer Use API"));
   });
 
   it("returns Gone for custom Computer Use action routes", async () => {
@@ -322,7 +332,7 @@ describe("createApp", () => {
         enabled: true,
       })
       .expect(410);
-    expect(response.body.engineKind).toBe("opencode");
+    expect(response.body).toEqual(legacyGoneBody("MCP/profile registration"));
     expect(fs.existsSync(path.join(projectRoot, "workspace", "shared", "plugins"))).toBe(false);
 
     const pluginsResponse = await request(context.app).get("/api/plugins").expect(200);
@@ -397,7 +407,7 @@ describe("createApp", () => {
 
     const toolsResponse = await request(app).get("/api/tools");
     expect(toolsResponse.status).toBe(410);
-    expect(toolsResponse.body.engineKind).toBe("opencode");
+    expect(toolsResponse.body).toEqual(legacyGoneBody("AetherOps internal tool runtime"));
 
     const channelsResponse = await request(app).get("/api/channels");
     expect(channelsResponse.status).toBe(200);
@@ -420,7 +430,7 @@ describe("createApp", () => {
 
     const skillsResponse = await request(app).get("/api/agents/default-agent/skills");
     expect(skillsResponse.status).toBe(410);
-    expect(skillsResponse.body.engineKind).toBe("opencode");
+    expect(skillsResponse.body).toEqual(legacyGoneBody("AetherOps skill/plugin execution"));
   });
 
   it("creates agents, scopes sessions, and exposes explicit memory files", async () => {
@@ -565,6 +575,76 @@ describe("createApp", () => {
     expect(JSON.stringify(logsResponse.body)).not.toContain(dataDir);
   });
 
+  it("manages automation rules and triggers scheduled opencode tasks", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const conversation = store.saveConversation({
+      title: "Automation session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+
+    const createResponse = await request(app)
+      .post("/api/agents/default-agent/automation-rules")
+      .send({
+        conversationId: conversation.id,
+        title: "Daily cockpit sweep",
+        prompt: "Summarize changed files and next actions.",
+        intervalMinutes: 30,
+        enabled: true,
+      })
+      .expect(201);
+
+    const ruleId = createResponse.body.rule.id as string;
+    expect(createResponse.body.rule).toEqual(
+      expect.objectContaining({
+        agentId: "default-agent",
+        conversationId: conversation.id,
+        title: "Daily cockpit sweep",
+        enabled: true,
+        intervalMinutes: 30,
+      }),
+    );
+
+    const listResponse = await request(app).get("/api/agents/default-agent/automation-rules").expect(200);
+    expect(listResponse.body.rules).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: ruleId })]),
+    );
+
+    const updateResponse = await request(app)
+      .patch(`/api/agents/default-agent/automation-rules/${ruleId}`)
+      .send({ enabled: false, intervalMinutes: 45 })
+      .expect(200);
+    expect(updateResponse.body.rule).toEqual(
+      expect.objectContaining({
+        id: ruleId,
+        enabled: false,
+        intervalMinutes: 45,
+      }),
+    );
+
+    const triggerResponse = await request(app)
+      .post(`/api/agents/default-agent/automation-rules/${ruleId}/trigger`)
+      .expect(200);
+    expect(triggerResponse.body.task).toEqual(
+      expect.objectContaining({
+        automationRuleId: ruleId,
+        taskKind: "scheduled",
+        title: "[자동화] Daily cockpit sweep",
+      }),
+    );
+
+    await request(app).delete(`/api/agents/default-agent/automation-rules/${ruleId}`).expect(200);
+    expect(store.getAutomationRule(ruleId)).toBeNull();
+    expect(store.getTask(triggerResponse.body.task.id)).toEqual(
+      expect.objectContaining({
+        automationRuleId: null,
+      }),
+    );
+  });
+
   it("manages standing orders, sub-agent sessions, task flows, and run control routes", async () => {
     const { app, store } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
@@ -699,7 +779,9 @@ describe("createApp", () => {
       },
     });
 
-    const getRunResponse = await request(app).get(`/api/runs/${taskBackedRun.id}`);
+    const getRunResponse = await request(app).get(
+      `/api/runs/${taskBackedRun.id}?conversationId=${conversation.id}`,
+    );
     expect(getRunResponse.status).toBe(200);
     expect(getRunResponse.body.run).toEqual(
       expect.objectContaining({
@@ -709,7 +791,34 @@ describe("createApp", () => {
       }),
     );
 
-    const cancelRunResponse = await request(app).post(`/api/runs/${taskBackedRun.id}/cancel`);
+    const unscopedRunResponse = await request(app).get(`/api/runs/${taskBackedRun.id}`);
+    expect(unscopedRunResponse.status).toBe(400);
+
+    const otherConversation = store.saveConversation({
+      title: "Other session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const wrongScopeRunResponse = await request(app).get(
+      `/api/runs/${taskBackedRun.id}?conversationId=${otherConversation.id}`,
+    );
+    expect(wrongScopeRunResponse.status).toBe(404);
+
+    const engineRunResponse = await request(app).get(
+      `/api/engine/runs/${taskBackedRun.id}?conversationId=${conversation.id}`,
+    );
+    expect(engineRunResponse.status).toBe(200);
+    expect(engineRunResponse.body.engineRun).toEqual(
+      expect.objectContaining({
+        runId: taskBackedRun.id,
+        engineKind: "opencode",
+      }),
+    );
+
+    const cancelRunResponse = await request(app).post(
+      `/api/runs/${taskBackedRun.id}/cancel?conversationId=${conversation.id}`,
+    );
     expect(cancelRunResponse.status).toBe(200);
     expect(cancelRunResponse.body.task).toEqual(
       expect.objectContaining({
@@ -735,7 +844,9 @@ describe("createApp", () => {
     });
     store.completeWorkspaceRun(resumableRun.id, "failed");
 
-    const resumeRunResponse = await request(app).post(`/api/runs/${resumableRun.id}/resume`);
+    const resumeRunResponse = await request(app).post(
+      `/api/runs/${resumableRun.id}/resume?conversationId=${conversation.id}`,
+    );
     expect(resumeRunResponse.status).toBe(200);
     expect(resumeRunResponse.body.task).toEqual(
       expect.objectContaining({
@@ -1755,7 +1866,9 @@ describe("createApp", () => {
       },
     });
 
-    const runResponse = await request(app).get(`/api/runs/${cancelRun.id}`);
+    const runResponse = await request(app).get(
+      `/api/runs/${cancelRun.id}?conversationId=${cancelConversation.id}`,
+    );
     expect(runResponse.status).toBe(200);
     expect(runResponse.body.run).toEqual(
       expect.objectContaining({
@@ -1764,7 +1877,9 @@ describe("createApp", () => {
       }),
     );
 
-    const cancelResponse = await request(app).post(`/api/runs/${cancelRun.id}/cancel`);
+    const cancelResponse = await request(app).post(
+      `/api/runs/${cancelRun.id}/cancel?conversationId=${cancelConversation.id}`,
+    );
     expect(cancelResponse.status).toBe(200);
     expect(cancelResponse.body.task.status).toBe("cancelled");
 
@@ -1796,7 +1911,9 @@ describe("createApp", () => {
     });
     store.finalizeWorkspaceRun(resumeRun.id, "failed", "run_failed", { error: "boom" });
 
-    const resumeResponse = await request(app).post(`/api/runs/${resumeRun.id}/resume`);
+    const resumeResponse = await request(app).post(
+      `/api/runs/${resumeRun.id}/resume?conversationId=${resumeConversation.id}`,
+    );
     expect(resumeResponse.status).toBe(200);
     expect(resumeResponse.body.task).toEqual(
       expect.objectContaining({

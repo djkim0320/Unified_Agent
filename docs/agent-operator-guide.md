@@ -6,17 +6,17 @@ If you need task-by-task routing, use [`agent-change-playbook.md`](agent-change-
 
 ## 1. What This Repo Is
 
-This codebase is not just a chat UI. It is a local-first agent platform with:
+This codebase is not just a chat UI. It is a local-first cockpit/scheduler/log store for opencode-backed agent work with:
 
 - first-class agents
 - webchat sessions
 - workspace runs and run events
 - detached tasks and task events
-- file-backed memory
-- plugin and skill loading
-- provider-backed planning and final-answer streaming
+- task-flow scheduling
+- opencode run/event capture
+- provider account and model selection
 
-The current product focus is local desktop usage with `webchat` as the first channel.
+The current product focus is local desktop usage with `webchat` as the first channel. AetherOps does not execute a hidden internal runtime; all workspace execution goes through `OpenCodeEngine`/opencode.
 
 ## 2. Domain Model
 
@@ -24,7 +24,7 @@ Current domain model:
 
 - `agents`
   - default provider/model/reasoning configuration
-  - isolated workspace and memory root
+  - opencode control files and session sandbox ownership
 - `conversations`
   - currently act as sessions
   - belong to an agent
@@ -39,6 +39,10 @@ Current domain model:
   - detached background work
 - `task_events`
   - task lifecycle ledger
+- `automation_rules`
+  - agent-scoped periodic prompts
+  - materialized into `scheduled` tasks by the scheduler
+  - historical task/run records are retained when rules are deleted
 
 The stable mental model is:
 
@@ -46,13 +50,13 @@ The stable mental model is:
 
 ## 2.2 Workspace Engine
 
-AetherOps is the local control plane. It owns sessions, persistence, task flows, heartbeats, approvals, memory, and run/audit events. Actual workspace execution is routed through an `AgentEngine` abstraction.
+AetherOps is the local control plane: cockpit UI, scheduler, and log store. It owns sessions, persistence, task flows, heartbeats, operator-facing policy notes, and run/audit events. Actual workspace execution is routed through an `AgentEngine` abstraction.
 
 - Runtime engine: `OpenCodeEngine`, backed by the official `opencode` CLI through the embedded `opencode-ai` package.
 - Tests use an opencode-shaped deterministic command harness so coverage still exercises the same engine boundary without requiring a local opencode install.
 - Engine selection flags are no longer used; the old provider/tool fallback path has been removed from gateway wiring.
 - Launcher resolution prefers `OPENCODE_BIN` when explicitly set, then the project-local `node_modules/opencode-ai/bin/opencode` launcher, then a global `opencode` command.
-- Status and operations: `GET /api/engine/status`, `POST /api/engine/opencode/refresh-models`, `GET /api/engine/runs/:runId`.
+- Status and operations: `GET /api/engine/status`, `POST /api/engine/opencode/refresh-models`, `POST /api/engine/opencode/auth/login`, `GET /api/engine/runs/:runId?conversationId=<id>`.
 
 The opencode engine always runs inside the active conversation sandbox and uses an allowlisted process environment. It records command metadata, JSON event summaries, external session ids when available, changed files, and exit state into workspace run events.
 
@@ -61,7 +65,8 @@ The opencode engine always runs inside the active conversation sandbox and uses 
 Do not guess where data lives. The main sources of truth are:
 
 - SQLite for agents, sessions, messages, runs, run events, tasks, and task events
-- workspace files for memory, session sandbox files, shared skills, and local plugins
+- opencode conversation sandboxes under `workspace/opencode/agents/<agentId>/sessions/<conversationId>/`
+- AetherOps guide files such as agent standing orders and heartbeat configuration under `workspace/opencode/agents/<agentId>/`
 - provider accounts and secrets through the local store helpers in [`server/db.ts`](../server/db.ts)
 
 If a behavior spans multiple layers, inspect the DB helper first and then the route/runtime wiring.
@@ -76,7 +81,6 @@ Primary flow starts in [`server/app.ts`](../server/app.ts).
 
 - SQLite store from [`server/db.ts`](../server/db.ts)
 - workspace manager from [`server/lib/workspace.ts`](../server/lib/workspace.ts)
-- browser runtime from [`server/lib/browser-runtime.ts`](../server/lib/browser-runtime.ts)
 - provider registry from [`server/provider-registry.ts`](../server/provider-registry.ts)
 - channel registry from [`server/lib/channel-registry.ts`](../server/lib/channel-registry.ts)
 - agent gateway from [`server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts)
@@ -85,39 +89,24 @@ Primary flow starts in [`server/app.ts`](../server/app.ts).
 
 [`server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts) is the composition layer. It creates:
 
-- tool registry
-- plugin manager
-- memory manager
+- opencode `AgentEngine`
 - task manager
 - foreground turn runner
 
-This is the main place to inspect when behavior spans providers, tasks, memory, and tools.
+This is the main place to inspect when behavior spans providers, tasks, flows, heartbeats, and opencode runs.
 
 ### Runtime
 
 [`server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts) now calls the configured `AgentEngine` for foreground chat, detached tasks, heartbeats, task-flow steps, and sub-agents.
 
-The old provider/tool loop remains in [`server/lib/agent-runtime.ts`](../server/lib/agent-runtime.ts) only as isolated reference/test coverage. It is not wired into chat, tasks, flows, heartbeat, or sub-agent execution:
-
-1. create run
-2. plan tool step
-3. validate tool call
-4. execute tool
-5. record events
-6. repeat until `final_answer`
-7. stream final answer
-8. finalize run
-
-Supporting parser:
-
-- [`server/lib/agent-step.ts`](../server/lib/agent-step.ts)
+The old internal provider execution path is not a product fallback. Chat, tasks, flows, heartbeat, and sub-agent execution must call `AgentEngine.runTurn(...)` and fail loudly if opencode fails.
 
 For foreground chat, the path is:
 
 1. `POST /api/chat/stream` in [`../server/app.ts`](../server/app.ts)
 2. `gateway.runForegroundTurn(...)`
 3. configured `AgentEngine.runTurn(...)`
-4. opencode CLI workspace execution with plugin skill guidance and memory context embedded into the engine prompt
+4. opencode CLI workspace execution with AetherOps run context and guide files embedded into the engine prompt
 5. run event persistence
 6. SSE back to the client
 
@@ -128,73 +117,23 @@ For detached tasks, the path is:
 3. `taskManager.runTask(...)`
 4. `executeDetachedTask(...)` in [`../server/lib/agent-gateway.ts`](../server/lib/agent-gateway.ts)
 5. `AgentEngine.runTurn(...)`
-6. assistant result appended back into the session
+6. assistant result appended back into the session only when opencode emits final assistant text
 
 ### Tools
 
+AetherOps no longer owns an internal executable tool runtime in the product path. Filesystem, command, browser, MCP, and external-tool behavior should be configured in opencode itself. AetherOps records opencode run events and changed-file summaries.
+
 ### Computer Use
 
-Computer Use is implemented as an opt-in controlled browser harness. It is intentionally not unrestricted OS desktop automation.
-
-- Settings and observability live under `/api/computer-use/*`.
-- The default policy allows localhost/127.0.0.1 and blocks arbitrary external domains unless allowlisted.
-- Sensitive typing, destructive clicks, submission-like actions, uploads/downloads, and allowlisted external navigation require approval records.
-- Screenshots are private artifacts under `workspace/computer-use-artifacts/`; they are not served as public static files.
-- Agent planner access is gated: `computer.browser.*` tools are hidden unless Computer Use is enabled.
-- Provider-native OpenAI computer tool integration is reserved behind the capability field `computerUseMode`; the current working path is `custom-browser-harness`.
-
-Typed tools are registered via:
-
-- [`server/lib/tool-registry.ts`](../server/lib/tool-registry.ts)
-- [`server/plugins/core.ts`](../server/plugins/core.ts)
-
-The registry is the source of truth for:
-
-- planner guidance
-- schema validation
-- permission classification
-- executable behavior
-
-If you add a tool, update the registry and related tests. Do not add hidden tool behaviors in multiple places.
-
-Planner instructions should be derived from the registry and loaded skills. If the planner stops calling a tool correctly, inspect the registry metadata before changing the core loop.
+Custom AetherOps Computer Use was removed from the product path. `/api/computer-use/*` returns `410 Gone`. Browser/computer automation should be configured in opencode or an opencode MCP integration.
 
 ### Skills and plugins
 
-Plugin and skill loading is handled by:
-
-- [`server/lib/plugin-manager.ts`](../server/lib/plugin-manager.ts)
-
-Skill sources:
-
-- built-in plugin skills
-- `workspace/shared/skills/*.md`
-- `workspace/agents/<agentId>/skills/*.md`
-
-Plugin source:
-
-- built-in plugins
-- `workspace/shared/plugins/<pluginId>/plugin.json`
+Internal skill/plugin execution was removed from the product path. Put repeatable behavior in agent standing orders, workflow step prompts, or opencode configuration.
 
 ### Memory
 
-Memory is file-backed and visible:
-
-- durable: `workspace/agents/<agentId>/MEMORY.md`
-- daily: `workspace/agents/<agentId>/memory/YYYY-MM-DD.md`
-
-Manager:
-
-- [`server/lib/memory-manager.ts`](../server/lib/memory-manager.ts)
-
-Do not introduce hidden memory state that exists only in prompts.
-
-Memory capture happens in two forms:
-
-- explicit writes through memory tools/routes
-- runtime-driven summary capture after agent runs
-
-If memory behavior looks wrong, inspect both the memory manager and the call sites in the runtime/gateway path.
+AetherOps does not run a separate internal memory tool path in opencode-only mode. Persistent working context should be expressed through session history, agent standing orders, task-flow prompts, and opencode workspace artifacts.
 
 ### Tasks
 
@@ -211,7 +150,35 @@ Task states:
 - `timed_out`
 - `cancelled`
 
+Task kinds:
+
+- `detached`: operator-created background work
+- `heartbeat`: built-in recurring health/progress check
+- `continuation`: resumed run continuation
+- `scheduled`: user-defined automation rule materialization
+- `subagent`: child session work spawned from a parent run
+- `flow_step`: one step in an ordered task flow
+
 Tasks can append assistant messages back into the session when they finish.
+
+### Automation rules
+
+User-defined automation rules live beside Heartbeat. The scheduler only materializes them when `ENABLE_AGENT_AUTOMATIONS=true`; manual "run now" actions are allowed without that flag. A materialized rule is a normal `taskKind: "scheduled"` task with `automationRuleId` set, so execution still flows through `TaskManager -> AgentEngine.runTurn(...) -> opencode`.
+
+Automation rule routes:
+
+- `GET /api/agents/:agentId/automation-rules`
+- `POST /api/agents/:agentId/automation-rules`
+- `PATCH /api/agents/:agentId/automation-rules/:ruleId`
+- `DELETE /api/agents/:agentId/automation-rules/:ruleId`
+- `POST /api/agents/:agentId/automation-rules/:ruleId/trigger`
+
+Important invariants:
+
+- never create a hidden provider/tool fallback for rule execution
+- keep one queued/running task per rule
+- validate agent/session ownership before materializing work
+- preserve past task/run audit records when rules are deleted
 
 ### Task flows
 
@@ -220,7 +187,7 @@ Task flows are ordered, observable long-running workflows on top of detached tas
 - storage: `task_flows` and `task_flow_steps`
 - runtime: [`server/lib/task-manager.ts`](../server/lib/task-manager.ts)
 - API: `POST /api/agents/:agentId/flows`, `GET /api/flows/:flowId`, `POST /api/flows/:flowId/start`, `POST /api/flows/:flowId/resume`, `POST /api/flows/:flowId/steps/:stepId/retry`, `POST /api/flows/:flowId/steps/:stepId/skip`, `POST /api/flows/:flowId/cancel`
-- UI: [`src/components/WorkspaceView.tsx`](../src/components/WorkspaceView.tsx)
+- UI: [`src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
 
 Rules:
 
@@ -247,20 +214,21 @@ Important components:
 - [`src/components/AgentSettingsDialog.tsx`](../src/components/AgentSettingsDialog.tsx)
 - [`src/components/ChatView.tsx`](../src/components/ChatView.tsx)
 - [`src/components/Composer.tsx`](../src/components/Composer.tsx)
-- [`src/components/WorkspaceView.tsx`](../src/components/WorkspaceView.tsx)
+- [`src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
+- [`src/components/CockpitPanels.tsx`](../src/components/CockpitPanels.tsx)
 
 When changing frontend behavior, preserve these constraints:
 
 - state must stay scoped to active agent/session/run/task
 - stale async requests must not overwrite newer state
-- workspace UI must not leak absolute host paths
+- cockpit file/log panels must not leak absolute host paths
 - unsupported file encodings must remain explicit instead of being silently corrupted
 
 State orchestration in `src/App.tsx` is high leverage. Change it carefully and prefer keeping fetch helpers, selection state, and refresh sequencing explicit.
 
 ## 5. Workspace Rules
 
-The workspace manager is security-sensitive.
+The workspace manager is still security-sensitive because it creates and cleans opencode sandboxes, anchors agent control files, and summarizes changed files. Direct workspace tree/file/folder CRUD routes were removed from the product path and return `410 Gone`.
 
 Relevant file:
 
@@ -274,9 +242,9 @@ Required invariants:
 - deleting a conversation must clean only that session sandbox
 - normal API responses must use relative paths
 
-Never bypass `workspace.ts` for sandbox file operations.
+Never bypass `workspace.ts` for sandbox lifecycle or changed-file reporting.
 
-If a file feature looks simple but touches path resolution, treat it as security-sensitive work.
+If a file feature looks simple but touches path resolution, treat it as security-sensitive work and keep execution delegated to opencode.
 
 ## 6. Exec Rules
 
@@ -286,41 +254,22 @@ Relevant file:
 
 Current expectation:
 
-- structured execution only by default
+- product execution goes through opencode, not direct AetherOps command tools
+- structured helper execution only by default
 - safe working directory under sandbox
 - timeout and abort support
 - Windows process-tree cleanup on timeout/cancel
 - output caps
 
-Do not reintroduce raw shell execution as default behavior.
+Do not reintroduce raw shell execution or direct command tools as default product behavior.
 
 If a command execution change needs more power, gate it explicitly behind the unsafe flag instead of weakening the default path.
 
 ## 7. Browser / Web Research Rules
 
-Relevant files:
+AetherOps no longer owns a browser, web research, or Computer Use runtime. `/api/computer-use/*` returns `410 Gone`, and browser/web automation should be configured in opencode or an opencode MCP integration.
 
-- [`server/lib/browser-runtime.ts`](../server/lib/browser-runtime.ts)
-- [`server/lib/web-fetch.ts`](../server/lib/web-fetch.ts)
-- [`server/lib/network-guard.ts`](../server/lib/network-guard.ts)
-
-Required invariants:
-
-- block SSRF targets
-- revalidate redirects
-- bound fetched/extracted content
-- keep browser state isolated
-- treat extracted page text as untrusted input
-
-Browser continuity is useful within a run, but it must not quietly become cross-agent or cross-run shared state.
-
-Computer-use oriented browser tools:
-
-- `browser_wait_for`: wait for visible selectors, text, or URL fragments after navigation/clicks.
-- `browser_press`: press keys or shortcuts in the current page, optionally targeting a selector.
-- `browser_screenshot`: capture a PNG into the active session sandbox as a visual evidence artifact.
-
-Screenshot artifacts are written through the workspace manager, so path traversal and absolute-path escapes remain blocked.
+Do not add a hidden AetherOps fallback for browsing, screenshots, network fetches, or local computer control. If opencode writes artifacts, keep them scoped to the active session sandbox and surface them through run events or changed-file summaries.
 
 ## 8. Route Map
 
@@ -330,9 +279,6 @@ High-value routes:
 - `GET /api/agents`
 - `POST /api/agents`
 - `DELETE /api/agents/:agentId`
-- `GET /api/agents/:agentId/memory`
-- `POST /api/agents/:agentId/memory`
-- `GET /api/agents/:agentId/skills`
 - `GET /api/agents/:agentId/tasks`
 - `POST /api/agents/:agentId/tasks`
 - `POST /api/agents/:agentId/tasks/:taskId/cancel`
@@ -340,14 +286,13 @@ High-value routes:
 - `GET/POST /api/conversations`
 - `GET /api/conversations/:id/messages`
 - `POST /api/chat/stream`
-- `GET /api/workspace/tree`
-- `GET /api/workspace/file`
-- `POST /api/workspace/file`
-- `POST /api/workspace/folder`
+- Removed workspace file CRUD routes return `410 Gone`; use opencode runs for file work.
 - `GET /api/workspace/runs`
 - `GET /api/workspace/runs/:runId/events`
-- `GET /api/plugins`
-- `GET /api/tools`
+- `GET /api/plugins` returns empty local-plugin metadata for compatibility.
+- Removed internal tool/profile routes return `410 Gone`; use opencode MCP/tool configuration.
+- Removed memory and skill routes return `410 Gone`; use standing orders, workflow prompts, session history, and opencode artifacts.
+- `/api/computer-use/*` returns `410 Gone`; use opencode browser/computer integrations.
 - `GET /api/channels`
 
 When routes and frontend drift apart, update both `server/app.ts` and `src/api.ts`.
@@ -360,18 +305,18 @@ If your task is about:
 
 - DB schema or persistence:
   - inspect `server/db.ts`, `server/db.test.ts`
-- run lifecycle, tool calls, cancellation:
-  - inspect `server/lib/agent-runtime.ts`, `server/lib/agent-runtime.test.ts`
+- run lifecycle, opencode execution, cancellation:
+  - inspect `server/lib/opencode-engine.ts`, `server/lib/agent-engine.ts`, `server/lib/agent-gateway.ts`
 - providers:
   - inspect `server/providers/*.ts`
 - sandbox/file safety:
   - inspect `server/lib/workspace.ts`, `server/lib/workspace.test.ts`
 - tasks/background work:
   - inspect `server/lib/task-manager.ts`
-- plugin/skill metadata:
-  - inspect `server/lib/plugin-manager.ts`, `server/plugins/core.ts`
-- frontend agent/session/workspace state:
-  - inspect `src/App.tsx`, `src/api.ts`, `src/components/WorkspaceView.tsx`
+- external tool/skill metadata:
+  - inspect opencode configuration, `server/routes/platform.routes.ts`, and cockpit metadata displays
+- frontend agent/session/cockpit state:
+  - inspect `src/App.tsx`, `src/api.ts`, `src/components/CockpitSectionView.tsx`, `src/components/CockpitPanels.tsx`
 
 If your task is broad and crosses more than two items above, read [`agent-change-playbook.md`](agent-change-playbook.md) before editing.
 
@@ -389,7 +334,7 @@ Smoke routes:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8787/api/providers | Select-Object -ExpandProperty Content
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8787/api/agents/default-agent/skills | Select-Object -ExpandProperty Content
+curl.exe -i http://127.0.0.1:8787/api/agents/default-agent/skills
 ```
 
 ### Frontend verification
@@ -408,10 +353,10 @@ Then open:
 
 Preferred checks:
 
-- send a chat that triggers `write_file`
-- confirm chat activity shows tool call and tool result
-- switch to workspace tab
-- confirm file exists in tree
+- send a chat that asks opencode to create a file in the current session workspace
+- confirm chat activity shows opencode run progress
+- open the cockpit files/log panels
+- confirm the changed-file summary includes the new file
 - confirm run ledger shows terminal status
 
 Recommended verification prompt:
@@ -419,7 +364,6 @@ Recommended verification prompt:
 ```text
 Create hello_browser.ts in the current session workspace with exactly:
 export const browserCheck = (): string => 'ok';
-Use the write_file tool.
 ```
 
 ### Important process check

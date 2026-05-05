@@ -14,6 +14,7 @@ import { runOpenCodeOnlyWorkspaceMigration } from "./lib/opencode-only-migration
 import { loadOrCreateLocalApiToken } from "./lib/local-api-token.js";
 import { createLocalApiAuthMiddleware } from "./middleware/local-api-auth.js";
 import { errorHandler, notFound } from "./middleware/error-handler.js";
+import { sendLegacyGone } from "./routes/legacy-gone.js";
 import { registerPlatformRoutes } from "./routes/platform.routes.js";
 import { registerWorkspaceRoutes } from "./routes/workspace.routes.js";
 import { createStore, DEFAULT_AGENT_ID, DEFAULT_CONVERSATION_TITLE } from "./db.js";
@@ -92,6 +93,29 @@ const TaskCreateSchema = z.object({
   model: z.string().min(1).max(120).optional(),
   reasoningLevel: ReasoningLevelSchema.optional(),
   autoStart: z.boolean().optional().default(true),
+});
+
+const AutomationRuleCreateSchema = z.object({
+  conversationId: z.string().uuid().optional().nullable(),
+  title: z.string().min(1).max(120),
+  prompt: z.string().min(1).max(20_000),
+  providerKind: ProviderKindSchema.optional(),
+  model: z.string().min(1).max(120).optional(),
+  reasoningLevel: ReasoningLevelSchema.optional(),
+  enabled: z.boolean().optional().default(true),
+  intervalMinutes: z.coerce.number().int().min(1).max(60 * 24 * 365),
+  nextRunAt: z.coerce.number().int().optional(),
+});
+
+const AutomationRulePatchSchema = z.object({
+  title: z.string().min(1).max(120).optional(),
+  prompt: z.string().min(1).max(20_000).optional(),
+  providerKind: ProviderKindSchema.optional(),
+  model: z.string().min(1).max(120).optional(),
+  reasoningLevel: ReasoningLevelSchema.optional(),
+  enabled: z.boolean().optional(),
+  intervalMinutes: z.coerce.number().int().min(1).max(60 * 24 * 365).optional(),
+  nextRunAt: z.coerce.number().int().optional(),
 });
 
 const SubagentCreateSchema = z.object({
@@ -230,7 +254,7 @@ function toSafeLocalName(value: string, fallback: string) {
   const normalized = value
     .trim()
     .replace(/\.md$/i, "")
-    .replace(/[^a-zA-Z0-9가-힣._ -]+/g, "-")
+    .replace(/[^\p{L}\p{N}._ -]+/gu, "-")
     .replace(/\s+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
@@ -397,7 +421,12 @@ export function createApp(options?: {
     response.status(result.ok ? 200 : 400).json(result);
   });
   app.get("/api/engine/runs/:runId", async (request, response) => {
-    const engineRun = await gateway.agentEngine.getRunSummary(request.params.runId);
+    const conversationId = z.string().uuid().parse(request.query.conversationId);
+    const conversation = requireConversation(response, conversationId);
+    if (!conversation) {
+      return;
+    }
+    const engineRun = await gateway.agentEngine.getRunSummary(conversation.id, request.params.runId);
     if (!engineRun) {
       response.status(404).json({ error: "Engine run not found." });
       return;
@@ -419,11 +448,7 @@ export function createApp(options?: {
   });
 
   app.use("/api/computer-use", (_request, response) => {
-    response.status(410).json({
-      error:
-        "Custom Computer Use routes were removed from AetherOps opencode-only mode. Use opencode-supported browser/computer integrations instead.",
-      engineKind: "opencode",
-    });
+    sendLegacyGone(response, "Custom Computer Use API");
   });
 
   function requireConversation(
@@ -479,6 +504,15 @@ export function createApp(options?: {
       return null;
     }
     return step;
+  }
+
+  function requireAutomationRule(response: express.Response, agentId: string, ruleId: string) {
+    const rule = store.getAutomationRuleForAgent?.(agentId, ruleId) ?? null;
+    if (!rule) {
+      response.status(404).json({ error: "Automation rule not found" });
+      return null;
+    }
+    return rule;
   }
 
   function getProviderSummary(kind: ProviderKind): ProviderSummary {
@@ -540,31 +574,24 @@ export function createApp(options?: {
     response.json({ ok: true });
   });
 
-  function gone(response: express.Response, message: string) {
-    response.status(410).json({
-      error: message,
-      engineKind: "opencode",
-    });
-  }
-
   app.get("/api/agents/:agentId/memory", (_request, response) => {
-    gone(response, "AetherOps internal memory files were removed in opencode-only mode.");
+    sendLegacyGone(response, "AetherOps internal memory");
   });
 
   app.post("/api/agents/:agentId/memory", (_request, response) => {
-    gone(response, "AetherOps internal memory files were removed in opencode-only mode.");
+    sendLegacyGone(response, "AetherOps internal memory");
   });
 
   app.get("/api/agents/:agentId/memory/search", (_request, response) => {
-    gone(response, "AetherOps internal memory search was removed in opencode-only mode.");
+    sendLegacyGone(response, "AetherOps internal memory search");
   });
 
   app.get("/api/agents/:agentId/skills", (_request, response) => {
-    gone(response, "AetherOps skill/plugin execution was removed; attach tools through opencode instead.");
+    sendLegacyGone(response, "AetherOps skill/plugin execution");
   });
 
   app.post("/api/agents/:agentId/skills", (_request, response) => {
-    gone(response, "AetherOps skill/plugin execution was removed; attach tools through opencode instead.");
+    sendLegacyGone(response, "AetherOps skill/plugin execution");
   });
 
   app.get("/api/agents/:agentId/soul", (request, response) => {
@@ -663,6 +690,131 @@ export function createApp(options?: {
     }
     response.json({
       logs: store.listHeartbeatLogs(agent.id),
+    });
+  });
+
+  app.get("/api/agents/:agentId/automation-rules", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    response.json({
+      rules: store.listAutomationRules?.(agent.id) ?? [],
+    });
+  });
+
+  app.post("/api/agents/:agentId/automation-rules", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = AutomationRuleCreateSchema.parse(request.body);
+    const providerKind = body.providerKind ?? agent.providerKind;
+    const model = body.model ?? agent.model;
+    const reasoningLevel = normalizeReasoningLevel(
+      providerKind,
+      model,
+      body.reasoningLevel ?? agent.reasoningLevel,
+    );
+    const conversation = body.conversationId
+      ? store.getConversation(body.conversationId)
+      : store.saveConversation({
+          agentId: agent.id,
+          title: body.title,
+          providerKind,
+          model,
+          reasoningLevel,
+        });
+    if (!conversation || conversation.agentId !== agent.id) {
+      response.status(404).json({ error: "Session not found for agent." });
+      return;
+    }
+    const rule = store.createAutomationRule({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: body.title,
+      prompt: body.prompt,
+      providerKind,
+      model,
+      reasoningLevel,
+      enabled: body.enabled,
+      intervalMinutes: body.intervalMinutes,
+      nextRunAt: body.nextRunAt,
+    });
+    response.status(201).json({ rule, conversation });
+  });
+
+  app.patch("/api/agents/:agentId/automation-rules/:ruleId", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    if (!requireAutomationRule(response, agent.id, request.params.ruleId)) {
+      return;
+    }
+    const body = AutomationRulePatchSchema.parse(request.body);
+    const providerKind = body.providerKind;
+    const model = body.model;
+    const reasoningLevel =
+      providerKind && model
+        ? normalizeReasoningLevel(providerKind, model, body.reasoningLevel ?? agent.reasoningLevel)
+        : body.reasoningLevel;
+    const rule = store.updateAutomationRule({
+      agentId: agent.id,
+      ruleId: request.params.ruleId,
+      title: body.title,
+      prompt: body.prompt,
+      providerKind,
+      model,
+      reasoningLevel,
+      enabled: body.enabled,
+      intervalMinutes: body.intervalMinutes,
+      nextRunAt: body.nextRunAt,
+    });
+    response.json({ rule });
+  });
+
+  app.delete("/api/agents/:agentId/automation-rules/:ruleId", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    if (!requireAutomationRule(response, agent.id, request.params.ruleId)) {
+      return;
+    }
+    response.json({
+      ok: store.deleteAutomationRule(agent.id, request.params.ruleId),
+      ruleId: request.params.ruleId,
+    });
+  });
+
+  app.post("/api/agents/:agentId/automation-rules/:ruleId/trigger", (request, response) => {
+    const agent = requireAgent(response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const rule = requireAutomationRule(response, agent.id, request.params.ruleId);
+    if (!rule) {
+      return;
+    }
+    const result = store.enqueueAutomationRuleTask?.(rule.id, Date.now(), true) ?? null;
+    if (!result) {
+      response.status(400).json({ error: "Automation rule could not be triggered." });
+      return;
+    }
+    if (!result.enqueued) {
+      response.status(409).json({
+        error: "An automation task for this rule is already queued or running.",
+        rule: result.rule,
+        task: result.task,
+      });
+      return;
+    }
+    void gateway.taskManager.runTask(result.task.id);
+    response.json({
+      rule: result.rule,
+      task: result.task,
+      message: "자동화 규칙을 즉시 실행했습니다.",
     });
   });
 

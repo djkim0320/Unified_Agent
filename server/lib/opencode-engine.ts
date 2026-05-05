@@ -122,6 +122,17 @@ export function buildOpenCodeEnvironment(params?: {
   });
 }
 
+function isEnabledEnvFlag(value: string | undefined) {
+  return value ? /^(1|true|yes|on)$/i.test(value.trim()) : false;
+}
+
+export function shouldAutoApproveOpenCodePermissions(env: NodeJS.ProcessEnv = process.env) {
+  return (
+    isEnabledEnvFlag(env.AETHEROPS_OPENCODE_AUTO_APPROVE) ||
+    isEnabledEnvFlag(env.AETHEROPS_OPENCODE_DANGEROUS_SKIP_PERMISSIONS)
+  );
+}
+
 function makeOpenCodeRunner(launcher: OpenCodeLauncher): OpenCodeCommandRunner {
   async function execute(args: string[], options: OpenCodeRunnerOptions) {
     return new Promise<OpenCodeCommandResult>((resolve) => {
@@ -136,6 +147,9 @@ function makeOpenCodeRunner(launcher: OpenCodeLauncher): OpenCodeCommandRunner {
         cwd: options.cwd,
         env: options.env,
         shell: false,
+        // opencode treats an open non-TTY stdin as extra prompt input. The server never streams
+        // stdin to CLI runs, so close it explicitly to avoid silent hangs in background tasks.
+        stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
       const finish = (result: OpenCodeCommandResult) => {
@@ -363,14 +377,6 @@ function toRunMode(params: AgentEngineRunParams) {
   return "foreground";
 }
 
-function safeRead<T>(fallback: T, action: () => T) {
-  try {
-    return action();
-  } catch {
-    return fallback;
-  }
-}
-
 function clip(text: string, maxLength: number) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
@@ -381,14 +387,9 @@ function buildPrompt(params: {
   workspace: ReturnType<typeof createWorkspaceManager>;
 }) {
   const { input } = params;
-  const guides = safeRead(
-    { agents: "", memory: "", user: "", tools: "" },
-    () => params.workspace.readGuides(),
-  );
-  const soul = safeRead("", () => params.workspace.readAgentSoul(input.agentId).content);
-  const standingOrders = safeRead("", () =>
-    params.workspace.readAgentStandingOrders(input.agentId).content,
-  );
+  const guides = params.workspace.readGuides();
+  const soul = params.workspace.readAgentSoul(input.agentId).content;
+  const standingOrders = params.workspace.readAgentStandingOrders(input.agentId).content;
   const recentMessages = input.messages
     .slice(-8)
     .map((message) => `${message.role.toUpperCase()}: ${clip(message.content, 1600)}`)
@@ -480,6 +481,7 @@ function extractAssistantText(event: unknown) {
     object.text,
     object.content,
     object.message,
+    stringFromPath(object, ["part", "text"]),
     stringFromPath(object, ["assistant", "text"]),
     stringFromPath(object, ["assistant", "content"]),
     stringFromPath(object, ["data", "text"]),
@@ -535,6 +537,40 @@ function summarizeJsonEvents(events: unknown[]) {
     counts[type] = (counts[type] ?? 0) + 1;
   }
   return counts;
+}
+
+function extractJsonEventErrorText(events: unknown[]) {
+  for (const event of events) {
+    if (typeof event !== "object" || event === null) {
+      continue;
+    }
+    const object = event as Record<string, unknown>;
+    const type = typeof object.type === "string" ? object.type.toLowerCase() : "";
+    if (!type.includes("error")) {
+      continue;
+    }
+    const candidates = [
+      object.message,
+      stringFromPath(object, ["error", "message"]),
+      stringFromPath(object, ["error", "data", "message"]),
+      stringFromPath(object, ["data", "message"]),
+      object.error,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+      if (typeof candidate === "object" && candidate !== null) {
+        try {
+          return JSON.stringify(candidate);
+        } catch {
+          return "opencode emitted an error event.";
+        }
+      }
+    }
+    return "opencode emitted an error event.";
+  }
+  return null;
 }
 
 function parseModelsFromOutput(output: string) {
@@ -661,7 +697,13 @@ function latestExternalSessionId(store: AgentEngineStore, conversationId: string
   return (
     store
       .listWorkspaceRuns?.(conversationId)
-      .find((run) => run.id !== currentRunId && typeof run.resumeToken === "string" && run.resumeToken.trim())
+      .find(
+        (run) =>
+          run.id !== currentRunId &&
+          run.status === "completed" &&
+          typeof run.resumeToken === "string" &&
+          run.resumeToken.trim(),
+      )
       ?.resumeToken ?? null
   );
 }
@@ -746,10 +788,12 @@ export function createOpenCodeEngine(params: {
       selectedProviderKind: input.providerKind,
       selectedModel: input.model,
     });
+    const autoApprovePermissions = shouldAutoApproveOpenCodePermissions();
     const args = [
       "run",
       "--format",
       "json",
+      ...(autoApprovePermissions ? ["--dangerously-skip-permissions"] : []),
       "--model",
       opencodeModel,
       ...(previousSessionId ? ["--session", previousSessionId] : []),
@@ -761,7 +805,7 @@ export function createOpenCodeEngine(params: {
     const env = buildOpenCodeEnvironment({ credentialSync });
     const jsonEvents: unknown[] = [];
     const assistantChunks: string[] = [];
-    const fallbackOutputChunks: string[] = [];
+    const nonJsonOutputChunks: string[] = [];
     let externalSessionId = previousSessionId;
     let stdoutLineBuffer = "";
     let terminalState: EngineRunStatus = "running";
@@ -826,7 +870,12 @@ export function createOpenCodeEngine(params: {
         handleJsonEvent(event);
         return;
       }
-      fallbackOutputChunks.push(line);
+      nonJsonOutputChunks.push(line);
+      emit("status", {
+        phase: "opencode_non_json_output",
+        engineKind: "opencode",
+        message: clip(line, 800),
+      });
     };
     const handleStdoutChunk = (chunk: string) => {
       stdoutLineBuffer += chunk;
@@ -890,10 +939,7 @@ export function createOpenCodeEngine(params: {
 
       const afterSnapshot = snapshotWorkspace(workspaceDirectory);
       const changedFiles = changedFilesBetween(beforeSnapshot, afterSnapshot);
-      const assistantText =
-        assistantChunks.join("") ||
-        fallbackOutputChunks.join("\n").trim() ||
-        "opencode 실행은 완료됐지만 최종 응답 텍스트를 반환하지 않았습니다. 실행 이벤트와 변경 파일을 확인해 주세요.";
+      const assistantText = assistantChunks.join("");
       const completedAt = Date.now();
       const eventSummary = {
         jsonEventCounts: summarizeJsonEvents(jsonEvents),
@@ -901,8 +947,11 @@ export function createOpenCodeEngine(params: {
         stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
         stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
         stderr: clip(result.stderr.trim(), 4000),
+        nonJsonOutputLineCount: nonJsonOutputChunks.length,
+        nonJsonOutput: clip(nonJsonOutputChunks.join("\n").trim(), 4000),
         changedFiles,
       };
+      const jsonEventError = extractJsonEventErrorText(jsonEvents);
 
       if (result.cancelled || input.signal?.aborted) {
         terminalState = "cancelled";
@@ -923,7 +972,12 @@ export function createOpenCodeEngine(params: {
           changedFiles,
           engineRun,
         });
-        throw new EngineRunError(result.errorMessage ?? "opencode run was cancelled.", "cancelled", run.id);
+        throw new EngineRunError(
+          result.errorMessage ?? "opencode run was cancelled.",
+          "cancelled",
+          run.id,
+          "cancelled",
+        );
       }
 
       if (result.timedOut || result.exitCode !== 0) {
@@ -951,10 +1005,68 @@ export function createOpenCodeEngine(params: {
           changedFiles,
           engineRun,
         });
-        throw new EngineRunError(message, "failed", run.id);
+        throw new EngineRunError(message, "failed", run.id, result.timedOut ? "timed_out" : "failed");
       }
 
-      if (!assistantChunks.length && assistantText) {
+      if (jsonEventError) {
+        terminalState = "failed";
+        const message = clip(jsonEventError, 1200);
+        lastFailure = message;
+        patchRun("failed", changedFiles);
+        const engineRun = engineRecordFromRun({
+          runId: run.id,
+          status: terminalState,
+          externalSessionId,
+          workspacePath: ".",
+          model: opencodeModel,
+          command,
+          exitCode: result.exitCode,
+          eventSummary,
+          startedAt,
+          completedAt,
+        });
+        emit("error", { error: message, phase: "engine_run_failed", engineRun });
+        params.store.finalizeWorkspaceRun(run.id, "failed", "run_failed", {
+          error: message,
+          changedFiles,
+          engineRun,
+        });
+        throw new EngineRunError(message, "failed", run.id, "failed");
+      }
+
+      if (!assistantChunks.length && changedFiles.length === 0) {
+        terminalState = "failed";
+        const message = "opencode completed without assistant text or workspace changes.";
+        lastFailure = message;
+        patchRun("failed", changedFiles);
+        const engineRun = engineRecordFromRun({
+          runId: run.id,
+          status: terminalState,
+          externalSessionId,
+          workspacePath: ".",
+          model: opencodeModel,
+          command,
+          exitCode: result.exitCode,
+          eventSummary,
+          startedAt,
+          completedAt,
+        });
+        emit("error", { error: message, phase: "engine_run_failed", engineRun });
+        params.store.finalizeWorkspaceRun(run.id, "failed", "run_failed", {
+          error: message,
+          changedFiles,
+          engineRun,
+        });
+        throw new EngineRunError(message, "failed", run.id, "failed");
+      }
+
+      if (!assistantChunks.length) {
+        emit("status", {
+          phase: "engine_run_completed_without_assistant_text",
+          engineKind: "opencode",
+          message: "opencode completed without a final assistant text event.",
+        });
+      } else {
         send("delta", { delta: assistantText });
       }
 
@@ -993,7 +1105,7 @@ export function createOpenCodeEngine(params: {
         throw error;
       }
       if (isAbortError(error)) {
-        throw new EngineRunError("opencode run was cancelled.", "cancelled", run.id);
+        throw new EngineRunError("opencode run was cancelled.", "cancelled", run.id, "cancelled");
       }
       const message = error instanceof Error ? error.message : "opencode engine failed.";
       lastFailure = message;
@@ -1005,7 +1117,7 @@ export function createOpenCodeEngine(params: {
       params.store.finalizeWorkspaceRun(run.id, "failed", "run_failed", {
         error: message,
       });
-      throw new EngineRunError(message, "failed", run.id);
+      throw new EngineRunError(message, "failed", run.id, "failed");
     }
   }
 
@@ -1072,6 +1184,7 @@ export function createOpenCodeEngine(params: {
         autoUpdateDisabled: env.OPENCODE_DISABLE_AUTOUPDATE === "true",
         pruneDisabled: env.OPENCODE_DISABLE_PRUNE === "true",
         defaultPluginsDisabled: env.OPENCODE_DISABLE_DEFAULT_PLUGINS === "true",
+        autoApprovePermissions: shouldAutoApproveOpenCodePermissions(),
       },
       credentialSync: {
         mode: "runtime-env",
@@ -1182,9 +1295,14 @@ export function createOpenCodeEngine(params: {
     }
   }
 
-  async function getRunSummary(runId: string) {
-    const run = params.store.getWorkspaceRun?.(runId);
+  async function getRunSummary(conversationId: string, runId: string) {
+    const run =
+      params.store.getWorkspaceRunForConversation?.(conversationId, runId) ??
+      params.store.getWorkspaceRun?.(runId);
     if (!run) {
+      return null;
+    }
+    if (run.conversationId !== conversationId) {
       return null;
     }
     const events = params.store.listWorkspaceRunEvents?.(run.conversationId, runId) ?? [];
@@ -1226,6 +1344,8 @@ export const openCodeEngineTestUtils = {
   parseModelsFromOutput,
   parseSessionsFromOutput,
   parseAuthProvidersFromOutput,
+  createRunnerForLauncher: makeOpenCodeRunner,
+  shouldAutoApproveOpenCodePermissions,
   buildPrompt,
   snapshotWorkspace,
   changedFilesBetween,

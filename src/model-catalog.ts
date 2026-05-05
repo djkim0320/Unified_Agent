@@ -11,7 +11,7 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
     {
       id: "gpt-5.5",
       label: "GPT-5.5",
-      note: "복잡한 추론, 코딩, 에이전트 작업에 가장 적합한 최신 모델",
+      note: "복잡한 추론, 코딩, 장기 에이전트 작업에 맞춘 최신 고성능 모델",
     },
     {
       id: "gpt-5.4",
@@ -26,7 +26,7 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
     {
       id: "gpt-5.4-nano",
       label: "GPT-5.4 Nano",
-      note: "간단한 질의와 초저지연 작업용 경량 모델",
+      note: "간단한 지시와 초저지연 작업에 맞춘 경량 모델",
     },
   ],
   anthropic: [
@@ -50,12 +50,12 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
     {
       id: "gemini-3.1-pro-preview",
       label: "Gemini 3.1 Pro Preview",
-      note: "복잡한 에이전트 워크플로우와 긴 맥락에 적합한 Gemini 모델",
+      note: "긴 컨텍스트와 복잡한 에이전트 워크플로우에 적합한 Gemini 모델",
     },
     {
       id: "gemini-3.1-pro-preview-customtools",
-      label: "Gemini 3.1 Pro Custom Tools",
-      note: "커스텀 툴과 bash 스타일 도구 호출에 맞춘 Gemini 모델",
+      label: "Gemini 3.1 Pro Preview",
+      note: "opencode MCP/확장 설정과 함께 쓰기 좋은 Gemini 모델 별칭",
     },
     {
       id: "gemini-3-flash-preview",
@@ -82,14 +82,14 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
     {
       id: "gemma3:12b",
       label: "Gemma 3 12B",
-      note: "가벼운 로컬 추론과 멀티모달 작업에 적합한 모델",
+      note: "가벼운 로컬 추론과 메모리 제한 환경에 맞춘 모델",
     },
   ],
   "openai-codex": [
     {
       id: "gpt-5.5",
       label: "GPT-5.5",
-      note: "ChatGPT/OAuth로 로그인한 Codex에서 권장되는 최신 모델",
+      note: "ChatGPT/OAuth로 연결한 Codex에서 권장하는 최신 모델",
     },
     {
       id: "gpt-5.4",
@@ -99,7 +99,7 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
     {
       id: "gpt-5.4-mini",
       label: "GPT-5.4 Mini",
-      note: "가벼운 코딩 작업과 빠른 서브에이전트 작업용 모델",
+      note: "가벼운 코딩 작업과 빠른 하위 에이전트 작업용 모델",
     },
     {
       id: "gpt-5.3-codex",

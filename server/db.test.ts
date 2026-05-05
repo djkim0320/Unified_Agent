@@ -34,10 +34,130 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ version: number; name: string }>;
 
     expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9]),
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
     );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
+  });
+
+  it("persists automation rules and materializes due rules as scheduled tasks once", () => {
+    const conversation = createConversation("automation");
+    const rule = store.createAutomationRule({
+      agentId: "default-agent",
+      conversationId: conversation.id,
+      title: "Daily cockpit sweep",
+      prompt: "Summarize changed files and next actions.",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      enabled: true,
+      intervalMinutes: 15,
+      nextRunAt: 100,
+    });
+
+    expect(store.listAutomationRules("default-agent")).toEqual([
+      expect.objectContaining({
+        id: rule.id,
+        title: "Daily cockpit sweep",
+        enabled: true,
+        providerKind: "openai",
+        reasoningLevel: "high",
+      }),
+    ]);
+
+    const updated = store.updateAutomationRule({
+      agentId: "default-agent",
+      ruleId: rule.id,
+      intervalMinutes: 30,
+      nextRunAt: 200,
+    });
+    expect(updated).toEqual(expect.objectContaining({ intervalMinutes: 30, nextRunAt: 200 }));
+    expect(store.listDueAutomationRules(199)).toEqual([]);
+    expect(store.listDueAutomationRules(200)).toHaveLength(1);
+
+    const first = store.enqueueAutomationRuleTask(rule.id, 200);
+    expect(first?.enqueued).toBe(true);
+    expect(first?.task).toEqual(
+      expect.objectContaining({
+        automationRuleId: rule.id,
+        taskKind: "scheduled",
+        status: "queued",
+        scheduledFor: 200,
+      }),
+    );
+    expect(store.getAutomationRule(rule.id)).toEqual(
+      expect.objectContaining({
+        lastTaskId: first?.task.id,
+        lastRunAt: 200,
+        runCount: 1,
+        nextRunAt: 200 + 30 * 60_000,
+      }),
+    );
+
+    const second = store.enqueueAutomationRuleTask(rule.id, 200, true);
+    expect(second?.enqueued).toBe(false);
+    expect(second?.task.id).toBe(first?.task.id);
+
+    expect(store.deleteAutomationRule("default-agent", rule.id)).toBe(true);
+    expect(store.getTask(first!.task.id)).toEqual(
+      expect.objectContaining({
+        id: first!.task.id,
+        automationRuleId: null,
+      }),
+    );
+  });
+
+  it("does not bootstrap removed memory/plugin stores for fresh databases", () => {
+    const rows = store.rawDb
+      .prepare(
+        `SELECT name FROM sqlite_master
+         WHERE name = 'plugins' OR name = 'memory_index' OR name LIKE 'memory_index_%'
+         ORDER BY name ASC`,
+      )
+      .all() as Array<{ name: string }>;
+
+    expect(rows).toEqual([]);
+  });
+
+  it("preserves legacy memory/plugin tables when opening old databases", () => {
+    store.rawDb.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    const db = new Database(path.join(dataDir, "chat.sqlite"));
+    db.exec(`
+      CREATE TABLE memory_index (
+        agent_id TEXT,
+        path TEXT,
+        kind TEXT,
+        line INTEGER,
+        reason TEXT,
+        text TEXT
+      );
+      INSERT INTO memory_index (agent_id, path, kind, line, reason, text)
+      VALUES ('default-agent', 'legacy.md', 'note', 1, 'legacy', 'keep me');
+
+      CREATE TABLE plugins (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        manifest_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO plugins (id, name, manifest_json, enabled, created_at, updated_at)
+      VALUES ('plugin-1', 'Legacy Plugin', '{}', 1, 1, 1);
+    `);
+    db.close();
+
+    store = createStore(dataDir);
+
+    expect(
+      store.rawDb.prepare("SELECT COUNT(*) AS count FROM memory_index").get(),
+    ).toEqual({ count: 1 });
+    expect(store.rawDb.prepare("SELECT COUNT(*) AS count FROM plugins").get()).toEqual({
+      count: 1,
+    });
   });
 
   it("upgrades an existing partial conversation schema without deleting data", () => {
@@ -348,6 +468,55 @@ describe("workspace run persistence consistency", () => {
     expect(store.listTaskEvents(owner.id, task.id).length).toBeGreaterThan(1);
     expect(store.listTaskEvents(other.id, task.id)).toEqual([]);
     expect(store.getTaskForAgent(other.id, task.id)).toBeNull();
+  });
+
+  it("keeps terminal task transitions idempotent", () => {
+    const agent = store.saveAgent({
+      name: "Terminal Agent",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const conversation = store.saveConversation({
+      agentId: agent.id,
+      title: "terminal session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+    const task = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Terminal work",
+      prompt: "Complete once",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+    });
+
+    const completed = store.transitionTask({
+      taskId: task.id,
+      status: "completed",
+      eventType: "completed",
+      resultText: "done",
+    });
+    const eventCountAfterComplete = store.listTaskEvents(agent.id, task.id).length;
+    const failed = store.transitionTask({
+      taskId: task.id,
+      status: "failed",
+      eventType: "failed",
+      resultText: "should not overwrite",
+    });
+
+    expect(completed.changed).toBe(true);
+    expect(failed.changed).toBe(false);
+    expect(store.getTask(task.id)).toEqual(
+      expect.objectContaining({
+        status: "completed",
+        resultText: "done",
+      }),
+    );
+    expect(store.listTaskEvents(agent.id, task.id)).toHaveLength(eventCountAfterComplete);
   });
 
   it("stores task metadata and heartbeat logs", () => {

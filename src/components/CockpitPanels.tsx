@@ -29,30 +29,31 @@ function formatClock(timestamp: number) {
 
 function displayPath(value: string) {
   return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\/.test(value) || /^\/(?!\/)/.test(value)
-    ? "[숨김 경로]"
+    ? "[숨긴 경로]"
     : value;
 }
 
-function getToolName(event: WorkspaceRunEventRecord) {
+function eventName(event: WorkspaceRunEventRecord) {
   const payload = event.payload;
-  const candidates = [payload.toolName, payload.tool, payload.name, payload.command, payload.action];
+  const candidates = [payload.phase, payload.command, payload.action, payload.status, payload.name, payload.toolName];
   const match = candidates.find((value) => typeof value === "string" && value.trim());
   return typeof match === "string" ? match : event.eventType;
 }
 
-function getEventSummary(event: WorkspaceRunEventRecord) {
+function eventSummary(event: WorkspaceRunEventRecord) {
   const payload = event.payload;
   if (typeof payload.message === "string") return payload.message;
   if (typeof payload.error === "string") return payload.error;
   if (typeof payload.path === "string") return displayPath(payload.path);
   if (typeof payload.query === "string") return payload.query;
+  if (typeof payload.summary === "string") return payload.summary;
   return event.eventType;
 }
 
-function getStepTone(status: string | null | undefined) {
+function stepTone(status: string | null | undefined) {
   if (status === "completed" || status === "skipped") return "done";
   if (status === "running") return "active";
-  if (status === "failed" || status === "cancelled") return "error";
+  if (status === "failed" || status === "cancelled" || status === "timed_out") return "error";
   return "queued";
 }
 
@@ -70,6 +71,8 @@ function statusLabel(status: string | null | undefined) {
       return "취소";
     case "skipped":
       return "건너뜀";
+    case "timed_out":
+      return "시간 초과";
     default:
       return "준비";
   }
@@ -82,11 +85,31 @@ function flowStatusCounts(flows: TaskFlowRecord[]) {
   }, {});
 }
 
-function collectToolEvents(events: WorkspaceRunEventRecord[]) {
+function collectExecutionEvents(events: WorkspaceRunEventRecord[]) {
   return events
-    .filter((event) => event.eventType === "tool_call" || event.eventType === "tool_result" || event.eventType === "error")
+    .filter((event) =>
+      event.eventType === "status" ||
+      event.eventType === "error" ||
+      event.eventType === "run_complete" ||
+      event.eventType === "run_failed" ||
+      event.eventType === "run_cancelled" ||
+      event.eventType === "tool_call" ||
+      event.eventType === "tool_result",
+    )
     .slice(-6)
     .reverse();
+}
+
+function collectOpenCodeExtensionEntries(platformMetadata: PlatformMetadata | null) {
+  return (platformMetadata?.tools ?? [])
+    .filter((tool) => {
+      const name = tool.name.toLowerCase();
+      return tool.permission === "network" || name.includes("mcp") || name.includes("browser");
+    })
+    .map((tool) => ({
+      name: tool.name,
+      status: tool.audit?.safeByDefault ? "opencode에서 자동 가능" : "opencode 정책 확인 필요",
+    }));
 }
 
 export function CockpitRightRail({
@@ -116,7 +139,7 @@ export function CockpitRightRail({
             <p className="cockpit-eyebrow">워크플로우</p>
             <h3>{activeFlow?.flow.title ?? "활성 작업 흐름 없음"}</h3>
           </div>
-          <span className={`cockpit-status cockpit-status--${getStepTone(activeFlow?.flow.status)}`}>
+          <span className={`cockpit-status cockpit-status--${stepTone(activeFlow?.flow.status)}`}>
             {statusLabel(activeFlow?.flow.status)}
           </span>
         </div>
@@ -147,7 +170,7 @@ export function CockpitRightRail({
                 { id: "placeholder-4", stepKey: "plan", title: "실행 계획", status: "queued" },
                 { id: "placeholder-5", stepKey: "decision", title: "결정 로그", status: "queued" },
               ]).map((step, index) => (
-            <article className={`cockpit-step cockpit-step--${getStepTone(step.status)}`} key={step.id}>
+            <article className={`cockpit-step cockpit-step--${stepTone(step.status)}`} key={step.id}>
               <span className="cockpit-step__index">{index + 1}</span>
               <div>
                 <strong>{step.title}</strong>
@@ -163,7 +186,7 @@ export function CockpitRightRail({
         <div className="cockpit-card__header">
           <div>
             <p className="cockpit-eyebrow">실시간 흐름 추적</p>
-            <h3>도구와 실행 이벤트</h3>
+            <h3>opencode 실행 이벤트</h3>
           </div>
           <span className="cockpit-pill">live</span>
         </div>
@@ -173,14 +196,16 @@ export function CockpitRightRail({
               <article className={`cockpit-timeline__item cockpit-timeline__item--${event.eventType}`} key={event.id}>
                 <span className="cockpit-timeline__dot" />
                 <div>
-                  <strong>{getToolName(event)}</strong>
-                  <p>{getEventSummary(event)}</p>
+                  <strong>{eventName(event)}</strong>
+                  <p>{eventSummary(event)}</p>
                   <small>{formatClock(event.createdAt)}</small>
                 </div>
               </article>
             ))
           ) : (
-            <p className="cockpit-empty">아직 실시간 이벤트가 없습니다. 채팅을 보내면 도구 호출과 결과가 여기에 표시됩니다.</p>
+            <p className="cockpit-empty">
+              아직 실시간 이벤트가 없습니다. 채팅을 보내면 opencode 실행 이벤트가 여기에 표시됩니다.
+            </p>
           )}
         </div>
       </section>
@@ -209,19 +234,14 @@ export function CockpitOpsDrawer({
   platformMetadata,
   runEvents,
 }: CockpitPanelsProps) {
-  const events = collectToolEvents([...(runEvents ?? []), ...liveEvents]);
-  const mcpLikeTools = (platformMetadata?.tools ?? []).filter(
-    (tool) => tool.permission === "network" || tool.name.includes("mcp") || tool.name.includes("browser"),
-  );
-  const skillsCount =
-    (platformMetadata?.agentSkills?.length ?? 0) +
-    (platformMetadata?.plugins ?? []).reduce((total, plugin) => total + (plugin.skills?.length ?? 0), 0);
+  const events = collectExecutionEvents([...(runEvents ?? []), ...liveEvents]);
+  const extensionEntries = collectOpenCodeExtensionEntries(platformMetadata);
 
   return (
-    <section className="cockpit-ops-drawer" aria-label="운영 로그 드로어">
+    <section className="cockpit-ops-drawer" aria-label="운영 로그 서랍">
       <div className="cockpit-drawer-panel cockpit-drawer-panel--wide">
         <div className="cockpit-drawer-panel__header">
-          <h3>도구 호출</h3>
+          <h3>opencode 실행 이벤트</h3>
           <span>{events.length}</span>
         </div>
         <div className="cockpit-tool-table">
@@ -229,55 +249,62 @@ export function CockpitOpsDrawer({
             events.map((event) => (
               <article className="cockpit-tool-row" key={`${event.id}-${event.createdAt}`}>
                 <time>{formatClock(event.createdAt)}</time>
-                <strong>{getToolName(event)}</strong>
-                <span>{getEventSummary(event)}</span>
+                <strong>{eventName(event)}</strong>
+                <span>{eventSummary(event)}</span>
                 <em>{event.eventType === "error" ? "오류" : "기록됨"}</em>
               </article>
             ))
           ) : (
-            <p className="cockpit-empty">최근 도구 호출이 없습니다.</p>
+            <p className="cockpit-empty">최근 opencode 실행 이벤트가 없습니다.</p>
           )}
         </div>
       </div>
 
       <div className="cockpit-drawer-panel">
         <div className="cockpit-drawer-panel__header">
-          <h3>승인 대기</h3>
-          <span>0</span>
+          <h3>실행 정책</h3>
+          <span>opencode</span>
         </div>
         <p className="cockpit-approval-copy">
-          파일 쓰기, 외부 API 호출, 장기 실행 작업처럼 side effect가 있는 액션은 여기에서 확인 후 승인합니다.
+          AetherOps는 내부 툴을 직접 실행하지 않습니다. 파일 변경, 명령 실행, MCP/브라우저 기능은 opencode 설정과 실행
+          로그를 통해 관제됩니다.
         </p>
       </div>
 
       <div className="cockpit-drawer-panel">
         <div className="cockpit-drawer-panel__header">
-          <h3>MCP 서버</h3>
-          <span>{mcpLikeTools.length}</span>
+          <h3>opencode 확장 상태</h3>
+          <span>{extensionEntries.length}</span>
         </div>
         <div className="cockpit-server-list">
-          {["filesystem", "web-search", "github", "database"].map((name, index) => (
-            <article key={name}>
-              <span className="cockpit-server-dot" />
-              <div>
-                <strong>{name}</strong>
-                <small>{index < Math.max(1, mcpLikeTools.length) ? "연결됨" : "대기"}</small>
-              </div>
-            </article>
-          ))}
+          {extensionEntries.length ? (
+            extensionEntries.map((entry) => (
+              <article key={entry.name}>
+                <span className="cockpit-server-dot" />
+                <div>
+                  <strong>{entry.name}</strong>
+                  <small>{entry.status}</small>
+                </div>
+              </article>
+            ))
+          ) : (
+            <p className="cockpit-empty">
+              AetherOps 내부 MCP/도구 런타임은 비활성화되어 있습니다. 확장 기능은 opencode 설정에서 연결하세요.
+            </p>
+          )}
         </div>
       </div>
 
       <div className="cockpit-drawer-panel">
         <div className="cockpit-drawer-panel__header">
-          <h3>스킬 / 파일 변경</h3>
-          <span>{skillsCount}</span>
+          <h3>변경 파일</h3>
+          <span>{changedFiles.length}</span>
         </div>
         <div className="cockpit-file-list">
           {changedFiles.length ? (
             changedFiles.slice(0, 5).map((file) => <span key={file}>{displayPath(file)}</span>)
           ) : (
-            <p className="cockpit-empty">변경된 파일이 아직 없습니다.</p>
+            <p className="cockpit-empty">아직 변경된 파일이 없습니다.</p>
           )}
         </div>
       </div>

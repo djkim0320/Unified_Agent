@@ -254,11 +254,6 @@ export function createWorkspaceManager(
     );
     readBootstrapFile(
       rootDir,
-      "MEMORY.md",
-      ["# MEMORY", "", "Store durable decisions, project notes, and repeated preferences here."].join("\n"),
-    );
-    readBootstrapFile(
-      rootDir,
       "USER.md",
       ["# USER", "", "This workspace belongs to the local user of the app."].join("\n"),
     );
@@ -294,14 +289,8 @@ export function createWorkspaceManager(
 
   function createAgentWorkspace(agentId: string) {
     const agentDir = getAgentDir(agentId);
-    fs.mkdirSync(path.join(agentDir, "memory"), { recursive: true });
     fs.mkdirSync(path.join(agentDir, "summaries"), { recursive: true });
     fs.mkdirSync(path.join(agentDir, "outcomes"), { recursive: true });
-    readBootstrapFile(
-      agentDir,
-      "MEMORY.md",
-      ["# MEMORY", "", "Durable facts, preferences, and decisions for this agent."].join("\n"),
-    );
     readBootstrapFile(
       agentDir,
       "SOUL.md",
@@ -335,7 +324,7 @@ export function createWorkspaceManager(
     readBootstrapFile(
       agentDir,
       "AGENTS.md",
-      ["# AGENT", "", "- Keep this agent's workspace, memory, and task history isolated."].join("\n"),
+      ["# AGENT", "", "- Keep this agent's workspace and task history isolated."].join("\n"),
     );
     return agentDir;
   }
@@ -356,24 +345,6 @@ export function createWorkspaceManager(
       force: true,
     });
     return true;
-  }
-
-  function todayMemoryFileName(date = new Date()) {
-    return `${date.toISOString().slice(0, 10)}.md`;
-  }
-
-  function readAgentMemory(agentId: string) {
-    const agentDir = createAgentWorkspace(agentId);
-    const dailyPath = path.join(agentDir, "memory", todayMemoryFileName());
-    if (!fs.existsSync(dailyPath)) {
-      fs.writeFileSync(dailyPath, `# ${todayMemoryFileName().replace(".md", "")}\n\n`, "utf8");
-    }
-    return {
-      agentId,
-      memory: fs.readFileSync(path.join(agentDir, "MEMORY.md"), "utf8"),
-      dailyNote: fs.readFileSync(dailyPath, "utf8"),
-      date: todayMemoryFileName().replace(".md", ""),
-    };
   }
 
   function readAgentSoul(agentId: string): AgentSoulRecord {
@@ -438,50 +409,6 @@ export function createWorkspaceManager(
     const content = serializeHeartbeatDocument(input);
     fs.writeFileSync(heartbeatPath, content, "utf8");
     return readAgentHeartbeat(agentId);
-  }
-
-  function appendAgentMemory(params: {
-    agentId: string;
-    content: string;
-    target?: "durable" | "daily";
-  }) {
-    const agentDir = createAgentWorkspace(params.agentId);
-    const targetPath =
-      params.target === "daily"
-        ? path.join(agentDir, "memory", todayMemoryFileName())
-        : path.join(agentDir, "MEMORY.md");
-    const prefix = fs.existsSync(targetPath) && fs.readFileSync(targetPath, "utf8").trim() ? "\n\n" : "";
-    fs.appendFileSync(targetPath, `${prefix}- ${params.content.trim()}\n`, "utf8");
-    return readAgentMemory(params.agentId);
-  }
-
-  function searchAgentMemory(params: {
-    agentId: string;
-    query: string;
-    maxResults?: number;
-  }) {
-    const agentDir = createAgentWorkspace(params.agentId);
-    const query = params.query.trim().toLowerCase();
-    const maxResults = params.maxResults ?? 8;
-    const files = [
-      path.join(agentDir, "MEMORY.md"),
-      ...fs
-        .readdirSync(path.join(agentDir, "memory"), { withFileTypes: true })
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".md"))
-        .map((entry) => path.join(agentDir, "memory", entry.name)),
-    ];
-
-    const results: Array<{ path: string; line: number; text: string }> = [];
-    for (const filePath of files) {
-      const relative = path.relative(agentDir, filePath).replace(/\\/g, "/");
-      const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
-      lines.forEach((line, index) => {
-        if (line.toLowerCase().includes(query) && results.length < maxResults) {
-          results.push({ path: relative, line: index + 1, text: line });
-        }
-      });
-    }
-    return results;
   }
 
   function getSandboxDir(conversationId: string) {
@@ -904,7 +831,6 @@ export function createWorkspaceManager(
   function readGuides() {
     return {
       agents: fs.readFileSync(path.join(rootDir, "AGENTS.md"), "utf8"),
-      memory: fs.readFileSync(path.join(rootDir, "MEMORY.md"), "utf8"),
       user: fs.readFileSync(path.join(rootDir, "USER.md"), "utf8"),
       tools: fs.readFileSync(path.join(rootDir, "TOOLS.md"), "utf8"),
     };
@@ -935,15 +861,12 @@ export function createWorkspaceManager(
     movePath,
     deletePath,
     resolveSandboxDirectory,
-    readAgentMemory,
     readAgentSoul,
     writeAgentSoul,
     readAgentStandingOrders,
     writeAgentStandingOrders,
     readAgentHeartbeat,
     writeAgentHeartbeat,
-    appendAgentMemory,
-    searchAgentMemory,
     readGuides,
   };
 }

@@ -1,4 +1,5 @@
 import type express from "express";
+import { sendLegacyGone } from "./legacy-gone.js";
 
 type PlatformRouteGateway = {
   agentEngine: {
@@ -9,13 +10,6 @@ type PlatformRouteGateway = {
 type PlatformRouteChannelRegistry = {
   listChannels: () => unknown[];
 };
-
-function gone(response: express.Response, feature: string) {
-  response.status(410).json({
-    error: `${feature} was removed from AetherOps opencode-only mode. Configure equivalent capabilities in opencode.`,
-    engineKind: "opencode",
-  });
-}
 
 export function registerPlatformRoutes(
   app: express.Express,
@@ -40,11 +34,11 @@ export function registerPlatformRoutes(
   });
 
   app.post("/api/mcp/servers", (_request, response) => {
-    gone(response, "MCP/profile registration");
+    sendLegacyGone(response, "MCP/profile registration");
   });
 
   app.get("/api/tools", (_request, response) => {
-    gone(response, "AetherOps internal tools");
+    sendLegacyGone(response, "AetherOps internal tool runtime");
   });
 
   app.get("/api/channels", (_request, response) => {

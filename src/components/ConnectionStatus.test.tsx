@@ -16,6 +16,21 @@ const provider: ProviderSummary = {
 };
 
 describe("ConnectionStatus", () => {
+  it("shows a checking state before the backend health probe completes", () => {
+    render(
+      <ConnectionStatus
+        backendOnline={null}
+        modelCount={0}
+        modelsError={null}
+        modelsLoading={false}
+        provider={provider}
+      />,
+    );
+
+    expect(screen.getByLabelText("서버 확인 중")).toHaveClass("is-checking");
+    expect(screen.getByText("백엔드 연결 상태를 확인하는 중입니다.")).toBeInTheDocument();
+  });
+
   it("shows a normal system status when the backend is reachable", () => {
     render(
       <ConnectionStatus

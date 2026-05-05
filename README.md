@@ -1,6 +1,6 @@
 # AetherOps
 
-AetherOps is a React + Express + SQLite local-first agent operations platform for tool-calling chat, workspace automation, long-running workflows, and future engineering design integrations.
+AetherOps is a React + Express + SQLite local-first cockpit, scheduler, and log store for opencode-backed agent work.
 
 ## Supported providers
 
@@ -19,9 +19,11 @@ AetherOps is a React + Express + SQLite local-first agent operations platform fo
 - OpenAI Codex integrated as a separate `openai-codex` provider
 - Codex OAuth callback flow plus optional Codex CLI `auth.json` import
 - Local-first agent gateway with webchat as the first channel
-- Multiple agents with scoped sessions, workspaces, memory files, and task history
-- Workspace runtime with per-session sandboxes, file tree, run logs, and browser research/computer-use tools
-- Core tool registry, skill/plugin loader, and detached background task ledger
+- Multiple agents with scoped sessions, opencode workspaces, run logs, and task history
+- Cockpit UI for workflow scheduling, opencode execution traces, changed-file summaries, and extension-status metadata
+- No hidden AetherOps tool/plugin/memory/browser runtime; configure execution capabilities in opencode
+- Detached background task ledger
+- User-defined automation rules that periodically materialize opencode-backed scheduled tasks
 - Long-running task flows with ordered steps, dependencies, start/resume/retry/skip/cancel controls, and step-linked task/run traces
 - Embedded `opencode-ai` Workspace Engine integration for local-first execution; chat, tasks, flows, heartbeat, and sub-agents all use the same opencode engine path
 
@@ -32,37 +34,37 @@ If PowerShell execution policy blocks `npm` or `pnpm` shim scripts, use the `.cm
 ### Install
 
 ```powershell
-& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' install
+& 'C:\Program Files\nodejs\npm.cmd' install
 ```
 
-Alternative with npm:
+Optional pnpm alternative:
 
 ```powershell
-& 'C:\Program Files\nodejs\npm.cmd' install
+& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' install
 ```
 
 ### Start development
 
 ```powershell
-& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' dev
+& 'C:\Program Files\nodejs\npm.cmd' run dev
 ```
 
 ### Run tests
 
 ```powershell
-& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' test
+& 'C:\Program Files\nodejs\npm.cmd' test
 ```
 
 ### Build production assets
 
 ```powershell
-& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' build
+& 'C:\Program Files\nodejs\npm.cmd' run build
 ```
 
 ### Start the built server
 
 ```powershell
-& 'C:\Users\djkim\AppData\Roaming\npm\pnpm.cmd' start
+& 'C:\Program Files\nodejs\npm.cmd' start
 ```
 
 ## Local data
@@ -78,6 +80,8 @@ Alternative with npm:
 ## Long-Running Workflows
 
 Task flows are the local-first workflow primitive for research or implementation that should not be squeezed into one chat turn. A flow contains up to 8 ordered steps, each with a `stepKey`, title, prompt, and optional `dependencyStepKey`.
+
+For trusted local validation runs that need opencode to edit files without an interactive permission prompt, start the server with `AETHEROPS_OPENCODE_AUTO_APPROVE=true`. This adds opencode's `--dangerously-skip-permissions` flag, so keep it off for untrusted sessions or prompts.
 
 Native API controls:
 
@@ -101,11 +105,11 @@ Flow operation endpoints:
 - `POST /api/flows/:flowId/steps/:stepId/skip`
 - `POST /api/flows/:flowId/cancel`
 
-The workspace UI exposes the same controls in the task-flow panel, including an outline-to-steps editor and per-step task/run summaries.
+The cockpit workflow view exposes the same controls, including an outline-to-steps editor and per-step task/run summaries.
 
 ## Removed Internal Runtime Surfaces
 
-AetherOps is now opencode-only for execution. The old internal tool registry, local skill/plugin execution, direct workspace file CRUD UI, and custom Computer Use API are intentionally removed from the product path.
+AetherOps is now opencode-only for execution. The old internal tool execution path, local skill/plugin execution, direct workspace file CRUD UI, and custom Computer Use API are intentionally removed from the product path.
 
 These routes return `410 Gone` so old clients fail loudly instead of silently using the wrong runtime:
 
@@ -114,7 +118,7 @@ These routes return `410 Gone` so old clients fail loudly instead of silently us
 - `GET/POST /api/agents/:agentId/skills`
 - `GET/POST /api/agents/:agentId/memory`
 - `GET /api/agents/:agentId/memory/search`
-- `GET/POST /api/workspace/tree`
+- `GET /api/workspace/tree`
 - `GET/POST /api/workspace/file`
 - `POST /api/workspace/folder`
 - `/api/computer-use/*`
@@ -123,7 +127,7 @@ Equivalent filesystem, command, browser, MCP, and tool behavior should be config
 
 ## opencode Workspace Engine
 
-AetherOps treats itself as the control tower and delegates the actual workspace execution loop to the official `opencode` CLI. The app depends on `opencode-ai`, so a normal project install provides a managed local opencode launcher under `node_modules` without requiring a separate global install.
+AetherOps treats itself as the cockpit/scheduler/log store and delegates the actual workspace execution loop to the official `opencode` CLI. The app depends on `opencode-ai`, so a normal project install provides a managed local opencode launcher under `node_modules` without requiring a separate global install.
 
 - Foreground chat, detached tasks, heartbeat runs, sub-agent tasks, and task-flow steps all route through the shared `AgentEngine` abstraction.
 - The only runtime engine path is `opencode`; tests use an opencode-shaped deterministic command harness instead of the old provider/tool fallback.
@@ -145,7 +149,8 @@ Native engine endpoints:
 
 - `GET /api/engine/status`
 - `POST /api/engine/opencode/refresh-models`
-- `GET /api/engine/runs/:runId`
+- `POST /api/engine/opencode/auth/login`
+- `GET /api/engine/runs/:runId?conversationId=<id>`
 
 If opencode is not installed or not authenticated, the settings dialog shows the engine as unavailable and chat/task execution returns a structured run failure instead of silently falling back.
 
@@ -166,7 +171,21 @@ If opencode is not installed or not authenticated, the settings dialog shows the
 - `ENABLE_WORKSPACE_DEBUG_PATHS=true`
   Adds absolute workspace debug paths to workspace API responses. Safe default is off.
 - `ENABLE_AGENT_AUTOMATIONS=true`
-  Enables the conservative background automation heartbeat. Immediate detached tasks do not require this flag.
+  Enables the conservative background scheduler for Heartbeat and user-defined automation rules. Immediate detached tasks and manual rule triggers do not require this flag.
+
+## Automation rules
+
+Automation rules are agent-scoped periodic prompts that AetherOps stores in SQLite and converts into `taskKind: "scheduled"` tasks when due. They do not introduce a second execution runtime: every materialized task still runs through the same opencode engine path as chat, Heartbeat, workflows, and sub-agents.
+
+Native rule endpoints:
+
+- `GET /api/agents/:agentId/automation-rules`
+- `POST /api/agents/:agentId/automation-rules`
+- `PATCH /api/agents/:agentId/automation-rules/:ruleId`
+- `DELETE /api/agents/:agentId/automation-rules/:ruleId`
+- `POST /api/agents/:agentId/automation-rules/:ruleId/trigger`
+
+The Settings tab exposes rule creation, edit, enable/disable, delete, and "run now" actions. Historical task/run audit logs are preserved when a rule is deleted.
 
 ## Codex auth import
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTaskManager } from "./task-manager.js";
+import { EngineRunError } from "./agent-engine.js";
 import type { ProviderKind, ReasoningLevel, TaskRecord, TaskStatus } from "../types.js";
 
 function createTaskStore() {
@@ -45,6 +46,7 @@ function createTaskStore() {
         taskFlowId?: string | null;
         flowStepKey?: string | null;
         originRunId?: string | null;
+        automationRuleId?: string | null;
       }) {
         const timestamp = Date.now();
         const id = `task-${++sequence}`;
@@ -57,6 +59,7 @@ function createTaskStore() {
           taskFlowId: input.taskFlowId ?? null,
           flowStepKey: input.flowStepKey ?? null,
           originRunId: input.originRunId ?? null,
+          automationRuleId: input.automationRuleId ?? null,
           parentTaskId: input.parentTaskId ?? null,
           nestingDepth: input.nestingDepth ?? 0,
           title: input.title,
@@ -331,6 +334,159 @@ describe("createTaskManager", () => {
     }
   });
 
+  it("materializes due automation rules through the scheduled task path without duplicates", async () => {
+    const harness = createTaskStore();
+    const executeTask = vi.fn(async () => ({
+      runId: "run-automation",
+      assistantText: "automation result",
+    }));
+    const dueRule: import("../types.js").AutomationRuleRecord = {
+      id: "rule-1",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      title: "Rule",
+      prompt: "Do the scheduled thing.",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      enabled: true,
+      intervalMinutes: 60,
+      nextRunAt: Date.now() - 1,
+      lastRunAt: null,
+      lastTaskId: null,
+      runCount: 0,
+      createdAt: Date.now() - 100,
+      updatedAt: Date.now() - 100,
+    };
+    const automationStore = {
+      ...harness.store,
+      listDueAutomationRules: vi.fn((timestamp: number) =>
+        dueRule.enabled && dueRule.nextRunAt <= timestamp ? [dueRule] : [],
+      ),
+      enqueueAutomationRuleTask: vi.fn((ruleId: string, timestamp = Date.now()) => {
+        const active = [...harness.tasks.values()].find(
+          (task) =>
+            task.automationRuleId === ruleId &&
+            (task.status === "queued" || task.status === "running"),
+        );
+        if (active) {
+          return { rule: dueRule, task: active, enqueued: false };
+        }
+        const task = harness.store.createTask({
+          agentId: dueRule.agentId,
+          conversationId: dueRule.conversationId,
+          title: `[자동화] ${dueRule.title}`,
+          prompt: dueRule.prompt,
+          providerKind: dueRule.providerKind,
+          model: dueRule.model,
+          reasoningLevel: dueRule.reasoningLevel,
+          taskKind: "scheduled",
+          scheduledFor: timestamp,
+          automationRuleId: dueRule.id,
+        });
+        dueRule.lastRunAt = timestamp;
+        dueRule.lastTaskId = task.id;
+        dueRule.nextRunAt = timestamp + dueRule.intervalMinutes * 60_000;
+        dueRule.runCount += 1;
+        return { rule: dueRule, task, enqueued: true };
+      }),
+    };
+    const manager = createTaskManager({
+      store: automationStore,
+      executeTask,
+      schedulerEnabled: true,
+      pollIntervalMs: 25,
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(executeTask).toHaveBeenCalledTimes(1);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(automationStore.enqueueAutomationRuleTask).toHaveBeenCalled();
+      expect([...harness.tasks.values()].filter((task) => task.automationRuleId === dueRule.id)).toHaveLength(1);
+      expect(harness.store.getTask(dueRule.lastTaskId!)?.status).toBe("completed");
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("does not persist a fabricated assistant message when engine output is empty", async () => {
+    const harness = createTaskStore();
+    const executeTask = vi.fn(async () => ({
+      runId: "run-empty",
+      assistantText: "",
+      changedFiles: [],
+    }));
+    const manager = createTaskManager({
+      store: harness.store,
+      executeTask,
+      schedulerEnabled: false,
+      pollIntervalMs: 5,
+    });
+
+    try {
+      const task = await manager.enqueueDetachedTask({
+        agentId: "agent-1",
+        conversationId: "conversation-1",
+        prompt: "Run but produce no final text",
+        title: "Empty result",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+        startImmediately: true,
+      });
+
+      await vi.waitFor(() => {
+        expect(harness.store.getTask(task.id)?.status).toBe("completed");
+      });
+
+      expect(harness.messages).toHaveLength(0);
+      expect(harness.store.getTask(task.id)?.resultText).toBeNull();
+      expect(
+        harness.taskEvents.find((event) => event.taskId === task.id && event.eventType === "result_delivered")?.payload,
+      ).toMatchObject({
+        messageId: null,
+        assistantTextPresent: false,
+      });
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("uses structured engine timeout status instead of matching error text", async () => {
+    const harness = createTaskStore();
+    const executeTask = vi.fn(async () => {
+      throw new EngineRunError("opencode 실행 시간이 초과되었습니다.", "failed", "run-timeout", "timed_out");
+    });
+    const manager = createTaskManager({
+      store: harness.store,
+      executeTask,
+      schedulerEnabled: false,
+      pollIntervalMs: 5,
+    });
+
+    try {
+      const task = await manager.enqueueDetachedTask({
+        agentId: "agent-1",
+        conversationId: "conversation-1",
+        prompt: "Run until timeout",
+        title: "Timeout result",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+        startImmediately: true,
+      });
+
+      await vi.waitFor(() => {
+        expect(harness.store.getTask(task.id)?.status).toBe("timed_out");
+      });
+      expect(harness.store.getTask(task.id)?.resultText).toContain("opencode 실행 시간이 초과되었습니다.");
+    } finally {
+      manager.dispose();
+    }
+  });
+
   it("coordinates flow steps in order", async () => {
     const harness = createTaskStore();
     const conversation = harness.store.saveConversation({
@@ -427,6 +583,100 @@ describe("createTaskManager", () => {
             status: "completed",
           }),
         ]),
+      );
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it("recovers stale running flow steps on scheduler tick after a manager restart", async () => {
+    const harness = createTaskStore();
+    const conversation = harness.store.saveConversation({
+      agentId: "agent-1",
+      title: "restart flow session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    const executeTask = vi.fn(async ({ task }: { task: TaskRecord }) => ({
+      runId: `run-${task.id}`,
+      assistantText: `recovered ${task.flowStepKey ?? task.id}`,
+    }));
+    const flow = harness.store.createTaskFlow({
+      agentId: "agent-1",
+      conversationId: conversation.id,
+      title: "Recover after restart",
+    });
+    const step = harness.store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "recover",
+      title: "Recover stale step",
+      prompt: "Continue this long-running step after a restart.",
+    });
+    const staleTask = harness.store.createTask({
+      agentId: "agent-1",
+      conversationId: conversation.id,
+      title: step.title,
+      prompt: step.prompt,
+      providerKind: conversation.providerKind,
+      model: conversation.model,
+      reasoningLevel: conversation.reasoningLevel,
+      taskKind: "flow_step",
+      taskFlowId: flow.id,
+      flowStepKey: step.stepKey,
+    });
+    harness.store.transitionTask({
+      taskId: staleTask.id,
+      status: "running",
+      eventType: "running",
+      payload: { message: "Simulated task from a previous process." },
+    });
+    harness.store.transitionTaskFlowStep({
+      stepId: step.id,
+      taskId: staleTask.id,
+      status: "running",
+    });
+    harness.store.transitionTaskFlow({
+      flowId: flow.id,
+      status: "running",
+      clearCompletedAt: true,
+    });
+
+    const manager = createTaskManager({
+      store: harness.store,
+      executeTask,
+      schedulerEnabled: true,
+      pollIntervalMs: 5,
+    });
+
+    try {
+      await manager.tick();
+
+      await vi.waitFor(() => {
+        expect(harness.store.getTask(staleTask.id)?.status).toBe("cancelled");
+      });
+      await vi.waitFor(() => {
+        expect(executeTask).toHaveBeenCalledTimes(1);
+      });
+      await vi.waitFor(() => {
+        expect(harness.flows.get(flow.id)?.status).toBe("completed");
+      });
+
+      const replacementTask = [...harness.tasks.values()].find(
+        (task) => task.id !== staleTask.id && task.flowStepKey === step.stepKey,
+      );
+      expect(replacementTask).toEqual(
+        expect.objectContaining({
+          status: "completed",
+          taskFlowId: flow.id,
+          flowStepKey: step.stepKey,
+        }),
+      );
+      expect(harness.store.getTaskFlowStep(step.id)).toEqual(
+        expect.objectContaining({
+          taskId: replacementTask?.id,
+          status: "completed",
+        }),
       );
     } finally {
       manager.dispose();

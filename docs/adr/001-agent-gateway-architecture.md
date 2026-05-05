@@ -11,11 +11,15 @@ Accepted
 - multiple agents
 - session-scoped chat
 - workspace-backed execution
-- file-backed memory
 - detached tasks
-- plugins and skills
+- task flows
+- opencode session sandboxes
+- visible run/event logging
+- standing orders and workflow prompts for durable operator context
 
 The architecture needed to evolve without discarding the working web app or existing local data.
+
+Post-migration note: AetherOps is now opencode-only for workspace execution. Removed legacy AetherOps execution subsystems are not product paths; configure equivalent capabilities in opencode.
 
 ## Decision
 
@@ -43,22 +47,23 @@ This avoids destructive migration while enabling agent-first behavior.
 
 The gateway composes:
 
-- tool registry
-- plugin manager
-- memory manager
+- opencode `AgentEngine`
 - task manager
 - foreground runtime
+- run/event persistence
 
-This keeps provider adapters focused on model interaction and keeps local tool execution under server control.
+This keeps provider adapters focused on account/model metadata while delegating filesystem, command, browser, MCP, and external-tool behavior to opencode configuration.
 
-### 4. Use file-backed memory
+### 4. Keep persistent context visible
 
-Memory stays visible and debuggable through files inside the agent workspace.
+Persistent working context stays visible and debuggable through:
 
-- durable memory in `MEMORY.md`
-- daily notes in `memory/YYYY-MM-DD.md`
+- session transcripts
+- agent control files under `workspace/opencode/agents/<agentId>/`
+- task-flow prompts
+- artifacts written by opencode inside the active session sandbox
 
-No hidden prompt-only memory should become the source of truth.
+No hidden AetherOps memory runtime should become the source of truth.
 
 ### 5. Support detached tasks as a first-class concept
 
@@ -75,7 +80,7 @@ Positive:
 
 - preserves the working app while enabling a stronger platform model
 - keeps local debugging straightforward
-- allows tools, memory, and tasks to stay inspectable
+- keeps opencode run events, changed files, and task history inspectable
 - reduces coupling between provider auth and runtime behavior
 
 Tradeoffs:
@@ -86,7 +91,7 @@ Tradeoffs:
 
 ## Follow-Up Work
 
-- improve structured tool calling per provider
+- improve opencode run metadata and changed-file presentation
 - continue breaking large frontend state concerns into narrower hooks
-- expand plugin and skill ergonomics
+- improve standing-order and task-flow prompt ergonomics
 - deepen task automation only after current runtime guarantees stay stable

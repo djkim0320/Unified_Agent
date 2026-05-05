@@ -1,21 +1,13 @@
 import { z } from "zod";
-import { parseAgentStep } from "../lib/agent-step.js";
 import {
   resolveCodexExpiry,
   resolveCodexWorkspaceId,
   writeCodexCliAuth,
 } from "../lib/codex-auth.js";
-import { runCodexExec } from "../lib/codex-cli.js";
 import { createPkcePair, randomState } from "../lib/oauth.js";
 import { ensureOk, readJson } from "../lib/streaming.js";
 import { providerModelCatalog } from "../model-catalog.js";
-import { normalizeReasoningLevel } from "../reasoning-options.js";
-import type {
-  ChatMessage,
-  ProviderSecret,
-  ProviderTestResult,
-  ReasoningLevel,
-} from "../types.js";
+import type { ProviderSecret } from "../types.js";
 import type { ProviderAdapter } from "./base.js";
 
 export const CODEX_MODELS = providerModelCatalog["openai-codex"].map((entry) => entry.id);
@@ -26,8 +18,6 @@ const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_SCOPE =
   "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const CODEX_ORIGINATOR = "codex_cli_rs";
-const DEFAULT_CODEX_INSTRUCTIONS =
-  "You are OpenAI Codex inside AetherOps. Answer helpfully and concisely. The local server executes workspace tools for you, so do not try to run your own shell commands.";
 
 const CodexTokenSchema = z.object({
   access_token: z.string(),
@@ -35,28 +25,6 @@ const CodexTokenSchema = z.object({
   refresh_token: z.string().optional(),
   expires_in: z.number().optional(),
 });
-
-function buildCodexPrompt(messages: ChatMessage[]) {
-  const transcript = messages
-    .map((message) => {
-      const speaker = message.role === "user" ? "User" : "Assistant";
-      return `${speaker}: ${message.content}`;
-    })
-    .join("\n\n");
-
-  return `${DEFAULT_CODEX_INSTRUCTIONS}\n\nConversation transcript:\n${transcript}\n\nReply as the assistant to the final user message.`;
-}
-
-function buildCodexPromptWithInstructions(instructions: string, messages: ChatMessage[]) {
-  const transcript = messages
-    .map((message) => {
-      const speaker = message.role === "user" ? "User" : "Assistant";
-      return `${speaker}: ${message.content}`;
-    })
-    .join("\n\n");
-
-  return `${instructions}\n\nConversation transcript:\n${transcript}`;
-}
 
 function assertConfigured(secret: ProviderSecret<"openai-codex"> | null) {
   if (!secret?.accessToken || !secret.refreshToken) {
@@ -221,27 +189,6 @@ export async function refreshCodexSecret(
   return refreshedSecret;
 }
 
-async function generateCodexText(params: {
-  model: string;
-  reasoningLevel: ReasoningLevel;
-  instructions: string;
-  messages: ChatMessage[];
-  signal?: AbortSignal;
-}) {
-  const result = await runCodexExec({
-    cwd: process.cwd(),
-    model: params.model,
-    reasoningEffort: normalizeReasoningLevel(
-      "openai-codex",
-      params.model,
-      params.reasoningLevel,
-    ),
-    prompt: buildCodexPromptWithInstructions(params.instructions, params.messages),
-    signal: params.signal,
-  });
-  return result.finalAgentMessage.trim();
-}
-
 export const openAICodexAdapter: ProviderAdapter<"openai-codex"> = {
   kind: "openai-codex",
   label: "OpenAI Codex",
@@ -251,57 +198,18 @@ export const openAICodexAdapter: ProviderAdapter<"openai-codex"> = {
     return [...CODEX_MODELS];
   },
 
-  async testConnection(secret): Promise<ProviderTestResult> {
+  async testConnection(secret) {
     try {
       assertConfigured(secret);
-      const result = await runCodexExec({
-        cwd: process.cwd(),
-        model: "gpt-5.4-mini",
-        prompt: buildCodexPrompt([
-          {
-            role: "user",
-            content: "Reply with exactly pong. No markdown, no extra words.",
-          },
-        ]),
-      });
-      if (result.finalAgentMessage.trim().toLowerCase() !== "pong") {
-        throw new Error(`Unexpected Codex test reply: ${result.finalAgentMessage.trim()}`);
-      }
       return {
         ok: true,
-        message: "Connected successfully. Official Codex CLI auth is working.",
+        message: "Codex OAuth credentials are stored. opencode will use the synced auth/config path for execution.",
       };
     } catch (error) {
       return {
         ok: false,
         message: error instanceof Error ? error.message : "Codex connection test failed.",
       };
-    }
-  },
-
-  async planToolStep({ secret, model, reasoningLevel, instructions, messages, signal }) {
-    assertConfigured(secret);
-    const text = await generateCodexText({
-      model,
-      reasoningLevel,
-      instructions,
-      messages,
-      signal,
-    });
-    return parseAgentStep(text);
-  },
-
-  async streamFinalAnswer({ secret, model, reasoningLevel, instructions, messages, onText, signal }) {
-    assertConfigured(secret);
-    const text = await generateCodexText({
-      model,
-      reasoningLevel,
-      instructions,
-      messages,
-      signal,
-    });
-    if (text) {
-      onText(text);
     }
   },
 };

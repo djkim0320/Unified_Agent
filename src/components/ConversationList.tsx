@@ -3,14 +3,7 @@ import { displayConversationTitle } from "../appStateUtils";
 import { type AgentRecord, type ConversationRecord, providerLabels } from "../types";
 import { CustomSelect } from "./ui/CustomSelect";
 
-export type CockpitNavTarget =
-  | "chat"
-  | "workflow"
-  | "computer"
-  | "mcp"
-  | "skills"
-  | "files"
-  | "settings";
+export type CockpitNavTarget = "chat" | "workflow" | "settings";
 
 interface ConversationListProps {
   activeAgentId: string | null;
@@ -53,7 +46,7 @@ export function ConversationList(props: ConversationListProps) {
         ))}
         <button
           aria-current={props.activeNavTarget === "settings" ? "page" : undefined}
-          aria-label="설정"
+          aria-label="설정 탭"
           className={`cockpit-nav__item cockpit-nav__item--bottom ${
             props.activeNavTarget === "settings" ? "is-active" : ""
           }`}
@@ -78,7 +71,7 @@ export function ConversationList(props: ConversationListProps) {
             <div>
               <div className="conversation-list__section-label">에이전트</div>
               <p className="conversation-list__agent-caption">
-                {activeAgent ? `현재 작업 대상: ${activeAgent.name}` : "작업할 에이전트를 선택해 주세요."}
+                {activeAgent ? `현재 작업 대상: ${activeAgent.name}` : "작업할 에이전트를 선택하세요."}
               </p>
             </div>
             <button className="conversation-list__action-button" onClick={props.onOpenAgentSettings} type="button">

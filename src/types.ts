@@ -10,11 +10,9 @@ export type ProviderKind = (typeof providerKinds)[number];
 
 export type ChatRole = "user" | "assistant";
 export type ReasoningLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
-export type WorkspaceScope = "sandbox" | "shared" | "root";
 export type ChannelKind = "webchat";
 export type WorkspaceRunStatus = "running" | "completed" | "failed" | "cancelled";
 export type TaskKind = "detached" | "heartbeat" | "continuation" | "scheduled" | "subagent" | "flow_step";
-export type ComputerUseMode = "none" | "openai-computer-tool" | "custom-browser-harness";
 export type AgentEngineKind = "opencode";
 export type EngineRunStatus =
   | "queued"
@@ -23,27 +21,6 @@ export type EngineRunStatus =
   | "failed"
   | "cancelled"
   | "timed_out";
-export type ComputerUseActionType =
-  | "create_session"
-  | "navigate"
-  | "screenshot"
-  | "click"
-  | "double_click"
-  | "type"
-  | "keypress"
-  | "scroll"
-  | "wait"
-  | "extract_text"
-  | "close_session";
-export type ComputerUseEventStatus =
-  | "allowed"
-  | "requires_approval"
-  | "blocked"
-  | "approved"
-  | "denied"
-  | "started"
-  | "completed"
-  | "failed";
 export type ToolPermission =
   | "workspace"
   | "memory"
@@ -113,9 +90,6 @@ export interface ProviderModelCapabilities {
   reasoningLevel: boolean;
   vision: boolean;
   maxContextTokens: number | null;
-  supportsComputerUse: boolean;
-  supportsBrowserUse: boolean;
-  computerUseMode: ComputerUseMode;
 }
 
 export interface ProviderDraft {
@@ -142,17 +116,6 @@ export interface ToolDescriptor {
 export interface StandingOrdersRecord {
   path: string;
   content: string;
-}
-
-export interface MemorySearchResult {
-  path?: string;
-  content?: string;
-  excerpt?: string;
-  score?: number;
-  title?: string;
-  line?: number;
-  agentId?: string;
-  updatedAt?: number;
 }
 
 export interface TaskFlowRecord {
@@ -252,79 +215,6 @@ export interface PlatformMetadata {
   agentSkills?: AgentSkillSummary[];
 }
 
-export interface ComputerUseSettingsRecord {
-  enabled: boolean;
-  customBrowserHarnessEnabled: boolean;
-  allowExternalDomains: string[];
-  allowFileUrls: boolean;
-  maxActionsPerSession: number;
-  sessionTimeoutMs: number;
-  updatedAt: number;
-}
-
-export interface ComputerUseSessionRecord {
-  id: string;
-  agentId: string | null;
-  conversationId: string | null;
-  runId: string | null;
-  taskId: string | null;
-  status: "open" | "closed";
-  currentUrl: string | null;
-  allowedDomains: string[];
-  actionCount: number;
-  latestScreenshotPath: string | null;
-  createdAt: number;
-  updatedAt: number;
-  closedAt: number | null;
-}
-
-export interface ComputerUseActionEventRecord {
-  id: string;
-  sessionId: string;
-  actionType: ComputerUseActionType;
-  status: ComputerUseEventStatus;
-  currentUrl: string | null;
-  targetUrl: string | null;
-  summary: string;
-  metadata: Record<string, unknown>;
-  screenshotPath: string | null;
-  createdAt: number;
-}
-
-export interface ComputerUseApprovalRecord {
-  id: string;
-  sessionId: string;
-  actionEventId: string | null;
-  decision: "approved" | "denied";
-  reason: string | null;
-  createdAt: number;
-}
-
-export interface ComputerUseSessionDetail {
-  session: ComputerUseSessionRecord;
-  events: ComputerUseActionEventRecord[];
-  approvals: ComputerUseApprovalRecord[];
-  latestScreenshotBase64?: string | null;
-  latestScreenshotMimeType?: string | null;
-}
-
-export interface WorkspaceTreeNode {
-  name: string;
-  path: string;
-  kind: "file" | "directory";
-  size: number | null;
-  children?: WorkspaceTreeNode[];
-}
-
-export interface WorkspaceFileRecord {
-  scope: WorkspaceScope;
-  path: string;
-  content: string;
-  binary: boolean;
-  unsupportedEncoding: boolean;
-  encoding: string | null;
-}
-
 export interface WorkspaceRunRecord {
   id: string;
   conversationId: string;
@@ -388,6 +278,7 @@ export interface EngineStatusRecord {
     autoUpdateDisabled: boolean;
     pruneDisabled: boolean;
     defaultPluginsDisabled: boolean;
+    autoApprovePermissions: boolean;
   };
   credentialSync?: {
     mode: "runtime-env";
@@ -420,6 +311,7 @@ export interface TaskRecord {
   taskFlowId: string | null;
   flowStepKey: string | null;
   originRunId: string | null;
+  automationRuleId: string | null;
   taskKind: TaskKind;
   parentTaskId: string | null;
   nestingDepth: number;
@@ -483,20 +375,27 @@ export interface HeartbeatLogRecord {
   updatedAt: number;
 }
 
-export interface AgentMemorySnapshot {
+export interface AutomationRuleRecord {
+  id: string;
   agentId: string;
-  durableMemoryPath: string;
-  durableMemory: string;
-  dailyMemoryPath: string;
-  dailyMemory: string;
+  conversationId: string;
+  title: string;
+  prompt: string;
+  providerKind: ProviderKind;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  enabled: boolean;
+  intervalMinutes: number;
+  nextRunAt: number;
+  lastRunAt: number | null;
+  lastTaskId: string | null;
+  runCount: number;
+  createdAt: number;
+  updatedAt: number;
 }
-
-export type AgentMemoryRecord = AgentMemorySnapshot;
 
 export interface StreamEventPayloadMap {
   status: { message: string; tool?: string };
-  tool_call: { tool: string; arguments: Record<string, unknown> };
-  tool_result: { tool: string; result: Record<string, unknown> };
   run_complete: { runId: string; changedFiles: string[]; engineRun?: EngineRunRecord };
   delta: { delta: string };
   done: { messageId: string | null; runId?: string; changedFiles?: string[] };

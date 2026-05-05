@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { createStore } from "../db.js";
 import type { createWorkspaceManager } from "../lib/workspace.js";
 import type { ProviderKind, ReasoningLevel } from "../types.js";
+import { sendLegacyGone } from "./legacy-gone.js";
 
 type WorkspaceRouteStore = ReturnType<typeof createStore>;
 type WorkspaceRouteManager = ReturnType<typeof createWorkspaceManager>;
@@ -36,12 +37,21 @@ function requireConversation(
   return conversation;
 }
 
-function workspaceGone(response: express.Response) {
-  response.status(410).json({
-    error:
-      "Workspace file CRUD was removed from AetherOps opencode-only mode. Use opencode execution inside the session workspace instead.",
-    engineKind: "opencode",
-  });
+function requireScopedWorkspaceRun(
+  response: express.Response,
+  store: WorkspaceRouteStore,
+  conversationId: string,
+  runId: string,
+) {
+  if (!requireConversation(response, store, conversationId)) {
+    return null;
+  }
+  const run = store.getWorkspaceRunForConversation(conversationId, runId);
+  if (!run) {
+    response.status(404).json({ error: "Workspace run not found" });
+    return null;
+  }
+  return run;
 }
 
 export function registerWorkspaceRoutes(
@@ -56,19 +66,19 @@ export function registerWorkspaceRoutes(
   const { store, taskManager } = params;
 
   app.get("/api/workspace/tree", (_request, response) => {
-    workspaceGone(response);
+    sendLegacyGone(response, "Workspace file CRUD");
   });
 
   app.get("/api/workspace/file", (_request, response) => {
-    workspaceGone(response);
+    sendLegacyGone(response, "Workspace file CRUD");
   });
 
   app.post("/api/workspace/file", (_request, response) => {
-    workspaceGone(response);
+    sendLegacyGone(response, "Workspace file CRUD");
   });
 
   app.post("/api/workspace/folder", (_request, response) => {
-    workspaceGone(response);
+    sendLegacyGone(response, "Workspace file CRUD");
   });
 
   app.get("/api/workspace/runs", (request, response) => {
@@ -96,23 +106,18 @@ export function registerWorkspaceRoutes(
   });
 
   app.get("/api/runs/:runId", (request, response) => {
-    const conversationId =
-      typeof request.query.conversationId === "string" ? request.query.conversationId : null;
-    const run =
-      conversationId
-        ? store.getWorkspaceRunForConversation(conversationId, request.params.runId)
-        : store.getWorkspaceRun(request.params.runId);
+    const conversationId = z.string().uuid().parse(request.query.conversationId);
+    const run = requireScopedWorkspaceRun(response, store, conversationId, request.params.runId);
     if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
       return;
     }
     response.json({ run });
   });
 
   app.post("/api/runs/:runId/cancel", (request, response) => {
-    const run = store.getWorkspaceRun(request.params.runId);
+    const conversationId = z.string().uuid().parse(request.query.conversationId);
+    const run = requireScopedWorkspaceRun(response, store, conversationId, request.params.runId);
     if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
       return;
     }
     if (!run.taskId) {
@@ -132,9 +137,9 @@ export function registerWorkspaceRoutes(
   });
 
   app.post("/api/runs/:runId/resume", (request, response) => {
-    const run = store.getWorkspaceRun(request.params.runId);
+    const conversationId = z.string().uuid().parse(request.query.conversationId);
+    const run = requireScopedWorkspaceRun(response, store, conversationId, request.params.runId);
     if (!run) {
-      response.status(404).json({ error: "Workspace run not found" });
       return;
     }
     if (run.status === "running") {

@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import { CustomSelect } from "./ui/CustomSelect";
 import { getModelOption } from "../model-catalog";
 import {
@@ -69,10 +68,10 @@ function isProviderEnabled(provider: ProviderSummary | null | undefined) {
 
 function getProviderStatusLabel(provider: ProviderSummary | null | undefined) {
   if (!provider) {
-    return "not configured";
+    return "설정 없음";
   }
 
-  return isProviderEnabled(provider) ? "available" : "needs setup";
+  return isProviderEnabled(provider) ? "사용 가능" : "설정 필요";
 }
 
 function getAgentSummary(agent: AgentRecord) {
@@ -85,7 +84,7 @@ function getAgentSummary(agent: AgentRecord) {
 
 function formatMaybeDateString(value: string | null) {
   if (!value) {
-    return "none";
+    return "기록 없음";
   }
 
   const parsed = Date.parse(value);
@@ -126,16 +125,6 @@ export function AgentSettingsDialog({
   standingOrders,
   standingOrdersDraft,
 }: AgentSettingsDialogProps) {
-  const [activeTab, setActiveTab] = useState<"general" | "soul" | "heartbeat" | "standing-orders">(
-    "general",
-  );
-
-  useEffect(() => {
-    if (!open) {
-      setActiveTab("general");
-    }
-  }, [open]);
-
   if (!open) {
     return null;
   }
@@ -150,20 +139,20 @@ export function AgentSettingsDialog({
   return (
     <div className="provider-dialog-backdrop" role="presentation" onClick={onClose}>
       <div
-        aria-label="agent settings"
+        aria-label="에이전트 설정"
         className="modal-card modal-card--settings"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
       >
         <div className="modal-card__header modal-card__header--spacious">
           <div>
-            <h2>Agent settings</h2>
+            <h2>에이전트 설정</h2>
             <p className="modal-card__lede">
-              {activeAgent?.name ?? "No agent selected"} / {getProviderStatusLabel(provider)}
+              {activeAgent?.name ?? "선택된 에이전트 없음"} / {getProviderStatusLabel(provider)}
             </p>
           </div>
           <button className="icon-button" onClick={onClose} type="button">
-            Close
+            닫기
           </button>
         </div>
 
@@ -173,15 +162,15 @@ export function AgentSettingsDialog({
           <section className="settings-card">
             <div className="settings-card__title-row">
               <div>
-                <h3 style={{ margin: 0 }}>Current agent</h3>
+                <h3 style={{ margin: 0 }}>현재 에이전트</h3>
                 <p style={{ margin: "0.35rem 0 0", color: "var(--muted)" }}>
-                  {activeAgent ? getAgentSummary(activeAgent) : "No agent selected yet."}
+                  {activeAgent ? getAgentSummary(activeAgent) : "아직 선택된 에이전트가 없습니다."}
                 </p>
               </div>
 
               <div className="agent-settings__toolbar">
                 <button className="ghost-button" onClick={onCreate} type="button">
-                  New agent
+                  새 에이전트
                 </button>
                 <button
                   className="ghost-button agent-settings__delete-button"
@@ -193,53 +182,26 @@ export function AgentSettingsDialog({
                   }}
                   type="button"
                 >
-                  {deletingAgentId === activeAgent?.id ? "Deleting..." : "Delete agent"}
+                  {deletingAgentId === activeAgent?.id ? "삭제 중..." : "에이전트 삭제"}
                 </button>
               </div>
             </div>
 
             {activeAgent?.id === DEFAULT_AGENT_ID ? (
               <p className="agent-settings__helper">
-                The default agent cannot be deleted. Create and clean up a different agent instead.
+                기본 에이전트는 삭제할 수 없습니다. 별도 에이전트를 만든 뒤 정리해 주세요.
               </p>
             ) : null}
 
-            <div className="chat-panel__tabs" aria-label="settings tabs">
-              <button
-                className={`chat-panel__tab ${activeTab === "general" ? "is-active" : ""}`}
-                onClick={() => setActiveTab("general")}
-                type="button"
-              >
-                General
-              </button>
-              <button
-                className={`chat-panel__tab ${activeTab === "soul" ? "is-active" : ""}`}
-                onClick={() => setActiveTab("soul")}
-                type="button"
-              >
-                SOUL
-              </button>
-              <button
-                className={`chat-panel__tab ${activeTab === "heartbeat" ? "is-active" : ""}`}
-                onClick={() => setActiveTab("heartbeat")}
-                type="button"
-              >
-                Heartbeat
-              </button>
-              <button
-                className={`chat-panel__tab ${activeTab === "standing-orders" ? "is-active" : ""}`}
-                onClick={() => setActiveTab("standing-orders")}
-                type="button"
-              >
-                Standing Orders
-              </button>
-            </div>
-
-            {activeTab === "general" ? (
-              <div className="tab-pane">
+            <div className="agent-settings__section-stack">
+              <div className="tab-pane agent-settings__section">
+                <div className="settings-card__header">
+                  <h3>일반 설정</h3>
+                  <p>에이전트 이름, 기본 공급자, 모델과 추론 강도를 관리합니다.</p>
+                </div>
                 <div className="settings-card__fields">
                   <label className="field">
-                    <span>Agent name</span>
+                    <span>에이전트 이름</span>
                     <input
                       autoComplete="off"
                       className="field__input"
@@ -249,9 +211,9 @@ export function AgentSettingsDialog({
                   </label>
 
                   <label className="field">
-                    <span>Default provider</span>
+                    <span>기본 공급자</span>
                     <CustomSelect
-                      ariaLabel="Default provider"
+                      ariaLabel="기본 공급자"
                       className="field__input"
                       onChange={(value) => {
                         const providerKind = value as ProviderKind;
@@ -284,7 +246,7 @@ export function AgentSettingsDialog({
                   </label>
 
                   <label className="field">
-                    <span>Default model</span>
+                    <span>기본 모델</span>
                     <CustomSelect
                       className="field__input"
                       onChange={(value) => {
@@ -308,7 +270,7 @@ export function AgentSettingsDialog({
                   </label>
 
                   <label className="field">
-                    <span>Reasoning level</span>
+                    <span>추론 강도</span>
                     <CustomSelect
                       className="field__input"
                       onChange={(value) =>
@@ -326,23 +288,21 @@ export function AgentSettingsDialog({
                   </label>
                 </div>
               </div>
-            ) : null}
 
-            {activeTab === "soul" ? (
-              <div className="tab-pane">
+              <div className="tab-pane agent-settings__section">
                 <div className="settings-card__header">
                   <h3>SOUL.md</h3>
-                  <p>Agent identity, tone, and long-lived operating instructions.</p>
+                  <p>에이전트의 정체성, 말투, 장기 운영 지침을 기록합니다.</p>
                 </div>
 
                 <div className="settings-card__fields">
                   <label className="field">
-                    <span>SOUL.md content</span>
+                    <span>SOUL.md 내용</span>
                     <textarea
                       aria-label="SOUL content"
                       className="field__input"
                       onChange={(event) => onSoulDraftChange(event.target.value)}
-                      placeholder={"# SOUL\n\nKeep the agent thoughtful, explicit, and helpful."}
+                      placeholder={"# SOUL\n\n에이전트의 성격, 역할, 장기 운영 원칙을 적어 주세요."}
                       rows={14}
                       style={{
                         minHeight: "20rem",
@@ -354,21 +314,19 @@ export function AgentSettingsDialog({
                       value={soulDraft}
                     />
                   </label>
-                  <small className="text-muted">Current path: {soul?.path ?? "SOUL.md"}</small>
+                  <small className="text-muted">현재 파일: {soul?.path ?? "SOUL.md"}</small>
                 </div>
               </div>
-            ) : null}
 
-            {activeTab === "heartbeat" ? (
-              <div className="tab-pane">
+              <div className="tab-pane agent-settings__section">
                 <div className="settings-card__header">
-                  <h3>Heartbeat automation</h3>
-                  <p>Background instructions the agent can use for recurring checks.</p>
+                  <h3>Heartbeat 자동화</h3>
+                  <p>반복 점검에 사용할 백그라운드 지침입니다.</p>
                 </div>
 
                 <div className="settings-card__fields">
                   <div className="field field--inline">
-                    <span>Heartbeat enabled</span>
+                    <span>Heartbeat 활성화</span>
                     <button
                       aria-checked={heartbeatDraft.enabled}
                       className={`settings-toggle${heartbeatDraft.enabled ? " is-on" : ""}`}
@@ -384,7 +342,7 @@ export function AgentSettingsDialog({
                   </div>
 
                   <label className="field">
-                    <span>Interval minutes</span>
+                    <span>반복 주기(분)</span>
                     <input
                       aria-label="Interval minutes"
                       className="field__input"
@@ -402,7 +360,7 @@ export function AgentSettingsDialog({
                   </label>
 
                   <label className="field">
-                    <span>Heartbeat instructions</span>
+                    <span>Heartbeat 지침</span>
                     <textarea
                       aria-label="Heartbeat instructions"
                       className="field__input"
@@ -412,7 +370,7 @@ export function AgentSettingsDialog({
                           instructions: event.target.value,
                         })
                       }
-                      placeholder="Check the active work, summarize progress, and identify next steps."
+                      placeholder="활성 작업을 점검하고, 진행 상황과 다음 단계를 요약해 주세요."
                       rows={6}
                       style={{ minHeight: "8rem", resize: "vertical" }}
                       value={heartbeatDraft.instructions}
@@ -420,41 +378,39 @@ export function AgentSettingsDialog({
                   </label>
 
                   <div className="agent-settings__heartbeat-meta">
-                    <span>Last run: {formatMaybeDateString(heartbeat?.lastRun ?? null)}</span>
+                    <span>마지막 실행: {formatMaybeDateString(heartbeat?.lastRun ?? null)}</span>
                     {heartbeat?.parseError ? (
                       <span className="agent-settings__heartbeat-error">
-                        Parse error: {heartbeat.parseError}
+                        파싱 오류: {heartbeat.parseError}
                       </span>
                     ) : null}
                   </div>
                 </div>
               </div>
-            ) : null}
 
-            {activeTab === "standing-orders" ? (
-              <div className="tab-pane">
+              <div className="tab-pane agent-settings__section">
                 <div className="settings-card__header">
-                  <h3>Standing Orders</h3>
-                  <p>Persistent instructions loaded from the agent-scoped standing orders file.</p>
+                  <h3>상시 지침</h3>
+                  <p>에이전트 범위의 STANDING_ORDERS.md에서 불러오는 지속 지침입니다.</p>
                 </div>
 
                 <div className="settings-card__fields">
                   <label className="field">
-                    <span>Standing orders file</span>
+                    <span>상시 지침 파일</span>
                     <input
                       className="field__input"
                       readOnly
-                      value={standingOrders?.path ?? "standing-orders.md"}
+                      value={standingOrders?.path ?? "STANDING_ORDERS.md"}
                     />
                   </label>
 
                   <label className="field">
-                    <span>Standing orders content</span>
+                    <span>상시 지침 내용</span>
                     <textarea
                       aria-label="Standing orders content"
                       className="field__input"
                       onChange={(event) => onStandingOrdersDraftChange(event.target.value)}
-                      placeholder="# Standing Orders\n\nKeep the agent focused, explicit, and safe."
+                      placeholder="# Standing Orders\n\n에이전트가 유지해야 할 운영 지침을 적어 주세요."
                       rows={14}
                       style={{
                         minHeight: "20rem",
@@ -466,28 +422,29 @@ export function AgentSettingsDialog({
                       value={standingOrdersDraft}
                     />
                   </label>
+
+                  <div className="settings-card__actions agent-settings__actions">
+                    <button
+                      className="ghost-button"
+                      disabled={savingStandingOrders}
+                      onClick={onSaveStandingOrders}
+                      type="button"
+                    >
+                      {savingStandingOrders ? "저장 중..." : "상시 지침 저장"}
+                    </button>
+                  </div>
                 </div>
               </div>
-            ) : null}
+            </div>
 
             <div className="settings-card__actions agent-settings__actions">
               <button
                 className="primary-button"
-                disabled={
-                  activeTab === "standing-orders"
-                    ? savingStandingOrders
-                    : saving || !draft.name.trim()
-                }
-                onClick={activeTab === "standing-orders" ? onSaveStandingOrders : onSave}
+                disabled={saving || !draft.name.trim()}
+                onClick={onSave}
                 type="button"
               >
-                {activeTab === "standing-orders"
-                  ? savingStandingOrders
-                    ? "Saving..."
-                    : "Save standing orders"
-                  : saving
-                    ? "Saving..."
-                    : "Save settings"}
+                {saving ? "저장 중..." : "에이전트 설정 저장"}
               </button>
             </div>
           </section>

@@ -54,18 +54,6 @@ export type TaskFlowStepStatus =
   | "cancelled"
   | "skipped";
 export type TaskFlowTriggerSource = "manual" | "schedule" | "event_hook";
-export type ToolPermission =
-  | "workspace"
-  | "memory"
-  | "network"
-  | "browser"
-  | "exec"
-  | "tasks";
-export type ToolPermissionClass = "read" | "write" | "network" | "exec" | "memory" | "browser";
-export type ToolRiskLevel = "low" | "medium" | "high";
-export type ToolCostHint = "cheap" | "moderate" | "expensive";
-export type ToolConcurrencyClass = "serial" | "parallel-safe" | "exclusive";
-export type ComputerUseMode = "none" | "openai-computer-tool" | "custom-browser-harness";
 export type AgentEngineKind = "opencode";
 export type EngineRunStatus =
   | "queued"
@@ -74,87 +62,6 @@ export type EngineRunStatus =
   | "failed"
   | "cancelled"
   | "timed_out";
-export type ComputerUseActionType =
-  | "create_session"
-  | "navigate"
-  | "screenshot"
-  | "click"
-  | "double_click"
-  | "type"
-  | "keypress"
-  | "scroll"
-  | "wait"
-  | "extract_text"
-  | "close_session";
-export type ComputerUseDecision = "allowed" | "requires_approval" | "blocked";
-export type ComputerUseEventStatus =
-  | ComputerUseDecision
-  | "approved"
-  | "denied"
-  | "started"
-  | "completed"
-  | "failed";
-
-export interface ToolDescriptor {
-  name: ToolName;
-  description: string;
-  permission: ToolPermissionClass;
-  schema: Record<string, unknown>;
-  risk?: ToolRiskLevel;
-  costHint?: ToolCostHint;
-  concurrencyClass?: ToolConcurrencyClass;
-  batchable?: boolean;
-  rolePolicy?: {
-    allowPrimary?: boolean;
-    allowSubagent?: boolean;
-    maxNestingDepth?: number | null;
-  };
-  audit: {
-    category: string;
-    safeByDefault: boolean;
-  };
-}
-
-export interface ToolSummary {
-  name: string;
-  description: string;
-  permission: ToolPermission;
-  risk?: ToolRiskLevel;
-  costHint?: ToolCostHint;
-  concurrencyClass?: ToolConcurrencyClass;
-  batchable?: boolean;
-  rolePolicy?: {
-    allowPrimary?: boolean;
-    allowSubagent?: boolean;
-    maxNestingDepth?: number | null;
-  };
-  audit: {
-    category: string;
-    safeByDefault: boolean;
-  };
-}
-
-export interface PluginSkillSummary {
-  name: string;
-  summary: string | null;
-}
-
-export interface PluginManifest {
-  id: string;
-  name: string;
-  version: string;
-  description: string;
-  tools: ToolName[];
-  skills: PluginSkillSummary[];
-}
-
-export interface AgentSkillSummary {
-  id: string;
-  name: string;
-  source: "agent" | "shared" | "plugin";
-  summary: string;
-  pluginId: string | null;
-}
 
 export interface AgentRecord {
   id: string;
@@ -202,14 +109,10 @@ export interface ProviderAccountRecord {
 
 export interface ProviderModelCapabilities {
   streaming: boolean;
-  nativeToolCalling: boolean;
   jsonMode: boolean;
   reasoningLevel: boolean;
   vision: boolean;
   maxContextTokens: number | null;
-  supportsComputerUse: boolean;
-  supportsBrowserUse: boolean;
-  computerUseMode: ComputerUseMode;
 }
 
 export interface ProviderSummary {
@@ -228,38 +131,6 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
 }
-
-export interface SearchBackendAvailability {
-  kind: "provider_web_search" | "duckduckgo_search" | "browser_search" | "web_fetch";
-  enabled: boolean;
-  label: string;
-  note: string | null;
-}
-
-export interface ExecToolArguments {
-  program: string;
-  args?: string[];
-  cwd?: string;
-  timeoutMs?: number;
-}
-
-export type ToolName = string;
-
-export interface ToolCall {
-  name: ToolName;
-  arguments: Record<string, unknown>;
-}
-
-export interface AgentToolStep {
-  type: "tool_call";
-  tool: ToolCall;
-}
-
-export interface AgentFinalStep {
-  type: "final_answer";
-}
-
-export type AgentStep = AgentToolStep | AgentFinalStep;
 
 export interface WorkspaceTreeNode {
   name: string;
@@ -292,54 +163,6 @@ export interface WorkspaceRunRecord {
   resumeToken: string | null;
   createdAt: number;
   updatedAt: number;
-}
-
-export interface ComputerUseSettingsRecord {
-  enabled: boolean;
-  customBrowserHarnessEnabled: boolean;
-  allowExternalDomains: string[];
-  allowFileUrls: boolean;
-  maxActionsPerSession: number;
-  sessionTimeoutMs: number;
-  updatedAt: number;
-}
-
-export interface ComputerUseSessionRecord {
-  id: string;
-  agentId: string | null;
-  conversationId: string | null;
-  runId: string | null;
-  taskId: string | null;
-  status: "open" | "closed";
-  currentUrl: string | null;
-  allowedDomains: string[];
-  actionCount: number;
-  latestScreenshotPath: string | null;
-  createdAt: number;
-  updatedAt: number;
-  closedAt: number | null;
-}
-
-export interface ComputerUseActionEventRecord {
-  id: string;
-  sessionId: string;
-  actionType: ComputerUseActionType;
-  status: ComputerUseEventStatus;
-  currentUrl: string | null;
-  targetUrl: string | null;
-  summary: string;
-  metadata: Record<string, unknown>;
-  screenshotPath: string | null;
-  createdAt: number;
-}
-
-export interface ComputerUseApprovalRecord {
-  id: string;
-  sessionId: string;
-  actionEventId: string | null;
-  decision: "approved" | "denied";
-  reason: string | null;
-  createdAt: number;
 }
 
 export interface WorkspaceRunEventRecord {
@@ -389,6 +212,7 @@ export interface EngineStatusRecord {
     autoUpdateDisabled: boolean;
     pruneDisabled: boolean;
     defaultPluginsDisabled: boolean;
+    autoApprovePermissions: boolean;
   };
   credentialSync?: {
     mode: "runtime-env";
@@ -422,6 +246,7 @@ export interface TaskRecord {
   taskFlowId: string | null;
   flowStepKey: string | null;
   originRunId: string | null;
+  automationRuleId: string | null;
   parentTaskId: string | null;
   nestingDepth: number;
   title: string;
@@ -484,26 +309,28 @@ export interface HeartbeatLogRecord {
   updatedAt: number;
 }
 
+export interface AutomationRuleRecord {
+  id: string;
+  agentId: string;
+  conversationId: string;
+  title: string;
+  prompt: string;
+  providerKind: ProviderKind;
+  model: string;
+  reasoningLevel: ReasoningLevel;
+  enabled: boolean;
+  intervalMinutes: number;
+  nextRunAt: number;
+  lastRunAt: number | null;
+  lastTaskId: string | null;
+  runCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface AgentStandingOrdersRecord {
   path: string;
   content: string;
-}
-
-export interface AgentMemorySnapshot {
-  agentId: string;
-  durableMemoryPath: string;
-  durableMemory: string;
-  dailyMemoryPath: string;
-  dailyMemory: string;
-}
-
-export interface MemorySearchResult {
-  path: string;
-  line: number;
-  text: string;
-  kind: "durable" | "daily" | "session_summary" | "outcome";
-  score: number;
-  reason: string;
 }
 
 export interface RunCheckpoint {
@@ -597,21 +424,7 @@ export interface ProviderSecretMap {
 
 export type ProviderSecret<K extends ProviderKind> = ProviderSecretMap[K];
 
-export interface StreamCallbacks {
-  onText: (chunk: string) => void;
-}
-
 export interface ProviderTestResult {
   ok: boolean;
   message: string;
-}
-
-export interface ProviderAdapterContext<K extends ProviderKind> {
-  secret: ProviderSecret<K>;
-  fetchImpl: typeof fetch;
-}
-
-export interface PlanningPrompt {
-  instructions: string;
-  messages: ChatMessage[];
 }

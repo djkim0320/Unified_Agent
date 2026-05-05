@@ -5,16 +5,10 @@ import path from "node:path";
 import { createSecretBox } from "./lib/crypto.js";
 import type {
   AgentRecord,
-  ComputerUseActionEventRecord,
-  ComputerUseActionType,
-  ComputerUseApprovalRecord,
-  ComputerUseEventStatus,
-  ComputerUseSessionRecord,
-  ComputerUseSettingsRecord,
+  AutomationRuleRecord,
   ConversationRecord,
   HeartbeatLogRecord,
   HeartbeatTriggerSource,
-  MemorySearchResult,
   MessageRecord,
   ProviderAccountRecord,
   ProviderKind,
@@ -119,6 +113,7 @@ type TaskRow = {
   task_flow_id: string | null;
   flow_step_key: string | null;
   origin_run_id: string | null;
+  automation_rule_id: string | null;
   parent_task_id: string | null;
   nesting_depth: number;
   title: string;
@@ -189,53 +184,23 @@ type HeartbeatLogRow = {
   updated_at: number;
 };
 
-type ComputerUseSettingsRow = {
+type AutomationRuleRow = {
   id: string;
+  agent_id: string;
+  conversation_id: string;
+  title: string;
+  prompt: string;
+  provider_kind: ProviderKind;
+  model: string;
+  reasoning_level: ReasoningLevel;
   enabled: number;
-  custom_browser_harness_enabled: number;
-  allow_external_domains_json: string;
-  allow_file_urls: number;
-  max_actions_per_session: number;
-  session_timeout_ms: number;
-  updated_at: number;
-};
-
-type ComputerUseSessionRow = {
-  id: string;
-  agent_id: string | null;
-  conversation_id: string | null;
-  run_id: string | null;
-  task_id: string | null;
-  status: ComputerUseSessionRecord["status"];
-  current_url: string | null;
-  allowed_domains_json: string;
-  action_count: number;
-  latest_screenshot_path: string | null;
+  interval_minutes: number;
+  next_run_at: number;
+  last_run_at: number | null;
+  last_task_id: string | null;
+  run_count: number;
   created_at: number;
   updated_at: number;
-  closed_at: number | null;
-};
-
-type ComputerUseEventRow = {
-  id: string;
-  session_id: string;
-  action_type: ComputerUseActionType;
-  status: ComputerUseEventStatus;
-  current_url: string | null;
-  target_url: string | null;
-  summary: string;
-  metadata_json: string;
-  screenshot_path: string | null;
-  created_at: number;
-};
-
-type ComputerUseApprovalRow = {
-  id: string;
-  session_id: string;
-  action_event_id: string | null;
-  decision: ComputerUseApprovalRecord["decision"];
-  reason: string | null;
-  created_at: number;
 };
 
 const WORKSPACE_RUN_EVENT_TYPES = [
@@ -280,30 +245,6 @@ const TASK_FLOW_STEP_STATUSES = [
   "skipped",
 ] as const;
 const TASK_FLOW_TRIGGER_SOURCES = ["manual", "schedule", "event_hook"] as const;
-const COMPUTER_USE_ACTION_TYPES = [
-  "create_session",
-  "navigate",
-  "screenshot",
-  "click",
-  "double_click",
-  "type",
-  "keypress",
-  "scroll",
-  "wait",
-  "extract_text",
-  "close_session",
-] as const;
-const COMPUTER_USE_EVENT_STATUSES = [
-  "allowed",
-  "requires_approval",
-  "blocked",
-  "approved",
-  "denied",
-  "started",
-  "completed",
-  "failed",
-] as const;
-
 export const DEFAULT_AGENT_ID = "default-agent";
 export const DEFAULT_CONVERSATION_TITLE = "\uC0C8 \uCC44\uD305";
 
@@ -418,6 +359,7 @@ function createTasksSql(tableName: string) {
       task_flow_id TEXT REFERENCES task_flows(id) ON DELETE SET NULL,
       flow_step_key TEXT,
       origin_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
+      automation_rule_id TEXT REFERENCES automation_rules(id) ON DELETE SET NULL,
       parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
       nesting_depth INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL,
@@ -475,20 +417,6 @@ function createTaskFlowStepsSql(tableName: string) {
   `;
 }
 
-function createMemoryIndexSql(tableName: string) {
-  return `
-    CREATE VIRTUAL TABLE IF NOT EXISTS ${tableName} USING fts5(
-      agent_id UNINDEXED,
-      path UNINDEXED,
-      kind UNINDEXED,
-      line UNINDEXED,
-      reason UNINDEXED,
-      text,
-      tokenize = 'unicode61'
-    );
-  `;
-}
-
 function createHeartbeatLogsSql(tableName: string) {
   return `
     CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -508,6 +436,29 @@ function createHeartbeatLogsSql(tableName: string) {
   `;
 }
 
+function createAutomationRulesSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      provider_kind TEXT NOT NULL,
+      model TEXT NOT NULL,
+      reasoning_level TEXT NOT NULL DEFAULT 'medium',
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+      interval_minutes INTEGER NOT NULL CHECK(interval_minutes >= 1),
+      next_run_at INTEGER NOT NULL,
+      last_run_at INTEGER,
+      last_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      run_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
 function createTaskEventsSql(tableName: string) {
   return `
     CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -515,59 +466,6 @@ function createTaskEventsSql(tableName: string) {
       task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
       event_type TEXT NOT NULL CHECK(event_type IN ('${TASK_EVENT_TYPES.join("', '")}')),
       payload_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createComputerUseSql() {
-  return `
-    CREATE TABLE IF NOT EXISTS computer_use_settings (
-      id TEXT PRIMARY KEY CHECK(id = 'default'),
-      enabled INTEGER NOT NULL DEFAULT 0,
-      custom_browser_harness_enabled INTEGER NOT NULL DEFAULT 1,
-      allow_external_domains_json TEXT NOT NULL DEFAULT '[]',
-      allow_file_urls INTEGER NOT NULL DEFAULT 0,
-      max_actions_per_session INTEGER NOT NULL DEFAULT 60,
-      session_timeout_ms INTEGER NOT NULL DEFAULT 900000,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS computer_use_sessions (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
-      conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
-      run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
-      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      status TEXT NOT NULL CHECK(status IN ('open', 'closed')),
-      current_url TEXT,
-      allowed_domains_json TEXT NOT NULL DEFAULT '[]',
-      action_count INTEGER NOT NULL DEFAULT 0,
-      latest_screenshot_path TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      closed_at INTEGER
-    );
-
-    CREATE TABLE IF NOT EXISTS computer_use_events (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL REFERENCES computer_use_sessions(id) ON DELETE CASCADE,
-      action_type TEXT NOT NULL CHECK(action_type IN ('${COMPUTER_USE_ACTION_TYPES.join("', '")}')),
-      status TEXT NOT NULL CHECK(status IN ('${COMPUTER_USE_EVENT_STATUSES.join("', '")}')),
-      current_url TEXT,
-      target_url TEXT,
-      summary TEXT NOT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}',
-      screenshot_path TEXT,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS computer_use_approvals (
-      id TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL REFERENCES computer_use_sessions(id) ON DELETE CASCADE,
-      action_event_id TEXT REFERENCES computer_use_events(id) ON DELETE SET NULL,
-      decision TEXT NOT NULL CHECK(decision IN ('approved', 'denied')),
-      reason TEXT,
       created_at INTEGER NOT NULL
     );
   `;
@@ -641,7 +539,7 @@ function migrateTaskMetadataColumns(db: Database.Database) {
       db.exec(`
         INSERT INTO tasks_next (
           id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id,
-          parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
           status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
         )
         SELECT
@@ -649,6 +547,7 @@ function migrateTaskMetadataColumns(db: Database.Database) {
           agent_id,
           conversation_id,
           COALESCE(task_kind, 'detached'),
+          NULL,
           NULL,
           NULL,
           NULL,
@@ -702,6 +601,9 @@ function migrateTaskMetadataColumns(db: Database.Database) {
   }
   if (!columnNames.has("origin_run_id")) {
     statements.push(`ALTER TABLE tasks ADD COLUMN origin_run_id TEXT`);
+  }
+  if (!columnNames.has("automation_rule_id")) {
+    statements.push(`ALTER TABLE tasks ADD COLUMN automation_rule_id TEXT`);
   }
 
   if (statements.length) {
@@ -859,6 +761,25 @@ function migrateConversationSessionColumns(db: Database.Database) {
   }
 }
 
+function migrateAutomationRuleColumns(db: Database.Database) {
+  db.exec(createAutomationRulesSql("automation_rules"));
+  const columns = db.prepare(`PRAGMA table_info(automation_rules)`).all() as Array<{ name: string }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+  const statements: string[] = [];
+  if (!columnNames.has("provider_kind")) {
+    statements.push(`ALTER TABLE automation_rules ADD COLUMN provider_kind TEXT NOT NULL DEFAULT 'openai'`);
+  }
+  if (!columnNames.has("model")) {
+    statements.push(`ALTER TABLE automation_rules ADD COLUMN model TEXT NOT NULL DEFAULT 'gpt-5.4'`);
+  }
+  if (!columnNames.has("reasoning_level")) {
+    statements.push(`ALTER TABLE automation_rules ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`);
+  }
+  for (const statement of statements) {
+    db.exec(statement);
+  }
+}
+
 function migrateTaskFlowStepPositionColumn(db: Database.Database) {
   const columns = db.prepare(`PRAGMA table_info(task_flow_steps)`).all() as Array<{ name: string }>;
   const columnNames = new Set(columns.map((column) => column.name));
@@ -952,18 +873,9 @@ export function createStore(dataDir: string) {
 
     ${createHeartbeatLogsSql("heartbeat_logs")}
 
-    CREATE TABLE IF NOT EXISTS plugins (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      manifest_json TEXT NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
+    ${createAutomationRulesSql("automation_rules")}
   `);
   recordSchemaMigration(db, 1, "base_schema");
-
-  db.exec(createMemoryIndexSql("memory_index"));
 
   ensureDefaultAgent(db);
   runSchemaMigration(db, 2, "conversation_session_columns", () =>
@@ -981,6 +893,7 @@ export function createStore(dataDir: string) {
   runSchemaMigration(db, 6, "task_metadata_columns", () =>
     migrateTaskMetadataColumns(db),
   );
+  migrateTaskMetadataColumns(db);
 
   runSchemaMigration(db, 7, "conversation_reasoning_level", () => {
     const conversationColumns = db
@@ -990,12 +903,23 @@ export function createStore(dataDir: string) {
       db.exec(`ALTER TABLE conversations ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`);
     }
   });
-  runSchemaMigration(db, 8, "computer_use_tables", () => {
-    db.exec(createComputerUseSql());
+  runSchemaMigration(db, 8, "computer_use_removed_from_product_path", () => {
+    // Kept as a no-op migration marker so existing databases remain compatible
+    // without creating legacy custom Computer Use tables for new installations.
   });
   runSchemaMigration(db, 9, "task_flow_step_positions", () => {
     migrateTaskFlowStepPositionColumn(db);
   });
+  runSchemaMigration(db, 10, "automation_rules", () => {
+    migrateAutomationRuleColumns(db);
+  });
+  migrateAutomationRuleColumns(db);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS automation_rules_agent_due_idx
+      ON automation_rules(agent_id, enabled, next_run_at);
+    CREATE INDEX IF NOT EXISTS tasks_automation_rule_status_idx
+      ON tasks(automation_rule_id, status);
+  `);
 
   const upsertProviderAccount = db.prepare(`
     INSERT INTO provider_accounts (
@@ -1103,67 +1027,12 @@ export function createStore(dataDir: string) {
     );
   `);
 
-  const upsertComputerUseSettingsStmt = db.prepare(`
-    INSERT INTO computer_use_settings (
-      id, enabled, custom_browser_harness_enabled, allow_external_domains_json, allow_file_urls,
-      max_actions_per_session, session_timeout_ms, updated_at
-    ) VALUES (
-      'default', @enabled, @custom_browser_harness_enabled, @allow_external_domains_json, @allow_file_urls,
-      @max_actions_per_session, @session_timeout_ms, @updated_at
-    )
-    ON CONFLICT(id) DO UPDATE SET
-      enabled = excluded.enabled,
-      custom_browser_harness_enabled = excluded.custom_browser_harness_enabled,
-      allow_external_domains_json = excluded.allow_external_domains_json,
-      allow_file_urls = excluded.allow_file_urls,
-      max_actions_per_session = excluded.max_actions_per_session,
-      session_timeout_ms = excluded.session_timeout_ms,
-      updated_at = excluded.updated_at;
-  `);
-
-  const insertComputerUseSessionStmt = db.prepare(`
-    INSERT INTO computer_use_sessions (
-      id, agent_id, conversation_id, run_id, task_id, status, current_url, allowed_domains_json,
-      action_count, latest_screenshot_path, created_at, updated_at, closed_at
-    ) VALUES (
-      @id, @agent_id, @conversation_id, @run_id, @task_id, @status, @current_url, @allowed_domains_json,
-      @action_count, @latest_screenshot_path, @created_at, @updated_at, @closed_at
-    );
-  `);
-
-  const updateComputerUseSessionStmt = db.prepare(`
-    UPDATE computer_use_sessions
-    SET status = COALESCE(@status, status),
-        current_url = COALESCE(@current_url, current_url),
-        action_count = COALESCE(@action_count, action_count),
-        latest_screenshot_path = COALESCE(@latest_screenshot_path, latest_screenshot_path),
-        updated_at = @updated_at,
-        closed_at = COALESCE(@closed_at, closed_at)
-    WHERE id = @id;
-  `);
-
-  const insertComputerUseEventStmt = db.prepare(`
-    INSERT INTO computer_use_events (
-      id, session_id, action_type, status, current_url, target_url, summary, metadata_json, screenshot_path, created_at
-    ) VALUES (
-      @id, @session_id, @action_type, @status, @current_url, @target_url, @summary, @metadata_json, @screenshot_path, @created_at
-    );
-  `);
-
-  const insertComputerUseApprovalStmt = db.prepare(`
-    INSERT INTO computer_use_approvals (
-      id, session_id, action_event_id, decision, reason, created_at
-    ) VALUES (
-      @id, @session_id, @action_event_id, @decision, @reason, @created_at
-    );
-  `);
-
   const insertTaskStmt = db.prepare(`
     INSERT INTO tasks (
-      id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+      id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
       status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
     ) VALUES (
-      @id, @agent_id, @conversation_id, @task_kind, @task_flow_id, @flow_step_key, @origin_run_id, @parent_task_id, @nesting_depth, @title, @prompt, @provider_kind, @model, @reasoning_level,
+      @id, @agent_id, @conversation_id, @task_kind, @task_flow_id, @flow_step_key, @origin_run_id, @automation_rule_id, @parent_task_id, @nesting_depth, @title, @prompt, @provider_kind, @model, @reasoning_level,
       @status, @run_id, @result_text, @created_at, @started_at, @updated_at, @completed_at, @scheduled_for
     );
   `);
@@ -1250,6 +1119,40 @@ export function createStore(dataDir: string) {
     );
   `);
 
+  const insertAutomationRuleStmt = db.prepare(`
+    INSERT INTO automation_rules (
+      id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level, enabled, interval_minutes,
+      next_run_at, last_run_at, last_task_id, run_count, created_at, updated_at
+    ) VALUES (
+      @id, @agent_id, @conversation_id, @title, @prompt, @provider_kind, @model, @reasoning_level, @enabled, @interval_minutes,
+      @next_run_at, @last_run_at, @last_task_id, @run_count, @created_at, @updated_at
+    );
+  `);
+
+  const updateAutomationRuleStmt = db.prepare(`
+    UPDATE automation_rules
+    SET title = COALESCE(@title, title),
+        prompt = COALESCE(@prompt, prompt),
+        provider_kind = COALESCE(@provider_kind, provider_kind),
+        model = COALESCE(@model, model),
+        reasoning_level = COALESCE(@reasoning_level, reasoning_level),
+        enabled = COALESCE(@enabled, enabled),
+        interval_minutes = COALESCE(@interval_minutes, interval_minutes),
+        next_run_at = COALESCE(@next_run_at, next_run_at),
+        updated_at = @updated_at
+    WHERE id = @id AND agent_id = @agent_id;
+  `);
+
+  const markAutomationRuleRunStmt = db.prepare(`
+    UPDATE automation_rules
+    SET last_run_at = @last_run_at,
+        last_task_id = @last_task_id,
+        next_run_at = @next_run_at,
+        run_count = run_count + 1,
+        updated_at = @updated_at
+    WHERE id = @id;
+  `);
+
   const updateHeartbeatLogStmt = db.prepare(`
     UPDATE heartbeat_logs
     SET task_id = COALESCE(@task_id, task_id),
@@ -1260,15 +1163,6 @@ export function createStore(dataDir: string) {
         completed_at = COALESCE(@completed_at, completed_at),
         updated_at = @updated_at
     WHERE id = @id;
-  `);
-
-  const deleteMemoryIndexForAgentStmt = db.prepare(`
-    DELETE FROM memory_index WHERE agent_id = ?;
-  `);
-
-  const insertMemoryIndexStmt = db.prepare(`
-    INSERT INTO memory_index (agent_id, path, kind, line, reason, text)
-    VALUES (@agent_id, @path, @kind, @line, @reason, @text);
   `);
 
   const appendMessageTx = db.transaction((input: {
@@ -1423,6 +1317,7 @@ export function createStore(dataDir: string) {
       taskFlowId: row.task_flow_id,
       flowStepKey: row.flow_step_key,
       originRunId: row.origin_run_id,
+      automationRuleId: row.automation_rule_id,
       parentTaskId: row.parent_task_id,
       nestingDepth: row.nesting_depth,
       title: row.title,
@@ -1468,6 +1363,27 @@ export function createStore(dataDir: string) {
     };
   }
 
+  function mapAutomationRule(row: AutomationRuleRow): AutomationRuleRecord {
+    return {
+      id: row.id,
+      agentId: row.agent_id,
+      conversationId: row.conversation_id,
+      title: row.title,
+      prompt: row.prompt,
+      providerKind: row.provider_kind,
+      model: row.model,
+      reasoningLevel: row.reasoning_level,
+      enabled: row.enabled === 1,
+      intervalMinutes: row.interval_minutes,
+      nextRunAt: row.next_run_at,
+      lastRunAt: row.last_run_at,
+      lastTaskId: row.last_task_id,
+      runCount: row.run_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
   function mapTaskFlow(row: TaskFlowRow): TaskFlowRecord {
     return {
       id: row.id,
@@ -1499,79 +1415,6 @@ export function createStore(dataDir: string) {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       completedAt: row.completed_at,
-    };
-  }
-
-  function defaultComputerUseSettings(): ComputerUseSettingsRecord {
-    return {
-      enabled: false,
-      customBrowserHarnessEnabled: true,
-      allowExternalDomains: [],
-      allowFileUrls: false,
-      maxActionsPerSession: 60,
-      sessionTimeoutMs: 15 * 60_000,
-      updatedAt: now(),
-    };
-  }
-
-  function parseJsonArray(value: string) {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
-  }
-
-  function mapComputerUseSettings(row: ComputerUseSettingsRow): ComputerUseSettingsRecord {
-    return {
-      enabled: Boolean(row.enabled),
-      customBrowserHarnessEnabled: Boolean(row.custom_browser_harness_enabled),
-      allowExternalDomains: parseJsonArray(row.allow_external_domains_json),
-      allowFileUrls: Boolean(row.allow_file_urls),
-      maxActionsPerSession: row.max_actions_per_session,
-      sessionTimeoutMs: row.session_timeout_ms,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapComputerUseSession(row: ComputerUseSessionRow): ComputerUseSessionRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      conversationId: row.conversation_id,
-      runId: row.run_id,
-      taskId: row.task_id,
-      status: row.status,
-      currentUrl: row.current_url,
-      allowedDomains: parseJsonArray(row.allowed_domains_json),
-      actionCount: row.action_count,
-      latestScreenshotPath: row.latest_screenshot_path,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      closedAt: row.closed_at,
-    };
-  }
-
-  function mapComputerUseEvent(row: ComputerUseEventRow): ComputerUseActionEventRecord {
-    return {
-      id: row.id,
-      sessionId: row.session_id,
-      actionType: row.action_type,
-      status: row.status,
-      currentUrl: row.current_url,
-      targetUrl: row.target_url,
-      summary: row.summary,
-      metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
-      screenshotPath: row.screenshot_path,
-      createdAt: row.created_at,
-    };
-  }
-
-  function mapComputerUseApproval(row: ComputerUseApprovalRow): ComputerUseApprovalRecord {
-    return {
-      id: row.id,
-      sessionId: row.session_id,
-      actionEventId: row.action_event_id,
-      decision: row.decision,
-      reason: row.reason,
-      createdAt: row.created_at,
     };
   }
 
@@ -1982,185 +1825,6 @@ export function createStore(dataDir: string) {
       return rows.map(mapWorkspaceRunEvent);
     },
 
-    getComputerUseSettings(): ComputerUseSettingsRecord {
-      const row = db
-        .prepare(
-          `SELECT id, enabled, custom_browser_harness_enabled, allow_external_domains_json, allow_file_urls,
-                  max_actions_per_session, session_timeout_ms, updated_at
-           FROM computer_use_settings
-           WHERE id = 'default'`,
-        )
-        .get() as ComputerUseSettingsRow | undefined;
-      return row ? mapComputerUseSettings(row) : defaultComputerUseSettings();
-    },
-
-    saveComputerUseSettings(input: Partial<Omit<ComputerUseSettingsRecord, "updatedAt">>) {
-      const current = store.getComputerUseSettings();
-      const updated = {
-        ...current,
-        ...input,
-        allowExternalDomains: input.allowExternalDomains ?? current.allowExternalDomains,
-        updatedAt: now(),
-      };
-      upsertComputerUseSettingsStmt.run({
-        enabled: updated.enabled ? 1 : 0,
-        custom_browser_harness_enabled: updated.customBrowserHarnessEnabled ? 1 : 0,
-        allow_external_domains_json: JSON.stringify(updated.allowExternalDomains),
-        allow_file_urls: updated.allowFileUrls ? 1 : 0,
-        max_actions_per_session: updated.maxActionsPerSession,
-        session_timeout_ms: updated.sessionTimeoutMs,
-        updated_at: updated.updatedAt,
-      });
-      return store.getComputerUseSettings();
-    },
-
-    createComputerUseSession(input: {
-      agentId?: string | null;
-      conversationId?: string | null;
-      runId?: string | null;
-      taskId?: string | null;
-      allowedDomains?: string[];
-    }) {
-      const id = crypto.randomUUID();
-      const timestamp = now();
-      insertComputerUseSessionStmt.run({
-        id,
-        agent_id: input.agentId ?? null,
-        conversation_id: input.conversationId ?? null,
-        run_id: input.runId ?? null,
-        task_id: input.taskId ?? null,
-        status: "open",
-        current_url: "about:blank",
-        allowed_domains_json: JSON.stringify(input.allowedDomains ?? []),
-        action_count: 0,
-        latest_screenshot_path: null,
-        created_at: timestamp,
-        updated_at: timestamp,
-        closed_at: null,
-      });
-      return store.getComputerUseSession(id)!;
-    },
-
-    getComputerUseSession(id: string): ComputerUseSessionRecord | null {
-      const row = db
-        .prepare(
-          `SELECT id, agent_id, conversation_id, run_id, task_id, status, current_url, allowed_domains_json,
-                  action_count, latest_screenshot_path, created_at, updated_at, closed_at
-           FROM computer_use_sessions
-           WHERE id = ?`,
-        )
-        .get(id) as ComputerUseSessionRow | undefined;
-      return row ? mapComputerUseSession(row) : null;
-    },
-
-    updateComputerUseSession(input: {
-      sessionId: string;
-      status?: ComputerUseSessionRecord["status"];
-      currentUrl?: string | null;
-      actionCount?: number;
-      latestScreenshotPath?: string | null;
-      closedAt?: number | null;
-    }) {
-      updateComputerUseSessionStmt.run({
-        id: input.sessionId,
-        status: input.status ?? null,
-        current_url: input.currentUrl ?? null,
-        action_count: input.actionCount ?? null,
-        latest_screenshot_path: input.latestScreenshotPath ?? null,
-        updated_at: now(),
-        closed_at: input.closedAt ?? null,
-      });
-      return store.getComputerUseSession(input.sessionId);
-    },
-
-    appendComputerUseEvent(input: {
-      sessionId: string;
-      actionType: ComputerUseActionType;
-      status: ComputerUseEventStatus;
-      currentUrl?: string | null;
-      targetUrl?: string | null;
-      summary: string;
-      metadata?: Record<string, unknown>;
-      screenshotPath?: string | null;
-    }) {
-      const id = crypto.randomUUID();
-      const createdAt = now();
-      insertComputerUseEventStmt.run({
-        id,
-        session_id: input.sessionId,
-        action_type: input.actionType,
-        status: input.status,
-        current_url: input.currentUrl ?? null,
-        target_url: input.targetUrl ?? null,
-        summary: input.summary,
-        metadata_json: JSON.stringify(input.metadata ?? {}),
-        screenshot_path: input.screenshotPath ?? null,
-        created_at: createdAt,
-      });
-      return {
-        id,
-        sessionId: input.sessionId,
-        actionType: input.actionType,
-        status: input.status,
-        currentUrl: input.currentUrl ?? null,
-        targetUrl: input.targetUrl ?? null,
-        summary: input.summary,
-        metadata: input.metadata ?? {},
-        screenshotPath: input.screenshotPath ?? null,
-        createdAt,
-      } satisfies ComputerUseActionEventRecord;
-    },
-
-    listComputerUseEvents(sessionId: string): ComputerUseActionEventRecord[] {
-      const rows = db
-        .prepare(
-          `SELECT id, session_id, action_type, status, current_url, target_url, summary, metadata_json, screenshot_path, created_at
-           FROM computer_use_events
-           WHERE session_id = ?
-           ORDER BY created_at ASC`,
-        )
-        .all(sessionId) as ComputerUseEventRow[];
-      return rows.map(mapComputerUseEvent);
-    },
-
-    recordComputerUseApproval(input: {
-      sessionId: string;
-      actionEventId?: string | null;
-      decision: ComputerUseApprovalRecord["decision"];
-      reason?: string | null;
-    }) {
-      const id = crypto.randomUUID();
-      const createdAt = now();
-      insertComputerUseApprovalStmt.run({
-        id,
-        session_id: input.sessionId,
-        action_event_id: input.actionEventId ?? null,
-        decision: input.decision,
-        reason: input.reason ?? null,
-        created_at: createdAt,
-      });
-      return {
-        id,
-        sessionId: input.sessionId,
-        actionEventId: input.actionEventId ?? null,
-        decision: input.decision,
-        reason: input.reason ?? null,
-        createdAt,
-      } satisfies ComputerUseApprovalRecord;
-    },
-
-    listComputerUseApprovals(sessionId: string): ComputerUseApprovalRecord[] {
-      const rows = db
-        .prepare(
-          `SELECT id, session_id, action_event_id, decision, reason, created_at
-           FROM computer_use_approvals
-           WHERE session_id = ?
-           ORDER BY created_at ASC`,
-        )
-        .all(sessionId) as ComputerUseApprovalRow[];
-      return rows.map(mapComputerUseApproval);
-    },
-
     createTask(input: {
       agentId: string;
       conversationId: string;
@@ -2168,6 +1832,7 @@ export function createStore(dataDir: string) {
       taskFlowId?: string | null;
       flowStepKey?: string | null;
       originRunId?: string | null;
+      automationRuleId?: string | null;
       parentTaskId?: string | null;
       nestingDepth?: number;
       title: string;
@@ -2205,6 +1870,7 @@ export function createStore(dataDir: string) {
           task_flow_id: input.taskFlowId ?? null,
           flow_step_key: input.flowStepKey ?? null,
           origin_run_id: input.originRunId ?? null,
+          automation_rule_id: input.automationRuleId ?? null,
           parent_task_id: input.parentTaskId ?? null,
           nesting_depth: nestingDepth,
           title: input.title,
@@ -2235,7 +1901,7 @@ export function createStore(dataDir: string) {
     getTask(id: string): TaskRecord | null {
       const row = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE id = ?`,
@@ -2247,7 +1913,7 @@ export function createStore(dataDir: string) {
     getTaskForAgent(agentId: string, taskId: string): TaskRecord | null {
       const row = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE agent_id = ? AND id = ?`,
@@ -2259,7 +1925,7 @@ export function createStore(dataDir: string) {
     listTasks(agentId: string): TaskRecord[] {
       const rows = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE agent_id = ?
@@ -2272,7 +1938,7 @@ export function createStore(dataDir: string) {
     listTasksForConversation(conversationId: string): TaskRecord[] {
       const rows = db
         .prepare(
-          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
                   status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
            FROM tasks
            WHERE conversation_id = ?
@@ -2471,6 +2137,246 @@ export function createStore(dataDir: string) {
       return row ? mapHeartbeatLog(row) : null;
     },
 
+    createAutomationRule(input: {
+      agentId: string;
+      conversationId: string;
+      title: string;
+      prompt: string;
+      providerKind: ProviderKind;
+      model: string;
+      reasoningLevel: ReasoningLevel;
+      enabled?: boolean;
+      intervalMinutes: number;
+      nextRunAt?: number | null;
+    }): AutomationRuleRecord {
+      if (!store.getAgent(input.agentId)) {
+        throw new Error("Agent not found.");
+      }
+      const conversation = store.getConversation(input.conversationId);
+      if (!conversation || conversation.agentId !== input.agentId) {
+        throw new Error("Session not found for agent.");
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      insertAutomationRuleStmt.run({
+        id,
+        agent_id: input.agentId,
+        conversation_id: input.conversationId,
+        title: input.title,
+        prompt: input.prompt,
+        provider_kind: input.providerKind,
+        model: input.model,
+        reasoning_level: input.reasoningLevel,
+        enabled: input.enabled === false ? 0 : 1,
+        interval_minutes: input.intervalMinutes,
+        next_run_at: input.nextRunAt ?? timestamp + input.intervalMinutes * 60_000,
+        last_run_at: null,
+        last_task_id: null,
+        run_count: 0,
+        created_at: timestamp,
+        updated_at: timestamp,
+      });
+      return store.getAutomationRuleForAgent(input.agentId, id)!;
+    },
+
+    getAutomationRuleForAgent(agentId: string, ruleId: string): AutomationRuleRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+                  enabled, interval_minutes, next_run_at, last_run_at, last_task_id, run_count, created_at, updated_at
+           FROM automation_rules
+           WHERE agent_id = ? AND id = ?`,
+        )
+        .get(agentId, ruleId) as AutomationRuleRow | undefined;
+      return row ? mapAutomationRule(row) : null;
+    },
+
+    getAutomationRule(ruleId: string): AutomationRuleRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+                  enabled, interval_minutes, next_run_at, last_run_at, last_task_id, run_count, created_at, updated_at
+           FROM automation_rules
+           WHERE id = ?`,
+        )
+        .get(ruleId) as AutomationRuleRow | undefined;
+      return row ? mapAutomationRule(row) : null;
+    },
+
+    listAutomationRules(agentId: string): AutomationRuleRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+                  enabled, interval_minutes, next_run_at, last_run_at, last_task_id, run_count, created_at, updated_at
+           FROM automation_rules
+           WHERE agent_id = ?
+           ORDER BY enabled DESC, next_run_at ASC, updated_at DESC`,
+        )
+        .all(agentId) as AutomationRuleRow[];
+      return rows.map(mapAutomationRule);
+    },
+
+    listDueAutomationRules(timestamp: number): AutomationRuleRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, title, prompt, provider_kind, model, reasoning_level,
+                  enabled, interval_minutes, next_run_at, last_run_at, last_task_id, run_count, created_at, updated_at
+           FROM automation_rules
+           WHERE enabled = 1 AND next_run_at <= ?
+           ORDER BY next_run_at ASC
+           LIMIT 25`,
+        )
+        .all(timestamp) as AutomationRuleRow[];
+      return rows.map(mapAutomationRule);
+    },
+
+    updateAutomationRule(input: {
+      agentId: string;
+      ruleId: string;
+      title?: string;
+      prompt?: string;
+      providerKind?: ProviderKind;
+      model?: string;
+      reasoningLevel?: ReasoningLevel;
+      enabled?: boolean;
+      intervalMinutes?: number;
+      nextRunAt?: number;
+    }): AutomationRuleRecord | null {
+      updateAutomationRuleStmt.run({
+        id: input.ruleId,
+        agent_id: input.agentId,
+        title: input.title ?? null,
+        prompt: input.prompt ?? null,
+        provider_kind: input.providerKind ?? null,
+        model: input.model ?? null,
+        reasoning_level: input.reasoningLevel ?? null,
+        enabled: input.enabled === undefined ? null : input.enabled ? 1 : 0,
+        interval_minutes: input.intervalMinutes ?? null,
+        next_run_at: input.nextRunAt ?? null,
+        updated_at: now(),
+      });
+      return store.getAutomationRuleForAgent(input.agentId, input.ruleId);
+    },
+
+    deleteAutomationRule(agentId: string, ruleId: string): boolean {
+      const result = db
+        .prepare(`DELETE FROM automation_rules WHERE agent_id = ? AND id = ?`)
+        .run(agentId, ruleId);
+      return result.changes > 0;
+    },
+
+    markAutomationRuleRun(input: {
+      ruleId: string;
+      taskId: string;
+      runAt?: number;
+      nextRunAt?: number;
+    }): AutomationRuleRecord | null {
+      const runAt = input.runAt ?? now();
+      const rule = store.getAutomationRule(input.ruleId);
+      if (!rule) {
+        return null;
+      }
+      markAutomationRuleRunStmt.run({
+        id: input.ruleId,
+        last_run_at: runAt,
+        last_task_id: input.taskId,
+        next_run_at: input.nextRunAt ?? runAt + rule.intervalMinutes * 60_000,
+        updated_at: runAt,
+      });
+      return store.getAutomationRule(input.ruleId);
+    },
+
+    enqueueAutomationRuleTask(ruleId: string, timestamp = now(), force = false) {
+      const tx = db.transaction(() => {
+        const rule = store.getAutomationRule(ruleId);
+        if (!rule || (!force && (!rule.enabled || rule.nextRunAt > timestamp))) {
+          return null;
+        }
+        const conversation = store.getConversation(rule.conversationId);
+        if (!conversation || conversation.agentId !== rule.agentId) {
+          return null;
+        }
+        const activeTask = db
+          .prepare(
+            `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+                    status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
+             FROM tasks
+             WHERE automation_rule_id = ? AND status IN ('queued', 'running')
+             ORDER BY created_at DESC
+             LIMIT 1`,
+          )
+          .get(rule.id) as TaskRow | undefined;
+        if (activeTask) {
+          return {
+            rule,
+            task: mapTask(activeTask),
+            enqueued: false,
+          };
+        }
+
+        const taskId = crypto.randomUUID();
+        const taskTitle = `[자동화] ${rule.title}`;
+        const taskPrompt = [
+          "[AetherOps 자동화 규칙]",
+          `규칙: ${rule.title}`,
+          `주기: ${rule.intervalMinutes}분`,
+          `예약 시각: ${new Date(timestamp).toISOString()}`,
+          "",
+          rule.prompt,
+        ].join("\n");
+
+        insertTaskStmt.run({
+          id: taskId,
+          agent_id: rule.agentId,
+          conversation_id: rule.conversationId,
+          task_kind: "scheduled",
+          task_flow_id: null,
+          flow_step_key: null,
+          origin_run_id: null,
+          automation_rule_id: rule.id,
+          parent_task_id: null,
+          nesting_depth: 0,
+          title: taskTitle,
+          prompt: taskPrompt,
+          provider_kind: rule.providerKind,
+          model: rule.model,
+          reasoning_level: rule.reasoningLevel,
+          status: "queued",
+          run_id: null,
+          result_text: null,
+          created_at: timestamp,
+          started_at: null,
+          updated_at: timestamp,
+          completed_at: null,
+          scheduled_for: timestamp,
+        });
+        insertTaskEventStmt.run({
+          id: crypto.randomUUID(),
+          task_id: taskId,
+          event_type: "queued",
+          payload_json: JSON.stringify({
+            message: "자동화 규칙이 예약 작업을 만들었습니다.",
+            automationRuleId: rule.id,
+            automationTitle: rule.title,
+          }),
+          created_at: timestamp,
+        });
+        markAutomationRuleRunStmt.run({
+          id: rule.id,
+          last_run_at: timestamp,
+          last_task_id: taskId,
+          next_run_at: timestamp + rule.intervalMinutes * 60_000,
+          updated_at: timestamp,
+        });
+        return {
+          rule: store.getAutomationRule(rule.id)!,
+          task: store.getTask(taskId)!,
+          enqueued: true,
+        };
+      });
+      return tx();
+    },
+
     createTaskFlow(input: {
       agentId: string;
       conversationId: string;
@@ -2667,71 +2573,6 @@ export function createStore(dataDir: string) {
         clear_completed_at: input.clearCompletedAt ? 1 : 0,
       });
       return store.getTaskFlowStep(input.stepId);
-    },
-
-    replaceMemoryIndex(
-      agentId: string,
-      entries: Array<{
-        path: string;
-        kind: MemorySearchResult["kind"];
-        line: number;
-        reason: string;
-        text: string;
-      }>,
-    ) {
-      const tx = db.transaction(() => {
-        deleteMemoryIndexForAgentStmt.run(agentId);
-        for (const entry of entries) {
-          insertMemoryIndexStmt.run({
-            agent_id: agentId,
-            path: entry.path,
-            kind: entry.kind,
-            line: entry.line,
-            reason: entry.reason,
-            text: entry.text,
-          });
-        }
-      });
-      tx();
-      return entries.length;
-    },
-
-    searchMemoryIndex(agentId: string, query: string, maxResults = 8): MemorySearchResult[] {
-      if (!query.trim()) {
-        return [];
-      }
-      const tokens = query
-        .toLowerCase()
-        .split(/[\s,.;:!?()[\]{}"']+/)
-        .filter((token) => token.length >= 2)
-        .map((token) => `"${token.replace(/"/g, '""')}"`);
-      if (!tokens.length) {
-        return [];
-      }
-      const rows = db
-        .prepare(
-          `SELECT path, kind, line, reason, text, bm25(memory_index) AS score
-           FROM memory_index
-           WHERE memory_index MATCH ? AND agent_id = ?
-           ORDER BY score
-           LIMIT ?`,
-        )
-        .all(tokens.join(" OR "), agentId, maxResults) as Array<{
-          path: string;
-          kind: MemorySearchResult["kind"];
-          line: number | string;
-          reason: string;
-          text: string;
-          score: number;
-        }>;
-      return rows.map((row) => ({
-        path: row.path,
-        kind: row.kind,
-        line: typeof row.line === "number" ? row.line : Number.parseInt(String(row.line), 10) || 1,
-        reason: row.reason,
-        text: row.text,
-        score: typeof row.score === "number" ? row.score : 0,
-      }));
     },
 
     getProviderAccount(kind: ProviderKind): ProviderAccountRecord | null {

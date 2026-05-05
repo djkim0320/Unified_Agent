@@ -4,19 +4,20 @@ Operational guide for AI agents working inside `AetherOps`.
 
 ## Purpose
 
-This repository is a local-first agent platform built on:
+This repository is a local-first agent cockpit, scheduler, and log store built on:
 
 - React + Vite frontend
 - Express backend
 - SQLite local store
-- workspace-based agent runtime
+- OpenCodeEngine/opencode workspace execution
 - provider adapters for OpenAI, Anthropic, Gemini, Ollama, and OpenAI Codex
 
 The product shape is:
 
 - `agent -> session(conversation) -> run -> task`
 - `webchat` is the primary channel
-- local workspace files are the source of truth for memory and file outputs
+- opencode session workspaces are the source of truth for file outputs
+- AetherOps schedules work, stores logs/state, and never runs a hidden internal execution loop
 
 Read this file first, then read:
 
@@ -32,7 +33,7 @@ When starting work, inspect these files first:
 - [`server/app.ts`](server/app.ts)
 - [`server/db.ts`](server/db.ts)
 - [`server/lib/agent-gateway.ts`](server/lib/agent-gateway.ts)
-- [`server/lib/agent-runtime.ts`](server/lib/agent-runtime.ts)
+- [`server/lib/opencode-engine.ts`](server/lib/opencode-engine.ts)
 - [`server/lib/workspace.ts`](server/lib/workspace.ts)
 - [`src/App.tsx`](src/App.tsx)
 - [`src/api.ts`](src/api.ts)
@@ -114,20 +115,17 @@ Important:
 
 - SQLite DB: `.data/chat.sqlite`
 - Secret key: `.data/secret.key`
-- Agent workspace root: `workspace/agents/<agentId>/`
-- Durable memory: `workspace/agents/<agentId>/MEMORY.md`
-- Daily memory: `workspace/agents/<agentId>/memory/YYYY-MM-DD.md`
-- Session sandbox: `workspace/agents/<agentId>/sessions/<conversationId>/`
-- Shared skills: `workspace/shared/skills/`
-- Shared plugins: `workspace/shared/plugins/`
+- Session sandbox: `workspace/opencode/agents/<agentId>/sessions/<conversationId>/`
+- Agent control files: `workspace/opencode/agents/<agentId>/SOUL.md`, `STANDING_ORDERS.md`, and `HEARTBEAT.md`
+- Legacy internal runtime folders under `workspace/agents`, `workspace/shared/skills`, and `workspace/shared/plugins` are removed by the opencode-only migration marker.
 
 ## Safety Invariants
 
 Do not break these:
 
 - Workspace access must stay sandboxed in [`server/lib/workspace.ts`](server/lib/workspace.ts)
-- `exec_command` must stay structured and safe by default
-- browser/web tools must keep SSRF protections
+- opencode runs must stay scoped to the active session sandbox
+- browser/web automation should be connected through opencode/MCP, not a hidden AetherOps fallback
 - run/task terminal states must be deterministic and idempotent
 - normal UI/API payloads must not leak absolute host paths
 - `scope=root` is debug-only and must remain off by default
@@ -138,14 +136,10 @@ Backend:
 
 - [`server/app.ts`](server/app.ts): API routes and top-level wiring
 - [`server/db.ts`](server/db.ts): schema bootstrap, migrations, persistence helpers
-- [`server/lib/agent-gateway.ts`](server/lib/agent-gateway.ts): composes runtime, plugins, memory, tasks
-- [`server/lib/agent-runtime.ts`](server/lib/agent-runtime.ts): plan/tool/final loop
-- [`server/lib/tool-registry.ts`](server/lib/tool-registry.ts): typed tool registry
-- [`server/lib/plugin-manager.ts`](server/lib/plugin-manager.ts): plugin + skill loading
-- [`server/lib/memory-manager.ts`](server/lib/memory-manager.ts): file-backed memory
+- [`server/lib/agent-gateway.ts`](server/lib/agent-gateway.ts): wires OpenCodeEngine, tasks, flows, heartbeats, and run logging
+- [`server/lib/opencode-engine.ts`](server/lib/opencode-engine.ts): opencode CLI adapter and run event bridge
 - [`server/lib/task-manager.ts`](server/lib/task-manager.ts): detached task lifecycle
 - [`server/lib/workspace.ts`](server/lib/workspace.ts): sandboxed file access
-- [`server/plugins/core.ts`](server/plugins/core.ts): built-in tools
 - [`server/providers/*.ts`](server/providers): provider adapters
 
 Frontend:
@@ -154,7 +148,9 @@ Frontend:
 - [`src/api.ts`](src/api.ts): API client
 - [`src/components/ConversationList.tsx`](src/components/ConversationList.tsx): agent/session sidebar
 - [`src/components/Composer.tsx`](src/components/Composer.tsx): chat input and model/reasoning controls
-- [`src/components/WorkspaceView.tsx`](src/components/WorkspaceView.tsx): workspace, runs, tasks, memory, platform metadata
+- [`src/components/CockpitSectionView.tsx`](src/components/CockpitSectionView.tsx): workflow cockpit for Flow editing, step control, and run/task logs
+- [`src/components/CockpitPanels.tsx`](src/components/CockpitPanels.tsx): chat-side opencode run timeline, changed files, and extension-status panels
+- [`src/components/CockpitPanels.tsx`](src/components/CockpitPanels.tsx): right-rail run/task summaries and ops drawer
 
 ## Change Routing
 
@@ -167,20 +163,18 @@ Use these shortcuts before you start editing:
 - schema, migration, or ownership logic:
   - [`server/db.ts`](server/db.ts)
   - [`server/db.test.ts`](server/db.test.ts)
-- agent planning, tool loop, cancellation, run status:
-  - [`server/lib/agent-runtime.ts`](server/lib/agent-runtime.ts)
-  - [`server/lib/agent-runtime.test.ts`](server/lib/agent-runtime.test.ts)
-- workspace sandbox or file preview:
+- opencode execution, cancellation, run status:
+  - [`server/lib/opencode-engine.ts`](server/lib/opencode-engine.ts)
+  - [`server/lib/agent-engine.ts`](server/lib/agent-engine.ts)
+  - [`server/lib/agent-gateway.ts`](server/lib/agent-gateway.ts)
+- session sandbox lifecycle or changed-file summaries:
   - [`server/lib/workspace.ts`](server/lib/workspace.ts)
-  - [`src/components/WorkspaceView.tsx`](src/components/WorkspaceView.tsx)
-- memory behavior:
-  - [`server/lib/memory-manager.ts`](server/lib/memory-manager.ts)
+  - [`src/components/CockpitSectionView.tsx`](src/components/CockpitSectionView.tsx)
+- agent standing orders or persistent working context:
+  - [`server/lib/workspace.ts`](server/lib/workspace.ts)
+  - opencode configuration and workspace artifacts
 - detached tasks:
   - [`server/lib/task-manager.ts`](server/lib/task-manager.ts)
-- tools, plugins, skills:
-  - [`server/lib/tool-registry.ts`](server/lib/tool-registry.ts)
-  - [`server/lib/plugin-manager.ts`](server/lib/plugin-manager.ts)
-  - [`server/plugins/core.ts`](server/plugins/core.ts)
 - provider-specific behavior:
   - [`server/providers/`](server/providers)
 - top-level frontend state:
@@ -192,14 +186,12 @@ For detailed playbooks, use [`docs/agent-change-playbook.md`](docs/agent-change-
 
 If you edit these files, run these tests at minimum:
 
-- workspace sandbox or file preview:
+- session sandbox or changed-file summaries:
   - `vitest run --config vitest.server.config.ts server/lib/workspace.test.ts`
-- agent loop, tools, cancellation:
-  - `vitest run --config vitest.server.config.ts server/lib/agent-runtime.test.ts`
+- opencode engine, task execution, cancellation:
+  - `vitest run --config vitest.server.config.ts server/lib/opencode-engine.test.ts server/lib/task-manager.test.ts`
 - exec safety:
   - `vitest run --config vitest.server.config.ts server/lib/exec-command.test.ts`
-- browser/web safety:
-  - `vitest run --config vitest.server.config.ts server/lib/browser-runtime.test.ts server/lib/web-fetch.test.ts`
 - DB or routes:
   - `vitest run --config vitest.server.config.ts server/db.test.ts server/app.test.ts`
 - frontend state or UI:
@@ -215,10 +207,10 @@ API smoke test:
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8787/api/providers | Select-Object -ExpandProperty Content
 ```
 
-Check live agent skill route:
+Check removed skill route returns `410 Gone`:
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8787/api/agents/default-agent/skills | Select-Object -ExpandProperty Content
+curl.exe -i http://127.0.0.1:8787/api/agents/default-agent/skills
 ```
 
 Browser validation:
@@ -226,15 +218,14 @@ Browser validation:
 - Start source backend on `8787`
 - Start Vite on `5173`
 - Open `http://127.0.0.1:5173`
-- Send a chat that triggers `write_file`
-- Confirm chat activity, run completion, and file appearance in the workspace tab
+- Send a chat that asks opencode to create a file in the current session sandbox
+- Confirm chat activity, run completion, and changed-file appearance in the cockpit files/log panels
 
 Suggested verification prompt:
 
 ```text
 Create hello_browser.ts in the current session workspace with exactly:
 export const browserCheck = (): string => 'ok';
-Use the write_file tool.
 ```
 
 ## Port Diagnostics

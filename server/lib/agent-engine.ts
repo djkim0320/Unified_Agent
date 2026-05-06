@@ -10,6 +10,7 @@ import type {
   ProviderSecret,
   ReasoningLevel,
   RunCheckpoint,
+  SessionSummaryRecord,
   TaskStatus,
   WorkspaceRunPhase,
   WorkspaceRunEventRecord,
@@ -49,6 +50,7 @@ export interface AgentEngineRunParams {
   agentId: string;
   userMessage: string;
   messages: ChatMessage[];
+  sessionSummary?: SessionSummaryRecord | null;
   signal?: AbortSignal;
   unsafeShellEnabled?: boolean;
   isDetachedTask?: boolean;
@@ -109,6 +111,13 @@ export interface AgentEngineStore {
   getWorkspaceRunForConversation?: (conversationId: string, runId: string) => WorkspaceRunRecord | null;
   listWorkspaceRuns?: (conversationId: string) => WorkspaceRunRecord[];
   listWorkspaceRunEvents?: (conversationId: string, runId: string) => WorkspaceRunEventRecord[];
+  createArtifactsForRun?: (input: {
+    agentId: string;
+    conversationId: string;
+    runId: string;
+    taskId?: string | null;
+    changedFiles: string[];
+  }) => unknown;
   getProviderSecret?: <K extends ProviderKind>(kind: K) => ProviderSecret<K> | null;
 }
 

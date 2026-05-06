@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  applySkillTemplateToHeartbeat,
+  applySkillTemplateToStandingOrders,
   cancelAgentTask,
   deleteConversation,
   deleteAgent,
@@ -7,15 +9,22 @@ import {
   createAgentTask,
   cancelSubagentSession,
   cancelTaskFlow,
+  createMcpTestRun,
   createSubagentSession,
   createTaskFlow,
   deleteAgentAutomationRule,
   deleteTaskFlow,
+  draftFlowFromPrompt,
   getAgentStandingOrders,
   getAgentHeartbeat,
   getAgentSoul,
+  getConversationSummary,
   getEngineStatus,
   getConversationMessages,
+  getMcpCatalog,
+  getMcpConfigStatus,
+  getPreflightStatus,
+  getRunDebug,
   importCodexCliAuth,
   listAgentAutomationRules,
   listAgentTasks,
@@ -26,6 +35,8 @@ import {
   listHeartbeatLogs,
   listPlatformMetadata,
   listProviders,
+  listSkillTemplates,
+  listRunArtifacts,
   listTaskEvents,
   listTaskFlows,
   listWorkspaceRunEvents,
@@ -34,11 +45,13 @@ import {
   resumeTaskFlow,
   retryTaskFlowStep,
   refreshOpenCodeModels,
+  refreshConversationSummary,
   saveAgentStandingOrders,
   saveAgent,
   saveAgentHeartbeat,
   saveAgentSoul,
   saveConversation,
+  saveConversationSummary,
   saveTaskFlowSteps,
   saveProviderAccount,
   startCodexOAuth,
@@ -51,6 +64,7 @@ import {
   getTaskFlow,
   streamChat,
   testProvider,
+  previewArtifact,
 } from "./api";
 import { ChatView } from "./components/ChatView";
 import { CockpitOpsDrawer, CockpitRightRail } from "./components/CockpitPanels";
@@ -64,8 +78,14 @@ import {
 import { Composer } from "./components/Composer";
 import { ConnectionStatus } from "./components/ConnectionStatus";
 import { ConversationList, type CockpitNavTarget } from "./components/ConversationList";
+import { ExtensionsSectionView } from "./components/ExtensionsSectionView";
+import { FlowDraftPanel } from "./components/FlowDraftPanel";
 import { ProviderSettingsDialog } from "./components/ProviderSettingsDialog";
+import { RunArtifactsPanel } from "./components/RunArtifactsPanel";
+import { SessionSummaryPanel } from "./components/SessionSummaryPanel";
 import { SettingsSectionView } from "./components/SettingsSectionView";
+import { SubagentPanel } from "./components/SubagentPanel";
+import { createAgentDraft } from "./app/agentDraft";
 import { getModelOption } from "./model-catalog";
 import { getReasoningLabel, normalizeReasoningLevel } from "./reasoning-options";
 import {
@@ -83,10 +103,12 @@ import {
   type ProviderDraft,
   type ProviderKind,
   type PlatformMetadata,
+  type PreflightResponse,
   type ProviderSummary,
   type StandingOrdersRecord,
   type StreamEventPayloadMap,
   type TaskEventRecord,
+  type TaskFlowDetailResponse,
   type TaskFlowRecord,
   type TaskFlowStepDraft,
   type TaskFlowStepDetail,
@@ -94,6 +116,14 @@ import {
   type WorkspaceRunEventRecord,
   type WorkspaceRunRecord,
   type EngineStatusRecord,
+  type McpConfigStatus,
+  type McpServerSummary,
+  type ArtifactPreviewResponse,
+  type ArtifactRecord,
+  type FlowDraft,
+  type RunDebugResponse,
+  type SessionSummaryRecord,
+  type SkillTemplateRecord,
 } from "./types";
 import {
   abortRef,
@@ -114,22 +144,7 @@ import {
   pickConversationProvider,
 } from "./appStateUtils";
 
-function createAgentDraft(agent: AgentRecord | null): AgentDraft {
-  const providerKind = agent?.providerKind ?? "openai";
-  const model = agent?.model ?? defaultModels[providerKind];
-  return {
-    name: agent?.name ?? "기본 에이전트",
-    providerKind,
-    model,
-    reasoningLevel: normalizeReasoningLevel(
-      providerKind,
-      model,
-      agent?.reasoningLevel ?? defaultReasoningLevels[providerKind],
-    ),
-  };
-}
-
-type AppSection = "chat" | "workflow" | "settings";
+type AppSection = "chat" | "workflow" | "mcp" | "skills" | "settings";
 
 export default function App() {
   const [activeSection, setActiveSection] = useState<AppSection>("chat");
@@ -155,6 +170,8 @@ export default function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [appNotice, setAppNotice] = useState<string | null>(null);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
+  const [preflightStatus, setPreflightStatus] = useState<PreflightResponse | null>(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
   const [providerDrafts, setProviderDrafts] = useState<Record<ProviderKind, ProviderDraft>>(
     createEmptyDrafts(),
   );
@@ -172,10 +189,7 @@ export default function App() {
   const [subagentSessions, setSubagentSessions] = useState<ConversationRecord[]>([]);
   const [taskFlows, setTaskFlows] = useState<TaskFlowRecord[]>([]);
   const [selectedTaskFlowId, setSelectedTaskFlowId] = useState<string | null>(null);
-  const [selectedTaskFlow, setSelectedTaskFlow] = useState<{
-    flow: TaskFlowRecord;
-    steps: TaskFlowStepDetail[];
-  } | null>(null);
+  const [selectedTaskFlow, setSelectedTaskFlow] = useState<TaskFlowDetailResponse | null>(null);
   const [heartbeatLogs, setHeartbeatLogs] = useState<HeartbeatLogRecord[]>([]);
   const [automationRules, setAutomationRules] = useState<AutomationRuleRecord[]>([]);
   const [heartbeatTriggering, setHeartbeatTriggering] = useState(false);
@@ -194,8 +208,28 @@ export default function App() {
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [taskEvents, setTaskEvents] = useState<TaskEventRecord[]>([]);
   const [platformMetadata, setPlatformMetadata] = useState<PlatformMetadata | null>(null);
+  const [mcpCatalog, setMcpCatalog] = useState<McpServerSummary[]>([]);
+  const [mcpStatus, setMcpStatus] = useState<McpConfigStatus | null>(null);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpTestRunPendingId, setMcpTestRunPendingId] = useState<string | null>(null);
+  const [skillTemplates, setSkillTemplates] = useState<SkillTemplateRecord[]>([]);
+  const [skillTemplatesLoading, setSkillTemplatesLoading] = useState(false);
+  const [skillActionPendingId, setSkillActionPendingId] = useState<string | null>(null);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
+  const [sessionSummary, setSessionSummary] = useState<SessionSummaryRecord | null>(null);
+  const [sessionSummaryDraft, setSessionSummaryDraft] = useState("");
+  const [summaryEditing, setSummaryEditing] = useState(false);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [flowDraftPrompt, setFlowDraftPrompt] = useState("");
+  const [flowDraft, setFlowDraft] = useState<FlowDraft | null>(null);
+  const [flowDraftEditing, setFlowDraftEditing] = useState(false);
+  const [flowDraftLoading, setFlowDraftLoading] = useState(false);
+  const [flowDraftError, setFlowDraftError] = useState<string | null>(null);
+  const [runArtifacts, setRunArtifacts] = useState<ArtifactRecord[]>([]);
+  const [artifactPreview, setArtifactPreview] = useState<ArtifactPreviewResponse | null>(null);
+  const [runDebug, setRunDebug] = useState<RunDebugResponse | null>(null);
+  const [runDetailLoading, setRunDetailLoading] = useState(false);
 
   const activeConversationIdRef = useRef<string | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
@@ -210,6 +244,10 @@ export default function App() {
   const conversationLoadControllerRef = useRef<AbortController | null>(null);
   const workspaceRunsSeqRef = useRef(0);
   const workspaceRunsControllerRef = useRef<AbortController | null>(null);
+  const runArtifactsSeqRef = useRef(0);
+  const runArtifactsControllerRef = useRef<AbortController | null>(null);
+  const sessionSummarySeqRef = useRef(0);
+  const sessionSummaryControllerRef = useRef<AbortController | null>(null);
   const tasksSeqRef = useRef(0);
   const tasksControllerRef = useRef<AbortController | null>(null);
   const taskEventsSeqRef = useRef(0);
@@ -235,6 +273,12 @@ export default function App() {
   const taskFlowDetailControllerRef = useRef<AbortController | null>(null);
   const platformMetadataSeqRef = useRef(0);
   const platformMetadataControllerRef = useRef<AbortController | null>(null);
+  const mcpMetadataSeqRef = useRef(0);
+  const mcpMetadataControllerRef = useRef<AbortController | null>(null);
+  const preflightSeqRef = useRef(0);
+  const preflightControllerRef = useRef<AbortController | null>(null);
+  const skillTemplatesSeqRef = useRef(0);
+  const skillTemplatesControllerRef = useRef<AbortController | null>(null);
   const workspaceEventsSeqRef = useRef(0);
   const workspaceEventsControllerRef = useRef<AbortController | null>(null);
   const streamSeqRef = useRef(0);
@@ -310,6 +354,14 @@ export default function App() {
     void refreshTaskFlowDetail(activeAgentId, selectedTaskFlowId);
   }, [activeAgentId, selectedTaskFlowId]);
 
+  useEffect(() => {
+    if (!activeAgentId && !activeConversationId) {
+      setPreflightStatus(null);
+      return;
+    }
+    void refreshPreflight(activeAgentId, activeConversationId);
+  }, [activeAgentId, activeConversationId, activeConversation?.model, activeConversation?.providerKind]);
+
   const providersByKind = useMemo(
     () =>
       Object.fromEntries(providers.map((provider) => [provider.kind, provider])) as Record<
@@ -331,16 +383,22 @@ export default function App() {
     abortRef(standingOrdersControllerRef);
     abortRef(taskFlowsControllerRef);
     abortRef(taskFlowDetailControllerRef);
+    abortRef(preflightControllerRef);
   }
 
   function abortAllPendingRequests() {
     abortAgentScopedRequests();
     abortRef(platformMetadataControllerRef);
+    abortRef(mcpMetadataControllerRef);
+    abortRef(preflightControllerRef);
+    abortRef(skillTemplatesControllerRef);
   }
 
   function abortConversationScopedRequests() {
     abortRef(conversationLoadControllerRef);
     abortRef(workspaceRunsControllerRef);
+    abortRef(runArtifactsControllerRef);
+    abortRef(sessionSummaryControllerRef);
     abortRef(workspaceEventsControllerRef);
     abortRef(streamControllerRef);
     abortRef(subagentSessionsControllerRef);
@@ -354,6 +412,15 @@ export default function App() {
     setWorkspaceRunEvents([]);
     setLiveEvents([]);
     setChangedFiles([]);
+    setSessionSummary(null);
+    setSessionSummaryDraft("");
+    setSummaryEditing(false);
+    setFlowDraft(null);
+    setFlowDraftPrompt("");
+    setFlowDraftError(null);
+    setRunArtifacts([]);
+    setArtifactPreview(null);
+    setRunDebug(null);
     setSubagentSessions([]);
   }
 
@@ -392,6 +459,43 @@ export default function App() {
       return null;
     } finally {
       setEngineStatusLoading(false);
+    }
+  }
+
+  async function refreshPreflight(agentId = activeAgentIdRef.current, conversationId = activeConversationIdRef.current) {
+    const request = beginRequest(preflightSeqRef, preflightControllerRef);
+    setPreflightLoading(true);
+    try {
+      const response = await getPreflightStatus({ agentId, conversationId }, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        preflightSeqRef.current !== request.seq ||
+        activeAgentIdRef.current !== agentId ||
+        activeConversationIdRef.current !== conversationId
+      ) {
+        return;
+      }
+      setPreflightStatus(response);
+    } catch (error) {
+      if (request.controller.signal.aborted || preflightSeqRef.current !== request.seq) {
+        return;
+      }
+      setPreflightStatus({
+        ok: false,
+        checks: [
+          {
+            id: "preflight-fetch",
+            label: "Preflight",
+            status: "error",
+            message: error instanceof Error ? error.message : "실행 전 점검을 불러오지 못했습니다.",
+          },
+        ],
+      });
+    } finally {
+      if (preflightSeqRef.current === request.seq) {
+        setPreflightLoading(false);
+        abortRef(preflightControllerRef);
+      }
     }
   }
 
@@ -821,6 +925,62 @@ export default function App() {
     }
   }
 
+  async function refreshSessionSummary(conversationId: string) {
+    const request = beginRequest(sessionSummarySeqRef, sessionSummaryControllerRef);
+    try {
+      const response = await getConversationSummary(conversationId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        sessionSummarySeqRef.current !== request.seq ||
+        activeConversationIdRef.current !== conversationId
+      ) {
+        return;
+      }
+      setSessionSummary(response.summary);
+      setSessionSummaryDraft(response.summary?.summary ?? "");
+      setSummaryEditing(false);
+    } catch (error) {
+      if (!request.controller.signal.aborted) {
+        setAppNotice(error instanceof Error ? error.message : "세션 요약을 불러오지 못했습니다.");
+      }
+    } finally {
+      if (sessionSummarySeqRef.current === request.seq) {
+        abortRef(sessionSummaryControllerRef);
+      }
+    }
+  }
+
+  async function refreshRunArtifacts(conversationId: string, runId: string | null) {
+    const request = beginRequest(runArtifactsSeqRef, runArtifactsControllerRef);
+    if (!runId) {
+      setRunArtifacts([]);
+      setArtifactPreview(null);
+      setRunDebug(null);
+      abortRef(runArtifactsControllerRef);
+      return;
+    }
+    try {
+      const response = await listRunArtifacts(conversationId, runId, request.controller.signal);
+      if (
+        request.controller.signal.aborted ||
+        runArtifactsSeqRef.current !== request.seq ||
+        activeConversationIdRef.current !== conversationId ||
+        selectedRunIdRef.current !== runId
+      ) {
+        return;
+      }
+      setRunArtifacts(response.artifacts);
+    } catch (error) {
+      if (!request.controller.signal.aborted) {
+        setAppNotice(error instanceof Error ? error.message : "산출물을 불러오지 못했습니다.");
+      }
+    } finally {
+      if (runArtifactsSeqRef.current === request.seq) {
+        abortRef(runArtifactsControllerRef);
+      }
+    }
+  }
+
   async function refreshAutomationRules(agentId: string) {
     const request = beginRequest(automationRulesSeqRef, automationRulesControllerRef);
 
@@ -957,6 +1117,7 @@ export default function App() {
         await refreshEngineStatus();
         const loadedAgents = await refreshAgents();
         await refreshPlatformMetadata(loadedAgents[0]?.id ?? null);
+        await refreshMcpMetadata();
       } catch (error) {
         if (!cancelled) {
           setAppNotice(error instanceof Error ? error.message : "초기 데이터를 불러오지 못했습니다.");
@@ -1036,6 +1197,8 @@ export default function App() {
 
     void (async () => {
       void refreshPlatformMetadata(activeAgentId);
+      void refreshMcpMetadata();
+      void refreshSkillTemplates();
       void refreshAgentSoul(activeAgentId);
       void refreshAgentHeartbeat(activeAgentId);
       void refreshHeartbeatLogs(activeAgentId);
@@ -1049,6 +1212,20 @@ export default function App() {
       }
     })();
   }, [activeAgentId]);
+
+  useEffect(() => {
+    if (activeSection !== "mcp") {
+      return;
+    }
+    void refreshMcpMetadata();
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (activeSection !== "skills") {
+      return;
+    }
+    void refreshSkillTemplates();
+  }, [activeSection]);
 
   useEffect(() => {
     const conversationChanged = lastConversationIdRef.current !== activeConversationId;
@@ -1073,6 +1250,7 @@ export default function App() {
     }
 
     void loadConversation(activeConversationId);
+    void refreshSessionSummary(activeConversationId);
     void refreshSubagentSessions(activeConversationId);
   }, [activeConversationId]);
 
@@ -1091,6 +1269,7 @@ export default function App() {
     }
 
     void refreshWorkspaceRunEvents(activeConversationId, selectedRunId);
+    void refreshRunArtifacts(activeConversationId, selectedRunId);
   }, [activeConversationId, selectedRunId]);
 
   useEffect(() => {
@@ -1166,7 +1345,6 @@ export default function App() {
   const activeModelsError = activeConversation
     ? modelErrorsByProvider[activeConversation.providerKind]
     : null;
-  const activeWorkspaceTarget = "workflow" as const;
   const activeProviderLabel = activeConversation
     ? providersByKind[activeConversation.providerKind]?.label ?? activeConversation.providerKind
     : "선택 안 됨";
@@ -1261,7 +1439,57 @@ export default function App() {
       return;
     }
 
-    setActiveSection("workflow");
+    setActiveSection(target);
+  }
+
+  async function refreshMcpMetadata() {
+    const request = beginRequest(mcpMetadataSeqRef, mcpMetadataControllerRef);
+    setMcpLoading(true);
+
+    try {
+      const [catalogResponse, statusResponse] = await Promise.all([
+        getMcpCatalog(request.controller.signal),
+        getMcpConfigStatus(request.controller.signal),
+      ]);
+      if (request.controller.signal.aborted || mcpMetadataSeqRef.current !== request.seq) {
+        return;
+      }
+      setMcpCatalog(catalogResponse.servers);
+      setMcpStatus(statusResponse.status);
+    } catch (error) {
+      if (request.controller.signal.aborted || mcpMetadataSeqRef.current !== request.seq) {
+        return;
+      }
+      setAppNotice(error instanceof Error ? error.message : "MCP 설정 정보를 불러오지 못했습니다.");
+    } finally {
+      if (mcpMetadataSeqRef.current === request.seq) {
+        setMcpLoading(false);
+        abortRef(mcpMetadataControllerRef);
+      }
+    }
+  }
+
+  async function refreshSkillTemplates() {
+    const request = beginRequest(skillTemplatesSeqRef, skillTemplatesControllerRef);
+    setSkillTemplatesLoading(true);
+
+    try {
+      const response = await listSkillTemplates(request.controller.signal);
+      if (request.controller.signal.aborted || skillTemplatesSeqRef.current !== request.seq) {
+        return;
+      }
+      setSkillTemplates(response.templates);
+    } catch (error) {
+      if (request.controller.signal.aborted || skillTemplatesSeqRef.current !== request.seq) {
+        return;
+      }
+      setAppNotice(error instanceof Error ? error.message : "스킬 템플릿을 불러오지 못했습니다.");
+    } finally {
+      if (skillTemplatesSeqRef.current === request.seq) {
+        setSkillTemplatesLoading(false);
+        abortRef(skillTemplatesControllerRef);
+      }
+    }
   }
 
   async function handleSaveAgentDefaults() {
@@ -1428,6 +1656,125 @@ export default function App() {
     }
   }
 
+  async function handleCreateMcpTestRun(server: McpServerSummary) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return null;
+    }
+    const agentId = activeAgentId;
+    const conversationId = activeConversationIdRef.current;
+    setMcpTestRunPendingId(server.id);
+    try {
+      const response = await createMcpTestRun({
+        agentId,
+        conversationId,
+        catalogId: server.status === "candidate" ? server.id : undefined,
+        serverId: server.status === "configured" ? server.id : undefined,
+        autoStart: true,
+      });
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+      setSelectedTaskId(response.task.id);
+      setConversations((current) => mergeConversationList(current, response.conversation));
+      if (!activeConversationIdRef.current) {
+        setActiveConversationId(response.conversation.id);
+      }
+      setAppNotice(`${server.name} MCP 테스트 Run을 생성했습니다.`);
+      void refreshAgentTasks(agentId);
+      void refreshMcpMetadata();
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "MCP 테스트 Run을 생성하지 못했습니다.");
+    } finally {
+      setMcpTestRunPendingId(null);
+    }
+  }
+
+  async function handleCreateSkillFlow(template: SkillTemplateRecord) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    setSkillActionPendingId(`flow:${template.id}`);
+    try {
+      const createdFlow = await handleCreateTaskFlow({
+        title: template.flowTemplate.title,
+        autoStart: false,
+        steps: template.flowTemplate.steps,
+      });
+      if (createdFlow) {
+        setActiveNavTarget("workflow");
+        setActiveSection("workflow");
+        setAppNotice(`${template.name} 템플릿으로 대기 중인 Flow를 만들었습니다.`);
+      }
+    } finally {
+      setSkillActionPendingId(null);
+    }
+  }
+
+  async function handleApplySkillStandingOrders(template: SkillTemplateRecord) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    setSkillActionPendingId(`standing:${template.id}`);
+    try {
+      const response = await applySkillTemplateToStandingOrders(agentId, template.id);
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setStandingOrders(response.standingOrders);
+      setStandingOrdersDraft(response.standingOrders.content);
+      setAppNotice(
+        response.applied
+          ? `${template.name} 스킬을 상시 지침에 추가했습니다.`
+          : `${template.name} 스킬은 이미 상시 지침에 적용되어 있습니다.`,
+      );
+      void refreshStandingOrders(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "상시 지침에 스킬을 적용하지 못했습니다.");
+    } finally {
+      setSkillActionPendingId(null);
+    }
+  }
+
+  async function handleApplySkillHeartbeat(template: SkillTemplateRecord) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    setSkillActionPendingId(`heartbeat:${template.id}`);
+    try {
+      const response = await applySkillTemplateToHeartbeat(agentId, template.id);
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setAgentHeartbeat(response.heartbeat);
+      setAgentHeartbeatDraft(createAgentHeartbeatDraft(response.heartbeat));
+      setAppNotice(
+        response.applied
+          ? `${template.name} Heartbeat 지침을 추가했습니다. 활성화 상태는 변경하지 않았습니다.`
+          : `${template.name} Heartbeat 지침은 이미 적용되어 있습니다.`,
+      );
+      void refreshAgentHeartbeat(agentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Heartbeat에 스킬을 적용하지 못했습니다.");
+    } finally {
+      setSkillActionPendingId(null);
+    }
+  }
+
+  function handleInsertSkillPrompt(template: SkillTemplateRecord) {
+    const prompt = template.suggestedPrompt.trim();
+    setComposerText((current) => (current.trim() ? `${current.trim()}\n\n${prompt}` : prompt));
+    setActiveNavTarget("chat");
+    setActiveSection("chat");
+    setAppNotice(`${template.name} 프롬프트를 채팅 입력창에 삽입했습니다.`);
+  }
+
   async function handleCancelTask(taskId: string) {
     if (!activeAgentId) {
       return;
@@ -1474,9 +1821,16 @@ export default function App() {
           (left, right) => right.updatedAt - left.updatedAt,
         ),
       );
+      setTasks((current) =>
+        [response.task, ...current.filter((task) => task.id !== response.task.id)].sort(
+          (left, right) => right.updatedAt - left.updatedAt,
+        ),
+      );
+      setSelectedTaskId(response.task.id);
       setConversations((current) => mergeConversationList(current, response.session));
       setAppNotice("하위 에이전트 세션을 만들었습니다.");
       void refreshSubagentSessions(conversation.id);
+      void refreshAgentTasks(agentId);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "하위 에이전트 세션 생성에 실패했습니다.");
     }
@@ -1484,10 +1838,19 @@ export default function App() {
 
   async function handleCancelSubagentSession(sessionId: string) {
     try {
-      await cancelSubagentSession(sessionId);
+      const response = await cancelSubagentSession(sessionId);
+      if (response.task) {
+        setTasks((current) =>
+          current.map((task) => (task.id === response.task?.id ? response.task : task)),
+        );
+      }
       if (activeConversationIdRef.current) {
         void refreshSubagentSessions(activeConversationIdRef.current);
       }
+      if (activeAgentIdRef.current) {
+        void refreshAgentTasks(activeAgentIdRef.current);
+      }
+      setAppNotice("서브에이전트 실행을 취소했습니다.");
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "하위 에이전트 세션 취소에 실패했습니다.");
     }
@@ -1525,12 +1888,14 @@ export default function App() {
         ),
       );
       setSelectedTaskFlowId(response.flow.id);
-      setSelectedTaskFlow({ flow: response.flow, steps: response.steps });
+      setSelectedTaskFlow(response);
       setAppNotice("작업 흐름을 만들었습니다.");
       void refreshTaskFlows(agentId, response.flow.id);
       void refreshTaskFlowDetail(agentId, response.flow.id);
+      return response.flow;
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "작업 흐름 생성에 실패했습니다.");
+      return null;
     }
   }
 
@@ -1619,7 +1984,7 @@ export default function App() {
 
       selectedTaskFlowIdRef.current = response.flow.id;
       setSelectedTaskFlowId(response.flow.id);
-      setSelectedTaskFlow({ flow: response.flow, steps: response.steps });
+      setSelectedTaskFlow(response);
       setTaskFlows((current) =>
         [response.flow, ...current.filter((flow) => flow.id !== response.flow.id)].sort(
           (left, right) => right.updatedAt - left.updatedAt,
@@ -1668,6 +2033,218 @@ export default function App() {
   function handleSelectTaskFlow(flowId: string) {
     selectedTaskFlowIdRef.current = flowId;
     setSelectedTaskFlowId(flowId);
+  }
+
+  async function handleGenerateFlowDraft() {
+    if (!activeAgentId || !activeConversationId) {
+      setFlowDraftError("먼저 에이전트와 세션을 선택해 주세요.");
+      return;
+    }
+    const prompt = (flowDraftPrompt || composerText).trim();
+    if (!prompt) {
+      setFlowDraftError("Flow로 만들 목표를 입력해 주세요.");
+      return;
+    }
+
+    setFlowDraftLoading(true);
+    setFlowDraftError(null);
+    try {
+      const response = await draftFlowFromPrompt(activeAgentId, {
+        conversationId: activeConversationId,
+        prompt,
+      });
+      setFlowDraft(response.draft);
+      setFlowDraftEditing(false);
+      setFlowDraftPrompt(prompt);
+    } catch (error) {
+      setFlowDraftError(error instanceof Error ? error.message : "Flow 초안을 만들지 못했습니다.");
+    } finally {
+      setFlowDraftLoading(false);
+    }
+  }
+
+  async function handleSaveFlowDraft() {
+    if (!flowDraft) {
+      return;
+    }
+    await handleCreateTaskFlow({
+      title: flowDraft.title,
+      autoStart: false,
+      steps: flowDraft.steps,
+    });
+    setFlowDraft(null);
+    setFlowDraftEditing(false);
+    setFlowDraftError(null);
+    setActiveNavTarget("workflow");
+    setActiveSection("workflow");
+  }
+
+  async function handleRefreshSummary() {
+    if (!activeConversationId) {
+      return;
+    }
+    setSummaryLoading(true);
+    try {
+      const response = await refreshConversationSummary(activeConversationId);
+      setSessionSummary(response.summary);
+      setSessionSummaryDraft(response.summary.summary);
+      setSummaryEditing(false);
+      setAppNotice("세션 요약을 새로고침했습니다.");
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "세션 요약 새로고침에 실패했습니다.");
+    } finally {
+      setSummaryLoading(false);
+    }
+  }
+
+  async function handleSaveSummary() {
+    if (!activeConversationId) {
+      return;
+    }
+    setSummaryLoading(true);
+    try {
+      const response = await saveConversationSummary(activeConversationId, {
+        summary: sessionSummaryDraft,
+        decisions: sessionSummary?.decisions ?? [],
+        openQuestions: sessionSummary?.openQuestions ?? [],
+        nextActions: sessionSummary?.nextActions ?? [],
+      });
+      setSessionSummary(response.summary);
+      setSessionSummaryDraft(response.summary.summary);
+      setSummaryEditing(false);
+      setAppNotice("세션 요약을 저장했습니다.");
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "세션 요약 저장에 실패했습니다.");
+    } finally {
+      setSummaryLoading(false);
+    }
+  }
+
+  async function handlePreviewArtifact(artifactId: string) {
+    setRunDetailLoading(true);
+    try {
+      setArtifactPreview(await previewArtifact(artifactId));
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "산출물 미리보기를 불러오지 못했습니다.");
+    } finally {
+      setRunDetailLoading(false);
+    }
+  }
+
+  async function handleOpenRunDebug(runId = selectedRunId) {
+    if (!activeConversationId || !runId) {
+      return;
+    }
+    setRunDetailLoading(true);
+    try {
+      setRunDebug(await getRunDebug(activeConversationId, runId));
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Run 디버그 정보를 불러오지 못했습니다.");
+    } finally {
+      setRunDetailLoading(false);
+    }
+  }
+
+  function handleCopyDebugBundle() {
+    if (!runDebug) {
+      return;
+    }
+    const payload = JSON.stringify(runDebug, null, 2);
+    void navigator.clipboard?.writeText(payload).then(
+      () => setAppNotice("Debug bundle을 클립보드에 복사했습니다."),
+      () => setAppNotice("클립보드 복사에 실패했습니다."),
+    );
+  }
+
+  async function readReportArtifactContent(artifactId: string) {
+    const preview = await previewArtifact(artifactId);
+    setArtifactPreview(preview);
+    if (preview.preview.binary) {
+      throw new Error("보고서 내용을 텍스트로 읽을 수 없습니다.");
+    }
+    return preview.preview.content;
+  }
+
+  async function handleCopyReportArtifact(artifactId: string) {
+    try {
+      const content = await readReportArtifactContent(artifactId);
+      await navigator.clipboard?.writeText(content);
+      setAppNotice("보고서를 클립보드에 복사했습니다.");
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "보고서 복사에 실패했습니다.");
+    }
+  }
+
+  function findReportArtifact(artifactId: string) {
+    return runArtifacts.find((artifact) => artifact.id === artifactId && artifact.kind === "report") ?? null;
+  }
+
+  async function handleCreateFollowUpTaskFromReport(artifactId: string) {
+    const artifact = findReportArtifact(artifactId);
+    if (!artifact || !activeAgentId || !activeConversation) {
+      setAppNotice("후속 Task를 만들 보고서 또는 세션이 없습니다.");
+      return;
+    }
+    const nextAction =
+      typeof artifact.metadata.nextRecommendedAction === "string"
+        ? artifact.metadata.nextRecommendedAction
+        : "보고서를 바탕으로 후속 작업을 계획하고 실행하세요.";
+    try {
+      const response = await createAgentTask(activeAgentId, {
+        conversationId: activeConversation.id,
+        title: `후속 Task: ${artifact.title}`.slice(0, 80),
+        prompt: [
+          "다음 AetherOps 보고서를 바탕으로 후속 작업을 수행하세요.",
+          "검증 명령이 필요하면 opencode 세션 sandbox 안에서 실행하고 결과를 요약하세요.",
+          "",
+          `권장 작업: ${nextAction}`,
+          "",
+          typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : artifact.summary ?? "",
+        ].join("\n"),
+        providerKind: activeConversation.providerKind,
+        model: activeConversation.model,
+        reasoningLevel: activeConversation.reasoningLevel,
+        autoStart: false,
+      });
+      setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+      setSelectedTaskId(response.task.id);
+      setAppNotice("후속 Task를 대기열에 만들었습니다.");
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "후속 Task 생성에 실패했습니다.");
+    }
+  }
+
+  async function handleCreateFollowUpFlowFromReport(artifactId: string) {
+    const artifact = findReportArtifact(artifactId);
+    if (!artifact) {
+      setAppNotice("후속 Flow를 만들 보고서가 없습니다.");
+      return;
+    }
+    const nextAction =
+      typeof artifact.metadata.nextRecommendedAction === "string"
+        ? artifact.metadata.nextRecommendedAction
+        : "보고서를 검토하고 다음 실행 계획을 만드세요.";
+    await handleCreateTaskFlow({
+      title: `후속 Flow: ${artifact.title}`.slice(0, 80),
+      autoStart: false,
+      steps: [
+        {
+          stepKey: "review-report",
+          title: "보고서 검토",
+          prompt: [
+            "AetherOps 보고서를 검토하고 완료/실패 원인을 정리하세요.",
+            typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : artifact.summary ?? "",
+          ].join("\n\n"),
+          dependencyStepKey: null,
+        },
+        {
+          stepKey: "follow-up-plan",
+          title: "후속 계획",
+          prompt: `다음 권장 작업을 실행 가능한 opencode 작업 계획으로 정리하세요.\n\n${nextAction}`,
+          dependencyStepKey: "review-report",
+        },
+      ],
+    });
   }
 
   async function handleTriggerHeartbeat() {
@@ -1989,6 +2566,7 @@ export default function App() {
               setSelectedRunId(completePayload.runId);
             }
             void refreshWorkspaceRuns(conversation.id, completePayload.runId);
+            void refreshRunArtifacts(conversation.id, completePayload.runId);
             return;
           }
 
@@ -2019,6 +2597,7 @@ export default function App() {
         await loadConversation(conversation.id);
         await refreshConversationList(conversation.id);
         await refreshWorkspaceRuns(conversation.id, selectedRunIdRef.current);
+        await refreshSessionSummary(conversation.id);
       }
     } catch (error) {
       if (!request.controller.signal.aborted) {
@@ -2096,6 +2675,8 @@ export default function App() {
       section={activeSection === "chat" ? "chat" : "workspace"}
     />
   ) : null;
+  const selectedRun =
+    selectedRunId ? workspaceRuns.find((run) => run.id === selectedRunId) ?? null : workspaceRuns[0] ?? null;
 
   return (
     <div className="app-shell">
@@ -2162,7 +2743,15 @@ export default function App() {
         >
           <div className="chat-panel__intro" aria-hidden={activeSection === "chat"}>
             <p className="eyebrow">
-              {activeSection === "chat" ? "대화" : activeSection === "settings" ? "설정" : "워크플로우"}
+              {activeSection === "chat"
+                ? "대화"
+                : activeSection === "settings"
+                  ? "설정"
+                  : activeSection === "mcp"
+                    ? "MCP"
+                    : activeSection === "skills"
+                      ? "스킬"
+                      : "워크플로우"}
             </p>
             <h1>{displayConversationTitle(activeConversation?.title)}</h1>
             <p className="chat-panel__intro-copy">
@@ -2170,7 +2759,11 @@ export default function App() {
                 ? "대화는 opencode 실행 엔진을 통해 파일 작업, 명령 실행, 연구 흐름을 처리합니다."
                 : activeSection === "settings"
                   ? "로컬 API/OAuth 연결, opencode 엔진, 자동화 정책을 한 화면에서 관리합니다."
-                  : "긴 작업 Flow, 단계 편집, 실행 로그를 한 화면에서 관제합니다."}
+                  : activeSection === "mcp"
+                    ? "opencode가 사용할 MCP 서버 설정과 안전 경계를 확인합니다."
+                    : activeSection === "skills"
+                      ? "상시 지침, 스킬 카드, Heartbeat 기반 행동 정책을 관리합니다."
+                      : "긴 작업 Flow, 단계 편집, 실행 로그를 한 화면에서 관제합니다."}
             </p>
             {activeConversation ? (
               <p className="chat-panel__intro-copy">
@@ -2192,17 +2785,6 @@ export default function App() {
             <>
               <div className="cockpit-chat-grid">
                 <section className="cockpit-chat-card">
-                  {messages.length === 0 && !pendingAssistantText ? (
-                    <div className="cockpit-chat-card__intro">
-                      <p className="eyebrow">opencode 워크스페이스 관제 에이전트</p>
-                      <h1>{displayConversationTitle(activeConversation?.title)}</h1>
-                      <p>
-                        {activeAgent?.name ?? "기본 에이전트"}가 opencode 실행 엔진으로 세션 워크스페이스와
-                        워크플로우를 처리합니다.
-                        현재 모델은 {activeModelOption?.label ?? activeConversation?.model ?? "선택 안 됨"} 입니다.
-                      </p>
-                    </div>
-                  ) : null}
                   <ChatView
                     changedFiles={changedFiles}
                     error={chatError}
@@ -2210,6 +2792,21 @@ export default function App() {
                     messages={messages}
                     pendingAssistantText={pendingAssistantText}
                   />
+                  <section className={`preflight-strip preflight-strip--${preflightStatus?.ok ? "ok" : "attention"}`} aria-label="실행 전 점검">
+                    <div>
+                      <strong>{preflightStatus?.ok ? "실행 준비 완료" : "실행 전 확인 필요"}</strong>
+                      <span>
+                        {preflightLoading
+                          ? "점검 중..."
+                          : preflightStatus
+                            ? `${preflightStatus.checks.filter((check) => check.status === "error").length} 오류 / ${preflightStatus.checks.filter((check) => check.status === "warn").length} 주의`
+                            : "아직 점검 결과가 없습니다."}
+                      </span>
+                    </div>
+                    <button className="cockpit-mini-button" onClick={() => void refreshPreflight()} type="button">
+                      다시 점검
+                    </button>
+                  </section>
                   {composerControl}
                 </section>
 
@@ -2231,16 +2828,139 @@ export default function App() {
                 />
               </div>
 
-              <CockpitOpsDrawer
-                activeConversation={activeConversation}
-                changedFiles={changedFiles}
-                liveEvents={liveEvents}
-                onOpenWorkspace={() => handleCockpitNavigate("workflow")}
-                platformMetadata={platformMetadata}
-                runEvents={workspaceRunEvents}
-                selectedTaskFlow={selectedTaskFlow}
-                taskFlows={taskFlows}
-              />
+              <section className="cockpit-secondary-stack" aria-label="보조 패널">
+                <FlowDraftPanel
+                  disabled={!activeConversation || !activeAgentId}
+                  draft={flowDraft}
+                  editing={flowDraftEditing}
+                  error={flowDraftError}
+                  loading={flowDraftLoading}
+                  onCancel={() => {
+                    setFlowDraft(null);
+                    setFlowDraftEditing(false);
+                    setFlowDraftError(null);
+                  }}
+                  onDraftChange={setFlowDraft}
+                  onEditingChange={setFlowDraftEditing}
+                  onGenerate={() => {
+                    if (!flowDraftPrompt.trim() && composerText.trim()) {
+                      setFlowDraftPrompt(composerText.trim());
+                    }
+                    void handleGenerateFlowDraft();
+                  }}
+                  onPromptChange={setFlowDraftPrompt}
+                  onSave={() => {
+                    void handleSaveFlowDraft();
+                  }}
+                  prompt={flowDraftPrompt || composerText}
+                />
+
+                <SessionSummaryPanel
+                  draft={sessionSummaryDraft}
+                  editing={summaryEditing}
+                  loading={summaryLoading}
+                  onCancel={() => {
+                    setSummaryEditing(false);
+                    setSessionSummaryDraft(sessionSummary?.summary ?? "");
+                  }}
+                  onDraftChange={setSessionSummaryDraft}
+                  onEdit={() => {
+                    setSummaryEditing(true);
+                    setSessionSummaryDraft(sessionSummary?.summary ?? "");
+                  }}
+                  onRefresh={() => {
+                    void handleRefreshSummary();
+                  }}
+                  onSave={() => {
+                    void handleSaveSummary();
+                  }}
+                  summary={sessionSummary}
+                />
+
+                <details className="cockpit-collapsible-panel">
+                  <summary>
+                    <span>
+                      <strong>서브에이전트</strong>
+                      <small>큰 작업을 작은 조사/검증 세션으로 나눕니다.</small>
+                    </span>
+                    <em>{subagentSessions.length}</em>
+                  </summary>
+                  <SubagentPanel
+                    activeConversation={activeConversation}
+                    onCancelSession={(sessionId) => {
+                      void handleCancelSubagentSession(sessionId);
+                    }}
+                    onCreateSession={(payload) => {
+                      void handleCreateSubagentSession(payload);
+                    }}
+                    onOpenSession={(sessionId) => {
+                      setActiveNavTarget("chat");
+                      setActiveSection("chat");
+                      setActiveConversationId(sessionId);
+                      setChatError(null);
+                      setPendingAssistantText("");
+                      setLiveEvents([]);
+                      setChangedFiles([]);
+                    }}
+                    onRefresh={() => {
+                      if (activeConversationId) {
+                        void refreshSubagentSessions(activeConversationId);
+                      }
+                      if (activeAgentId) {
+                        void refreshAgentTasks(activeAgentId);
+                      }
+                    }}
+                    runs={workspaceRuns}
+                    sessions={subagentSessions}
+                    tasks={tasks}
+                  />
+                </details>
+
+                <details className="cockpit-collapsible-panel">
+                  <summary>
+                    <span>
+                      <strong>실행 로그와 변경 파일</strong>
+                      <small>opencode 이벤트, 확장 상태, 변경된 파일을 확인합니다.</small>
+                    </span>
+                    <em>{workspaceRunEvents.length + liveEvents.length}</em>
+                  </summary>
+                  <CockpitOpsDrawer
+                    activeConversation={activeConversation}
+                    changedFiles={changedFiles}
+                    liveEvents={liveEvents}
+                    onOpenWorkspace={() => handleCockpitNavigate("workflow")}
+                    platformMetadata={platformMetadata}
+                    runEvents={workspaceRunEvents}
+                    selectedTaskFlow={selectedTaskFlow}
+                    taskFlows={taskFlows}
+                  />
+                </details>
+
+                <RunArtifactsPanel
+                  artifacts={runArtifacts}
+                  debug={runDebug}
+                  latestRun={selectedRun}
+                  loading={runDetailLoading}
+                  onClosePreview={() => setArtifactPreview(null)}
+                  onCopyDebug={handleCopyDebugBundle}
+                  onCopyReport={(artifactId) => {
+                    void handleCopyReportArtifact(artifactId);
+                  }}
+                  onCreateFollowUpFlow={(artifactId) => {
+                    void handleCreateFollowUpFlowFromReport(artifactId);
+                  }}
+                  onCreateFollowUpTask={(artifactId) => {
+                    void handleCreateFollowUpTaskFromReport(artifactId);
+                  }}
+                  onDebug={() => {
+                    void handleOpenRunDebug();
+                  }}
+                  onPreview={(artifactId) => {
+                    void handlePreviewArtifact(artifactId);
+                  }}
+                  preview={artifactPreview}
+                />
+              </section>
             </>
           ) : activeSection === "workflow" ? (
             <CockpitSectionView
@@ -2265,6 +2985,23 @@ export default function App() {
               onNavigate={handleCockpitNavigate}
               onOpenAgentSettings={handleOpenAgentSettings}
               onOpenProviderSettings={handleOpenProviderSettings}
+              onOpenRun={(runId) => {
+                manualRunSelectionRef.current = true;
+                setSelectedRunId(runId);
+                setAppNotice("Run 로그를 선택했습니다.");
+                if (activeConversationId) {
+                  void refreshWorkspaceRunEvents(activeConversationId, runId);
+                }
+              }}
+              onOpenArtifacts={(runId) => {
+                manualRunSelectionRef.current = true;
+                setSelectedRunId(runId);
+                setAppNotice("Run 산출물을 선택했습니다. 채팅 화면의 산출물 패널에서 확인하세요.");
+                if (activeConversationId) {
+                  void refreshRunArtifacts(activeConversationId, runId);
+                  void handleOpenRunDebug(runId);
+                }
+              }}
               onRefreshPlatformMetadata={() => {
                 void refreshPlatformMetadata(activeAgentId);
               }}
@@ -2291,9 +3028,64 @@ export default function App() {
               runEvents={workspaceRunEvents}
               runs={workspaceRuns}
               selectedTaskFlow={selectedTaskFlow}
-              target={activeWorkspaceTarget}
+              preflight={preflightStatus}
+              preflightLoading={preflightLoading}
+              target="workflow"
               taskFlows={taskFlows}
               tasks={tasks}
+              onRefreshPreflight={() => {
+                void refreshPreflight();
+              }}
+            />
+          ) : activeSection === "mcp" || activeSection === "skills" ? (
+            <ExtensionsSectionView
+              activeAgent={activeAgent}
+              activeConversation={activeConversation}
+              engineStatus={engineStatus}
+              heartbeat={agentHeartbeat}
+              mcpCatalog={mcpCatalog}
+              mcpLoading={mcpLoading}
+              mcpStatus={mcpStatus}
+              mcpTestRunPendingId={mcpTestRunPendingId}
+              skillActionPendingId={skillActionPendingId}
+              skillTemplates={skillTemplates}
+              skillTemplatesLoading={skillTemplatesLoading}
+              onApplySkillHeartbeat={(template) => {
+                void handleApplySkillHeartbeat(template);
+              }}
+              onApplySkillStandingOrders={(template) => {
+                void handleApplySkillStandingOrders(template);
+              }}
+              onCreateMcpTestRun={(server) => {
+                void handleCreateMcpTestRun(server);
+              }}
+              onCreateSkillFlow={(template) => {
+                void handleCreateSkillFlow(template);
+              }}
+              onInsertSkillPrompt={handleInsertSkillPrompt}
+              onNavigate={handleCockpitNavigate}
+              onOpenAgentSettings={handleOpenAgentSettings}
+              onOpenProviderSettings={handleOpenProviderSettings}
+              onRefreshEngineStatus={() => {
+                void refreshEngineStatus();
+              }}
+              onRefreshMcpMetadata={() => {
+                void refreshMcpMetadata();
+              }}
+              onRefreshPlatformMetadata={() => {
+                void refreshPlatformMetadata(activeAgentId);
+              }}
+              onRefreshSkillTemplates={() => {
+                void refreshSkillTemplates();
+              }}
+              onTriggerHeartbeat={() => {
+                void handleTriggerHeartbeat();
+              }}
+              platformMetadata={platformMetadata}
+              providers={providers}
+              soul={agentSoul}
+              standingOrders={standingOrders}
+              target={activeSection}
             />
           ) : (
             <SettingsSectionView

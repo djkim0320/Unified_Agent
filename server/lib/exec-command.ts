@@ -2,8 +2,10 @@ import { spawn } from "node:child_process";
 import {
   appendCappedText,
   createAbortError,
+  createProcessTreeLaunchOptions,
   createSanitizedEnvironment,
   isShellProgram,
+  spawnedAsProcessGroup,
   terminateProcessTree,
 } from "./process-control.js";
 
@@ -63,9 +65,10 @@ export async function runWorkspaceCommand(params: {
       cwd: params.cwd,
       env: createSanitizedEnvironment(),
       shell: false,
-      windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
+      ...createProcessTreeLaunchOptions(),
     });
+    const processGroup = spawnedAsProcessGroup(child);
 
     let stdout = "";
     let stderr = "";
@@ -81,7 +84,7 @@ export async function runWorkspaceCommand(params: {
       settled = true;
       clearTimeout(timeout);
       params.signal?.removeEventListener("abort", abortListener);
-      await terminateProcessTree(child.pid);
+      await terminateProcessTree(child.pid, { processGroup });
       reject(error);
     };
 

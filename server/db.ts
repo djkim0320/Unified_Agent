@@ -3,8 +3,63 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createSecretBox } from "./lib/crypto.js";
+import { buildFlowReportArtifact, buildRunReportArtifact } from "./lib/run-report.js";
+import {
+  configureDatabaseConnection,
+  ensureSchemaMigrationsTable,
+  now,
+  parseEventRetentionLimit,
+  recordSchemaMigration,
+  runSchemaMigration,
+} from "./db/migrations.js";
+import {
+  createArtifactsSql,
+  createAutomationRulesSql,
+  createConversationsSql,
+  createHeartbeatLogsSql,
+  createSessionSummariesSql,
+  createTaskEventsSql,
+  createTaskFlowsSql,
+  createTaskFlowStepsSql,
+  createTasksSql,
+  createWorkspaceRunEventsSql,
+  createWorkspaceRunsSql,
+} from "./db/schema.js";
+import {
+  mapAccount,
+  mapAgent,
+  mapArtifact,
+  mapAutomationRule,
+  mapConversation,
+  mapHeartbeatLog,
+  mapMessage,
+  mapSessionSummary,
+  mapTask,
+  mapTaskEvent,
+  mapTaskFlow,
+  mapTaskFlowStep,
+  mapWorkspaceRun,
+  mapWorkspaceRunEvent,
+  type AccountRow,
+  type AgentRow,
+  type ArtifactRow,
+  type AutomationRuleRow,
+  type ConversationRow,
+  type HeartbeatLogRow,
+  type MessageRow,
+  type SecretRow,
+  type SessionSummaryRow,
+  type TaskEventRow,
+  type TaskFlowRow,
+  type TaskFlowStepRow,
+  type TaskRow,
+  type WorkspaceRunEventRow,
+  type WorkspaceRunRow,
+} from "./db/mappers.js";
 import type {
   AgentRecord,
+  ArtifactKind,
+  ArtifactRecord,
   AutomationRuleRecord,
   ConversationRecord,
   HeartbeatLogRecord,
@@ -16,6 +71,7 @@ import type {
   ReasoningLevel,
   RunCheckpoint,
   SessionKind,
+  SessionSummaryRecord,
   TaskKind,
   TaskFlowRecord,
   TaskFlowStatus,
@@ -31,451 +87,28 @@ import type {
   WorkspaceRunStatus,
 } from "./types.js";
 
-type SecretRow = {
-  provider_kind: ProviderKind;
-  encrypted_blob: string;
-};
-
-type AccountRow = {
-  provider_kind: ProviderKind;
-  display_name: string | null;
-  email: string | null;
-  account_id: string | null;
-  status: ProviderAccountRecord["status"];
-  metadata_json: string;
-  created_at: number;
-  updated_at: number;
-};
-
-type AgentRow = {
-  id: string;
-  name: string;
-  description: string | null;
-  default_provider_kind: ProviderKind;
-  default_model: string;
-  default_reasoning_level: ReasoningLevel;
-  created_at: number;
-  updated_at: number;
-};
-
-type ConversationRow = {
-  id: string;
-  agent_id: string;
-  channel_kind: ConversationRecord["channelKind"];
-  session_kind: SessionKind;
-  parent_conversation_id: string | null;
-  owner_run_id: string | null;
-  title: string;
-  provider_kind: ProviderKind;
-  model: string;
-  reasoning_level: ConversationRecord["reasoningLevel"];
-  created_at: number;
-  updated_at: number;
-};
-
-type MessageRow = {
-  id: string;
-  conversation_id: string;
-  role: MessageRecord["role"];
-  content: string;
-  created_at: number;
-};
-
-type WorkspaceRunRow = {
-  id: string;
-  conversation_id: string;
-  task_id: string | null;
-  parent_run_id: string | null;
-  provider_kind: ProviderKind;
-  model: string;
-  user_message: string;
-  status: WorkspaceRunStatus;
-  phase: WorkspaceRunPhase;
-  checkpoint_json: string | null;
-  resume_token: string | null;
-  created_at: number;
-  updated_at: number;
-};
-
-type WorkspaceRunEventRow = {
-  id: string;
-  run_id: string;
-  event_type: WorkspaceRunEventRecord["eventType"];
-  payload_json: string;
-  created_at: number;
-};
-
-type TaskRow = {
-  id: string;
-  agent_id: string;
-  conversation_id: string;
-  task_kind: TaskKind;
-  task_flow_id: string | null;
-  flow_step_key: string | null;
-  origin_run_id: string | null;
-  automation_rule_id: string | null;
-  parent_task_id: string | null;
-  nesting_depth: number;
-  title: string;
-  prompt: string;
-  provider_kind: ProviderKind;
-  model: string;
-  reasoning_level: ReasoningLevel;
-  status: TaskStatus;
-  run_id: string | null;
-  result_text: string | null;
-  created_at: number;
-  started_at: number | null;
-  updated_at: number;
-  completed_at: number | null;
-  scheduled_for: number | null;
-};
-
-type TaskFlowRow = {
-  id: string;
-  agent_id: string;
-  conversation_id: string;
-  origin_run_id: string | null;
-  trigger_source: TaskFlowTriggerSource;
-  title: string;
-  status: TaskFlowStatus;
-  result_summary: string | null;
-  error_text: string | null;
-  created_at: number;
-  updated_at: number;
-  completed_at: number | null;
-};
-
-type TaskFlowStepRow = {
-  id: string;
-  flow_id: string;
-  task_id: string | null;
-  step_key: string;
-  dependency_step_key: string | null;
-  position: number;
-  title: string;
-  prompt: string;
-  status: TaskFlowStepStatus;
-  created_at: number;
-  updated_at: number;
-  completed_at: number | null;
-};
-
-type TaskEventRow = {
-  id: string;
-  task_id: string;
-  event_type: TaskEventRecord["eventType"];
-  payload_json: string;
-  created_at: number;
-};
-
-type HeartbeatLogRow = {
-  id: string;
-  agent_id: string;
-  conversation_id: string;
-  task_id: string | null;
-  trigger_source: HeartbeatTriggerSource;
-  status: HeartbeatLogRecord["status"];
-  summary: string | null;
-  error_text: string | null;
-  triggered_at: number;
-  started_at: number | null;
-  completed_at: number | null;
-  updated_at: number;
-};
-
-type AutomationRuleRow = {
-  id: string;
-  agent_id: string;
-  conversation_id: string;
-  title: string;
-  prompt: string;
-  provider_kind: ProviderKind;
-  model: string;
-  reasoning_level: ReasoningLevel;
-  enabled: number;
-  interval_minutes: number;
-  next_run_at: number;
-  last_run_at: number | null;
-  last_task_id: string | null;
-  run_count: number;
-  created_at: number;
-  updated_at: number;
-};
-
-const WORKSPACE_RUN_EVENT_TYPES = [
-  "status",
-  "tool_call",
-  "tool_result",
-  "error",
-  "run_complete",
-  "run_failed",
-  "run_cancelled",
-];
-
-const TASK_EVENT_TYPES = [
-  "queued",
-  "running",
-  "status",
-  "completed",
-  "failed",
-  "timed_out",
-  "cancelled",
-  "result_delivered",
-];
-
-const HEARTBEAT_LOG_STATUSES = ["queued", "running", "completed", "failed", "cancelled"] as const;
-const HEARTBEAT_TRIGGER_SOURCES = ["manual", "scheduler"] as const;
-const WORKSPACE_RUN_PHASES = [
-  "accepted",
-  "planning",
-  "tool_execution",
-  "synthesizing",
-  "completed",
-  "failed",
-  "cancelled",
-] as const;
-const TASK_FLOW_STATUSES = ["queued", "running", "completed", "failed", "cancelled"] as const;
-const TASK_FLOW_STEP_STATUSES = [
-  "queued",
-  "running",
-  "completed",
-  "failed",
-  "cancelled",
-  "skipped",
-] as const;
-const TASK_FLOW_TRIGGER_SOURCES = ["manual", "schedule", "event_hook"] as const;
 export const DEFAULT_AGENT_ID = "default-agent";
 export const DEFAULT_CONVERSATION_TITLE = "\uC0C8 \uCC44\uD305";
-
-function configureDatabaseConnection(db: Database.Database) {
-  db.pragma("journal_mode = WAL");
-  db.pragma("busy_timeout = 5000");
-  db.pragma("foreign_keys = ON");
-}
-
-function ensureSchemaMigrationsTable(db: Database.Database) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version INTEGER PRIMARY KEY,
-      name TEXT NOT NULL,
-      applied_at INTEGER NOT NULL
-    );
-  `);
-}
-
-function hasSchemaMigration(db: Database.Database, version: number) {
-  const row = db
-    .prepare(`SELECT version FROM schema_migrations WHERE version = ?`)
-    .get(version) as { version: number } | undefined;
-  return Boolean(row);
-}
-
-function recordSchemaMigration(db: Database.Database, version: number, name: string) {
-  db.prepare(
-    `INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
-  ).run(version, name, now());
-}
-
-function runSchemaMigration(
-  db: Database.Database,
-  version: number,
-  name: string,
-  migrate: () => void,
-) {
-  if (hasSchemaMigration(db, version)) {
-    return;
-  }
-  migrate();
-  recordSchemaMigration(db, version, name);
-}
-
-function now() {
-  return Date.now();
-}
-
-function createWorkspaceRunsSql(tableName: string, options?: { ifNotExists?: boolean }) {
-  const createClause = options?.ifNotExists === false ? "CREATE TABLE" : "CREATE TABLE IF NOT EXISTS";
-  return `
-    ${createClause} ${tableName} (
-      id TEXT PRIMARY KEY,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      parent_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
-      provider_kind TEXT NOT NULL,
-      model TEXT NOT NULL,
-      user_message TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'cancelled')),
-      phase TEXT NOT NULL CHECK(phase IN ('${WORKSPACE_RUN_PHASES.join("', '")}')),
-      checkpoint_json TEXT,
-      resume_token TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createWorkspaceRunEventsSql(tableName: string, options?: { ifNotExists?: boolean }) {
-  const createClause = options?.ifNotExists === false ? "CREATE TABLE" : "CREATE TABLE IF NOT EXISTS";
-  return `
-    ${createClause} ${tableName} (
-      id TEXT PRIMARY KEY,
-      run_id TEXT NOT NULL REFERENCES workspace_runs(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL CHECK(
-        event_type IN ('${WORKSPACE_RUN_EVENT_TYPES.join("', '")}')
-      ),
-      payload_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createConversationsSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-      channel_kind TEXT NOT NULL DEFAULT 'webchat',
-      session_kind TEXT NOT NULL DEFAULT 'primary',
-      parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
-      owner_run_id TEXT,
-      title TEXT NOT NULL,
-      provider_kind TEXT NOT NULL,
-      model TEXT NOT NULL,
-      reasoning_level TEXT NOT NULL DEFAULT 'medium',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createTasksSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      task_kind TEXT NOT NULL DEFAULT 'detached' CHECK(task_kind IN ('detached', 'heartbeat', 'continuation', 'scheduled', 'subagent', 'flow_step')),
-      task_flow_id TEXT REFERENCES task_flows(id) ON DELETE SET NULL,
-      flow_step_key TEXT,
-      origin_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
-      automation_rule_id TEXT REFERENCES automation_rules(id) ON DELETE SET NULL,
-      parent_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      nesting_depth INTEGER NOT NULL DEFAULT 0,
-      title TEXT NOT NULL,
-      prompt TEXT NOT NULL,
-      provider_kind TEXT NOT NULL,
-      model TEXT NOT NULL,
-      reasoning_level TEXT NOT NULL DEFAULT 'medium',
-      status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'completed', 'failed', 'timed_out', 'cancelled')),
-      run_id TEXT,
-      result_text TEXT,
-      created_at INTEGER NOT NULL,
-      started_at INTEGER,
-      updated_at INTEGER NOT NULL,
-      completed_at INTEGER,
-      scheduled_for INTEGER
-    );
-  `;
-}
-
-function createTaskFlowsSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      origin_run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
-      trigger_source TEXT NOT NULL CHECK(trigger_source IN ('${TASK_FLOW_TRIGGER_SOURCES.join("', '")}')),
-      title TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('${TASK_FLOW_STATUSES.join("', '")}')),
-      result_summary TEXT,
-      error_text TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      completed_at INTEGER
-    );
-  `;
-}
-
-function createTaskFlowStepsSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      flow_id TEXT NOT NULL REFERENCES task_flows(id) ON DELETE CASCADE,
-      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      step_key TEXT NOT NULL,
-      dependency_step_key TEXT,
-      position INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      prompt TEXT NOT NULL,
-      status TEXT NOT NULL CHECK(status IN ('${TASK_FLOW_STEP_STATUSES.join("', '")}')),
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      completed_at INTEGER
-    );
-  `;
-}
-
-function createHeartbeatLogsSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      trigger_source TEXT NOT NULL CHECK(trigger_source IN ('${HEARTBEAT_TRIGGER_SOURCES.join("', '")}')),
-      status TEXT NOT NULL CHECK(status IN ('${HEARTBEAT_LOG_STATUSES.join("', '")}')),
-      summary TEXT,
-      error_text TEXT,
-      triggered_at INTEGER NOT NULL,
-      started_at INTEGER,
-      completed_at INTEGER,
-      updated_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createAutomationRulesSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      prompt TEXT NOT NULL,
-      provider_kind TEXT NOT NULL,
-      model TEXT NOT NULL,
-      reasoning_level TEXT NOT NULL DEFAULT 'medium',
-      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
-      interval_minutes INTEGER NOT NULL CHECK(interval_minutes >= 1),
-      next_run_at INTEGER NOT NULL,
-      last_run_at INTEGER,
-      last_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-      run_count INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-  `;
-}
-
-function createTaskEventsSql(tableName: string) {
-  return `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id TEXT PRIMARY KEY,
-      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-      event_type TEXT NOT NULL CHECK(event_type IN ('${TASK_EVENT_TYPES.join("', '")}')),
-      payload_json TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-  `;
-}
 
 function tableSql(db: Database.Database, tableName: string) {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(tableName) as { sql: string } | undefined;
   return row?.sql ?? "";
+}
+
+function normalizeArtifactPath(relativePath: string) {
+  const normalized = relativePath.replace(/\\/g, "/").trim();
+  if (
+    !normalized ||
+    normalized.includes("\0") ||
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:/.test(normalized) ||
+    normalized.split("/").some((part) => part === "..")
+  ) {
+    throw new Error("Artifact path must be relative to the session workspace.");
+  }
+  return normalized;
 }
 
 function migrateWorkspaceTables(db: Database.Database) {
@@ -815,6 +448,8 @@ export function createStore(dataDir: string) {
   const dbPath = path.join(dataDir, "chat.sqlite");
   const db = new Database(dbPath);
   const secrets = createSecretBox(dataDir);
+  const maxRunEventsPerRun = parseEventRetentionLimit("AETHEROPS_MAX_RUN_EVENTS_PER_RUN");
+  const maxTaskEventsPerTask = parseEventRetentionLimit("AETHEROPS_MAX_TASK_EVENTS_PER_TASK");
 
   configureDatabaseConnection(db);
   ensureSchemaMigrationsTable(db);
@@ -871,6 +506,10 @@ export function createStore(dataDir: string) {
 
     ${createWorkspaceRunEventsSql("workspace_run_events")}
 
+    ${createSessionSummariesSql("session_summaries")}
+
+    ${createArtifactsSql("artifacts")}
+
     ${createHeartbeatLogsSql("heartbeat_logs")}
 
     ${createAutomationRulesSql("automation_rules")}
@@ -913,12 +552,22 @@ export function createStore(dataDir: string) {
   runSchemaMigration(db, 10, "automation_rules", () => {
     migrateAutomationRuleColumns(db);
   });
+  runSchemaMigration(db, 11, "session_summaries_and_artifacts", () => {
+    db.exec(`
+      ${createSessionSummariesSql("session_summaries")}
+      ${createArtifactsSql("artifacts")}
+    `);
+  });
   migrateAutomationRuleColumns(db);
   db.exec(`
     CREATE INDEX IF NOT EXISTS automation_rules_agent_due_idx
       ON automation_rules(agent_id, enabled, next_run_at);
     CREATE INDEX IF NOT EXISTS tasks_automation_rule_status_idx
       ON tasks(automation_rule_id, status);
+    CREATE INDEX IF NOT EXISTS artifacts_conversation_run_idx
+      ON artifacts(conversation_id, run_id, created_at);
+    CREATE INDEX IF NOT EXISTS artifacts_run_path_idx
+      ON artifacts(run_id, path);
   `);
 
   const upsertProviderAccount = db.prepare(`
@@ -1027,6 +676,43 @@ export function createStore(dataDir: string) {
     );
   `);
 
+  const upsertSessionSummaryStmt = db.prepare(`
+    INSERT INTO session_summaries (
+      conversation_id, summary, decisions_json, open_questions_json, next_actions_json, created_at, updated_at
+    ) VALUES (
+      @conversation_id, @summary, @decisions_json, @open_questions_json, @next_actions_json, @created_at, @updated_at
+    )
+    ON CONFLICT(conversation_id) DO UPDATE SET
+      summary = excluded.summary,
+      decisions_json = excluded.decisions_json,
+      open_questions_json = excluded.open_questions_json,
+      next_actions_json = excluded.next_actions_json,
+      updated_at = excluded.updated_at;
+  `);
+
+  const insertArtifactStmt = db.prepare(`
+    INSERT INTO artifacts (
+      id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+    ) VALUES (
+      @id, @agent_id, @conversation_id, @run_id, @task_id, @kind, @title, @path, @summary, @metadata_json, @created_at, @updated_at
+    );
+  `);
+
+  const deleteRunFileArtifactsStmt = db.prepare(`
+    DELETE FROM artifacts
+    WHERE run_id = ? AND kind = 'file';
+  `);
+
+  const deleteRunReportArtifactsStmt = db.prepare(`
+    DELETE FROM artifacts
+    WHERE run_id = ? AND kind = 'report';
+  `);
+
+  const deleteFlowReportArtifactsStmt = db.prepare(`
+    DELETE FROM artifacts
+    WHERE kind = 'report' AND metadata_json LIKE ?;
+  `);
+
   const insertTaskStmt = db.prepare(`
     INSERT INTO tasks (
       id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
@@ -1109,6 +795,30 @@ export function createStore(dataDir: string) {
     VALUES (@id, @task_id, @event_type, @payload_json, @created_at);
   `);
 
+  const pruneWorkspaceRunEventsStmt = db.prepare(`
+    DELETE FROM workspace_run_events
+    WHERE run_id = @run_id
+      AND id IN (
+        SELECT id
+        FROM workspace_run_events
+        WHERE run_id = @run_id
+        ORDER BY created_at DESC, id DESC
+        LIMIT -1 OFFSET @limit
+      );
+  `);
+
+  const pruneTaskEventsStmt = db.prepare(`
+    DELETE FROM task_events
+    WHERE task_id = @task_id
+      AND id IN (
+        SELECT id
+        FROM task_events
+        WHERE task_id = @task_id
+        ORDER BY created_at DESC, id DESC
+        LIMIT -1 OFFSET @limit
+      );
+  `);
+
   const insertHeartbeatLogStmt = db.prepare(`
     INSERT INTO heartbeat_logs (
       id, agent_id, conversation_id, task_id, trigger_source, status, summary, error_text,
@@ -1165,6 +875,26 @@ export function createStore(dataDir: string) {
     WHERE id = @id;
   `);
 
+  function pruneWorkspaceRunEvents(runId: string) {
+    if (maxRunEventsPerRun == null) {
+      return;
+    }
+    pruneWorkspaceRunEventsStmt.run({
+      run_id: runId,
+      limit: maxRunEventsPerRun,
+    });
+  }
+
+  function pruneTaskEvents(taskId: string) {
+    if (maxTaskEventsPerTask == null) {
+      return;
+    }
+    pruneTaskEventsStmt.run({
+      task_id: taskId,
+      limit: maxTaskEventsPerTask,
+    });
+  }
+
   const appendMessageTx = db.transaction((input: {
     id: string;
     conversationId: string;
@@ -1197,6 +927,7 @@ export function createStore(dataDir: string) {
       created_at: input.createdAt,
     });
     db.prepare(`UPDATE workspace_runs SET updated_at = ? WHERE id = ?`).run(input.createdAt, input.runId);
+    pruneWorkspaceRunEvents(input.runId);
   });
 
   const finalizeRunTx = db.transaction((input: {
@@ -1223,200 +954,11 @@ export function createStore(dataDir: string) {
         payload_json: JSON.stringify(input.payload),
         created_at: input.timestamp,
       });
+      pruneWorkspaceRunEvents(input.runId);
     }
 
     return result.changes > 0;
   });
-
-  function mapConversation(row: ConversationRow): ConversationRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      channelKind: row.channel_kind,
-      sessionKind: row.session_kind,
-      parentConversationId: row.parent_conversation_id,
-      ownerRunId: row.owner_run_id,
-      title: row.title,
-      providerKind: row.provider_kind,
-      model: row.model,
-      reasoningLevel: row.reasoning_level,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapAgent(row: AgentRow): AgentRecord {
-    return {
-      id: row.id,
-      name: row.name,
-      providerKind: row.default_provider_kind,
-      model: row.default_model,
-      reasoningLevel: row.default_reasoning_level,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapMessage(row: MessageRow): MessageRecord {
-    return {
-      id: row.id,
-      conversationId: row.conversation_id,
-      role: row.role,
-      content: row.content,
-      createdAt: row.created_at,
-    };
-  }
-
-  function mapAccount(row: AccountRow): ProviderAccountRecord {
-    return {
-      providerKind: row.provider_kind,
-      displayName: row.display_name,
-      email: row.email,
-      accountId: row.account_id,
-      status: row.status,
-      metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapWorkspaceRun(row: WorkspaceRunRow): WorkspaceRunRecord {
-    return {
-      id: row.id,
-      conversationId: row.conversation_id,
-      taskId: row.task_id,
-      parentRunId: row.parent_run_id,
-      providerKind: row.provider_kind,
-      model: row.model,
-      userMessage: row.user_message,
-      status: row.status,
-      phase: row.phase,
-      checkpoint: row.checkpoint_json ? (JSON.parse(row.checkpoint_json) as RunCheckpoint) : null,
-      resumeToken: row.resume_token,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapWorkspaceRunEvent(row: WorkspaceRunEventRow): WorkspaceRunEventRecord {
-    return {
-      id: row.id,
-      runId: row.run_id,
-      eventType: row.event_type,
-      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
-      createdAt: row.created_at,
-    };
-  }
-
-  function mapTask(row: TaskRow): TaskRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      conversationId: row.conversation_id,
-      taskKind: row.task_kind,
-      taskFlowId: row.task_flow_id,
-      flowStepKey: row.flow_step_key,
-      originRunId: row.origin_run_id,
-      automationRuleId: row.automation_rule_id,
-      parentTaskId: row.parent_task_id,
-      nestingDepth: row.nesting_depth,
-      title: row.title,
-      prompt: row.prompt,
-      providerKind: row.provider_kind,
-      model: row.model,
-      reasoningLevel: row.reasoning_level,
-      status: row.status,
-      runId: row.run_id,
-      resultText: row.result_text,
-      createdAt: row.created_at,
-      startedAt: row.started_at,
-      updatedAt: row.updated_at,
-      completedAt: row.completed_at,
-      scheduledFor: row.scheduled_for,
-    };
-  }
-
-  function mapTaskEvent(row: TaskEventRow): TaskEventRecord {
-    return {
-      id: row.id,
-      taskId: row.task_id,
-      eventType: row.event_type,
-      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
-      createdAt: row.created_at,
-    };
-  }
-
-  function mapHeartbeatLog(row: HeartbeatLogRow): HeartbeatLogRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      conversationId: row.conversation_id,
-      taskId: row.task_id,
-      triggerSource: row.trigger_source,
-      status: row.status,
-      summary: row.summary,
-      errorText: row.error_text,
-      triggeredAt: row.triggered_at,
-      startedAt: row.started_at,
-      completedAt: row.completed_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapAutomationRule(row: AutomationRuleRow): AutomationRuleRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      conversationId: row.conversation_id,
-      title: row.title,
-      prompt: row.prompt,
-      providerKind: row.provider_kind,
-      model: row.model,
-      reasoningLevel: row.reasoning_level,
-      enabled: row.enabled === 1,
-      intervalMinutes: row.interval_minutes,
-      nextRunAt: row.next_run_at,
-      lastRunAt: row.last_run_at,
-      lastTaskId: row.last_task_id,
-      runCount: row.run_count,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-  }
-
-  function mapTaskFlow(row: TaskFlowRow): TaskFlowRecord {
-    return {
-      id: row.id,
-      agentId: row.agent_id,
-      conversationId: row.conversation_id,
-      originRunId: row.origin_run_id,
-      triggerSource: row.trigger_source,
-      title: row.title,
-      status: row.status,
-      resultSummary: row.result_summary,
-      errorText: row.error_text,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      completedAt: row.completed_at,
-    };
-  }
-
-  function mapTaskFlowStep(row: TaskFlowStepRow): TaskFlowStepRecord {
-    return {
-      id: row.id,
-      flowId: row.flow_id,
-      taskId: row.task_id,
-      stepKey: row.step_key,
-      dependencyStepKey: row.dependency_step_key,
-      position: row.position,
-      title: row.title,
-      prompt: row.prompt,
-      status: row.status,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      completedAt: row.completed_at,
-    };
-  }
 
   const store = {
     dbPath,
@@ -1698,6 +1240,7 @@ export function createStore(dataDir: string) {
           payload_json: JSON.stringify({ message: "\uC791\uC5C5\uC744 \uC2DC\uC791\uD588\uC2B5\uB2C8\uB2E4." }),
           created_at: timestamp,
         });
+        pruneWorkspaceRunEvents(id);
       })();
       return store.getWorkspaceRun(id)!;
     },
@@ -1783,6 +1326,20 @@ export function createStore(dataDir: string) {
         payload,
         timestamp: now(),
       });
+      if (finalized) {
+        try {
+          store.createRunReportArtifact(id);
+        } catch (error) {
+          store.appendWorkspaceRunEvent({
+            runId: id,
+            eventType: "error",
+            payload: {
+              phase: "report_generation_failed",
+              error: error instanceof Error ? error.message : "Run report generation failed.",
+            },
+          });
+        }
+      }
       return {
         finalized,
         run: store.getWorkspaceRun(id),
@@ -1823,6 +1380,394 @@ export function createStore(dataDir: string) {
         )
         .all(conversationId, runId) as WorkspaceRunEventRow[];
       return rows.map(mapWorkspaceRunEvent);
+    },
+
+    getSessionSummary(conversationId: string): SessionSummaryRecord | null {
+      const row = db
+        .prepare(
+          `SELECT conversation_id, summary, decisions_json, open_questions_json, next_actions_json, created_at, updated_at
+           FROM session_summaries
+           WHERE conversation_id = ?`,
+        )
+        .get(conversationId) as SessionSummaryRow | undefined;
+      return row ? mapSessionSummary(row) : null;
+    },
+
+    saveSessionSummary(input: {
+      conversationId: string;
+      summary: string;
+      decisions?: string[];
+      openQuestions?: string[];
+      nextActions?: string[];
+    }): SessionSummaryRecord {
+      if (!store.getConversation(input.conversationId)) {
+        throw new Error("Conversation not found.");
+      }
+      const existing = store.getSessionSummary(input.conversationId);
+      const timestamp = now();
+      upsertSessionSummaryStmt.run({
+        conversation_id: input.conversationId,
+        summary: input.summary,
+        decisions_json: JSON.stringify(input.decisions ?? []),
+        open_questions_json: JSON.stringify(input.openQuestions ?? []),
+        next_actions_json: JSON.stringify(input.nextActions ?? []),
+        created_at: existing?.createdAt ?? timestamp,
+        updated_at: timestamp,
+      });
+      return store.getSessionSummary(input.conversationId)!;
+    },
+
+    createRunReportArtifact(runId: string): ArtifactRecord | null {
+      const run = store.getWorkspaceRun(runId);
+      if (!run || run.status === "running") {
+        return null;
+      }
+      const conversation = store.getConversation(run.conversationId);
+      if (!conversation) {
+        return null;
+      }
+      const task = run.taskId ? store.getTask(run.taskId) : null;
+      const events = store.listWorkspaceRunEvents(run.conversationId, run.id);
+      const artifacts = store
+        .listArtifactsForRun(run.conversationId, run.id)
+        .filter((artifact) => artifact.kind !== "report");
+      const report = buildRunReportArtifact({
+        run,
+        conversation,
+        task,
+        events,
+        artifacts,
+      });
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.transaction(() => {
+        deleteRunReportArtifactsStmt.run(run.id);
+        insertArtifactStmt.run({
+          id,
+          agent_id: conversation.agentId,
+          conversation_id: run.conversationId,
+          run_id: run.id,
+          task_id: run.taskId,
+          kind: "report" satisfies ArtifactKind,
+          title: report.title,
+          path: null,
+          summary: report.summary,
+          metadata_json: JSON.stringify(report.metadata),
+          created_at: timestamp,
+          updated_at: timestamp,
+        });
+      })();
+      return store.getArtifact(id);
+    },
+
+    createFlowReportArtifact(flowId: string): ArtifactRecord | null {
+      const flow = store.getTaskFlow(flowId);
+      if (!flow || flow.status !== "completed") {
+        return null;
+      }
+      const conversation = store.getConversation(flow.conversationId);
+      if (!conversation) {
+        return null;
+      }
+      const steps = store.listTaskFlowSteps(flow.id).map((step) => {
+        const task = step.taskId ? store.getTask(step.taskId) : null;
+        const run = task?.runId ? store.getWorkspaceRun(task.runId) : null;
+        const events = run ? store.listWorkspaceRunEvents(run.conversationId, run.id) : [];
+        const artifacts = run ? store.listArtifactsForRun(run.conversationId, run.id) : [];
+        return {
+          step,
+          task,
+          run,
+          events,
+          artifacts,
+        };
+      });
+      const report = buildFlowReportArtifact({
+        flow,
+        conversation,
+        steps,
+      });
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.transaction(() => {
+        deleteFlowReportArtifactsStmt.run(`%"flowId":"${flow.id}"%`);
+        insertArtifactStmt.run({
+          id,
+          agent_id: flow.agentId,
+          conversation_id: flow.conversationId,
+          run_id: null,
+          task_id: null,
+          kind: "report" satisfies ArtifactKind,
+          title: report.title,
+          path: null,
+          summary: report.summary,
+          metadata_json: JSON.stringify(report.metadata),
+          created_at: timestamp,
+          updated_at: timestamp,
+        });
+      })();
+      return store.getArtifact(id);
+    },
+
+    getLatestFlowReportArtifact(flowId: string): ArtifactRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+           FROM artifacts
+           WHERE kind = 'report' AND metadata_json LIKE ?
+           ORDER BY created_at DESC
+           LIMIT 1`,
+        )
+        .get(`%"flowId":"${flowId}"%`) as ArtifactRow | undefined;
+      return row ? mapArtifact(row) : null;
+    },
+
+    createArtifactsForRun(input: {
+      agentId: string;
+      conversationId: string;
+      runId: string;
+      taskId?: string | null;
+      changedFiles: string[];
+    }): ArtifactRecord[] {
+      const run = store.getWorkspaceRunForConversation(input.conversationId, input.runId);
+      if (!run) {
+        throw new Error("Workspace run not found.");
+      }
+      const uniquePaths = [...new Set(input.changedFiles.map(normalizeArtifactPath))];
+      const timestamp = now();
+      db.transaction(() => {
+        deleteRunFileArtifactsStmt.run(input.runId);
+        for (const filePath of uniquePaths) {
+          insertArtifactStmt.run({
+            id: crypto.randomUUID(),
+            agent_id: input.agentId,
+            conversation_id: input.conversationId,
+            run_id: input.runId,
+            task_id: input.taskId ?? run.taskId ?? null,
+            kind: "file" satisfies ArtifactKind,
+            title: path.basename(filePath),
+            path: filePath,
+            summary: `Changed file from opencode run ${input.runId}.`,
+            metadata_json: JSON.stringify({ source: "opencode.changedFiles" }),
+            created_at: timestamp,
+            updated_at: timestamp,
+          });
+        }
+      })();
+      return store.listArtifactsForRun(input.conversationId, input.runId);
+    },
+
+    listArtifactsForRun(conversationId: string, runId: string): ArtifactRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+           FROM artifacts
+           WHERE conversation_id = ? AND run_id = ?
+           ORDER BY created_at ASC, title ASC`,
+        )
+        .all(conversationId, runId) as ArtifactRow[];
+      return rows.map(mapArtifact);
+    },
+
+    getArtifact(artifactId: string): ArtifactRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+           FROM artifacts
+           WHERE id = ?`,
+        )
+        .get(artifactId) as ArtifactRow | undefined;
+      return row ? mapArtifact(row) : null;
+    },
+
+    countArtifactsForRun(conversationId: string, runId: string): number {
+      const row = db
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM artifacts
+           WHERE conversation_id = ? AND run_id = ?`,
+        )
+        .get(conversationId, runId) as { count: number };
+      return row.count;
+    },
+
+    recoverStaleRunningWork() {
+      const timestamp = now();
+      const reason = "server_restart_recovery";
+      const message = "Task was marked cancelled because the server restarted while it was running.";
+      const runMessage = "Workspace run was marked cancelled because the server restarted while it was running.";
+      const eventPayload = {
+        reason,
+        message,
+      };
+      const runPayload = {
+        reason,
+        message: runMessage,
+      };
+      const runningTasks = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id, automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
+                  status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
+           FROM tasks
+           WHERE status = 'running'`,
+        )
+        .all() as TaskRow[];
+      const runningRuns = db
+        .prepare(
+          `SELECT id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
+           FROM workspace_runs
+           WHERE status = 'running'`,
+        )
+        .all() as WorkspaceRunRow[];
+      const runningSteps = db
+        .prepare(
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, status, created_at, updated_at, completed_at
+           FROM task_flow_steps
+           WHERE status = 'running'`,
+        )
+        .all() as TaskFlowStepRow[];
+      const runningFlows = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, origin_run_id, trigger_source, title, status, result_summary, error_text, created_at, updated_at, completed_at
+           FROM task_flows
+           WHERE status = 'running'`,
+        )
+        .all() as TaskFlowRow[];
+
+      const recoverRunningTaskStmt = db.prepare(`
+        UPDATE tasks
+        SET status = 'cancelled',
+            result_text = @result_text,
+            updated_at = @timestamp,
+            completed_at = @timestamp
+        WHERE id = @id
+          AND status = 'running';
+      `);
+      const updateHeartbeatForTaskStmt = db.prepare(`
+        UPDATE heartbeat_logs
+        SET status = 'cancelled',
+            summary = 'Heartbeat task cancelled during server restart recovery.',
+            error_text = @message,
+            completed_at = @timestamp,
+            updated_at = @timestamp
+        WHERE task_id = @task_id
+          AND status IN ('queued', 'running');
+      `);
+      const cancelFlowStepByTaskStmt = db.prepare(`
+        UPDATE task_flow_steps
+        SET status = 'cancelled',
+            updated_at = @timestamp,
+            completed_at = @timestamp
+        WHERE flow_id = @flow_id
+          AND step_key = @step_key
+          AND status = 'running';
+      `);
+      const cancelRunningFlowStepStmt = db.prepare(`
+        UPDATE task_flow_steps
+        SET status = 'cancelled',
+            updated_at = @timestamp,
+            completed_at = @timestamp
+        WHERE id = @id
+          AND status = 'running';
+      `);
+
+      const result = db.transaction(() => {
+        let recoveredTasks = 0;
+        let recoveredRuns = 0;
+        let recoveredSteps = 0;
+        let recoveredFlows = 0;
+
+        for (const task of runningTasks) {
+          const update = recoverRunningTaskStmt.run({
+            id: task.id,
+            result_text: message,
+            timestamp,
+          });
+          if (update.changes > 0) {
+            recoveredTasks += 1;
+            insertTaskEventStmt.run({
+              id: crypto.randomUUID(),
+              task_id: task.id,
+              event_type: "cancelled",
+              payload_json: JSON.stringify(eventPayload),
+              created_at: timestamp,
+            });
+            pruneTaskEvents(task.id);
+            updateHeartbeatForTaskStmt.run({
+              task_id: task.id,
+              message,
+              timestamp,
+            });
+            if (task.task_flow_id && task.flow_step_key) {
+              const stepUpdate = cancelFlowStepByTaskStmt.run({
+                flow_id: task.task_flow_id,
+                step_key: task.flow_step_key,
+                timestamp,
+              });
+              recoveredSteps += stepUpdate.changes;
+            }
+          }
+        }
+
+        for (const run of runningRuns) {
+          const update = updateWorkspaceRunStatusStmt.run({
+            id: run.id,
+            status: "cancelled",
+            phase: "cancelled",
+            checkpoint_json: null,
+            resume_token: run.resume_token,
+            updated_at: timestamp,
+          });
+          if (update.changes > 0) {
+            recoveredRuns += 1;
+            insertWorkspaceRunEventStmt.run({
+              id: crypto.randomUUID(),
+              run_id: run.id,
+              event_type: "run_cancelled",
+              payload_json: JSON.stringify(runPayload),
+              created_at: timestamp,
+            });
+            pruneWorkspaceRunEvents(run.id);
+          }
+        }
+
+        for (const step of runningSteps) {
+          const update = cancelRunningFlowStepStmt.run({
+            id: step.id,
+            timestamp,
+          });
+          if (update.changes > 0) {
+            recoveredSteps += 1;
+          }
+        }
+
+        for (const flow of runningFlows) {
+          const update = updateTaskFlowStmt.run({
+            id: flow.id,
+            title: null,
+            status: "cancelled",
+            result_summary: null,
+            error_text: runMessage,
+            updated_at: timestamp,
+            completed_at: timestamp,
+            clear_result_summary: 0,
+            clear_error_text: 0,
+            clear_completed_at: 0,
+          });
+          if (update.changes > 0) {
+            recoveredFlows += 1;
+          }
+        }
+
+        return {
+          tasks: recoveredTasks,
+          workspaceRuns: recoveredRuns,
+          taskFlowSteps: recoveredSteps,
+          taskFlows: recoveredFlows,
+        };
+      })();
+
+      return result;
     },
 
     createTask(input: {
@@ -1894,6 +1839,7 @@ export function createStore(dataDir: string) {
           payload_json: JSON.stringify({ message: "\uD0DC\uC2A4\uD06C\uAC00 \uB300\uAE30\uC5F4\uC5D0 \uB4E4\uC5B4\uAC14\uC2B5\uB2C8\uB2E4." }),
           created_at: timestamp,
         });
+        pruneTaskEvents(id);
       })();
       return store.getTask(id)!;
     },
@@ -1982,6 +1928,7 @@ export function createStore(dataDir: string) {
             payload_json: JSON.stringify(input.payload ?? {}),
             created_at: timestamp,
           });
+          pruneTaskEvents(input.taskId);
         }
         return result.changes > 0;
       })();
@@ -2005,6 +1952,7 @@ export function createStore(dataDir: string) {
         payload_json: JSON.stringify(input.payload),
         created_at: createdAt,
       });
+      pruneTaskEvents(input.taskId);
       return {
         id,
         taskId: input.taskId,
@@ -2361,6 +2309,7 @@ export function createStore(dataDir: string) {
           }),
           created_at: timestamp,
         });
+        pruneTaskEvents(taskId);
         markAutomationRuleRunStmt.run({
           id: rule.id,
           last_run_at: timestamp,
@@ -2449,6 +2398,18 @@ export function createStore(dataDir: string) {
         clear_error_text: input.clearErrorText ? 1 : 0,
         clear_completed_at: input.clearCompletedAt ? 1 : 0,
       });
+      if (input.status === "completed") {
+        try {
+          store.createFlowReportArtifact(input.flowId);
+        } catch (error) {
+          // Flow reports are observability artifacts. A report failure should not roll back
+          // an already completed opencode-backed flow, but it should remain visible in logs.
+          console.warn(
+            "[aetherops] flow_report_generation_failed",
+            error instanceof Error ? error.message : "Flow report generation failed.",
+          );
+        }
+      }
       return store.getTaskFlow(input.flowId);
     },
 

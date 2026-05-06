@@ -180,6 +180,61 @@ export interface WorkspaceRunEventRecord {
   createdAt: number;
 }
 
+export interface SessionSummaryRecord {
+  conversationId: string;
+  summary: string;
+  decisions: string[];
+  openQuestions: string[];
+  nextActions: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ArtifactKind = "file" | "diff" | "report" | "summary" | "log";
+
+export interface ArtifactRecord {
+  id: string;
+  agentId: string;
+  conversationId: string;
+  runId: string | null;
+  taskId: string | null;
+  kind: ArtifactKind;
+  title: string;
+  path: string | null;
+  summary: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface FlowDraftStep {
+  stepKey: string;
+  title: string;
+  prompt: string;
+  dependencyStepKey: string | null;
+}
+
+export interface FlowDraft {
+  title: string;
+  steps: FlowDraftStep[];
+}
+
+export interface SkillTemplateRecord {
+  id: string;
+  name: string;
+  category: string;
+  summary: string;
+  description: string;
+  standingOrderPatch: string;
+  flowTemplate: FlowDraft;
+  verificationChecklist: string[];
+  heartbeatInstructions: string;
+  suggestedPrompt: string;
+  tags: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface EngineRunRecord {
   runId: string;
   engineKind: AgentEngineKind;
@@ -227,6 +282,34 @@ export interface EngineStatusRecord {
     }>;
   };
   opencodeAuthProviders?: string[];
+}
+
+export type McpServerCategory = "filesystem" | "browser" | "github" | "database" | "custom";
+export type McpServerStatus = "configured" | "candidate" | "unknown";
+export type McpRiskLevel = "low" | "medium" | "high";
+
+export interface McpServerSummary {
+  id: string;
+  name: string;
+  category: McpServerCategory;
+  status: McpServerStatus;
+  riskLevel: McpRiskLevel;
+  permissions: string[];
+  description: string;
+  configSnippet: string;
+  warnings: string[];
+  recommendedBoundary?: string | null;
+  testPrompt?: string | null;
+}
+
+export interface McpConfigStatus {
+  engineAvailable: boolean;
+  configDirSource: "default" | "env" | "unavailable";
+  displayPath: string;
+  debugPath?: string | null;
+  configuredCount: number;
+  configuredServers: McpServerSummary[];
+  warnings: string[];
 }
 
 export interface EngineAuthLoginResult {
@@ -392,9 +475,24 @@ export interface TaskFlowStepRunSummary {
   updatedAt: number;
 }
 
+export interface TaskFlowStepOutputSummary {
+  resultSummary: string | null;
+  changedFiles: string[];
+  artifactCount: number;
+  lastError: string | null;
+  lastEventSummary: string | null;
+}
+
 export interface TaskFlowStepDetail extends TaskFlowStepRecord {
   task: TaskFlowStepTaskSummary | null;
   run: TaskFlowStepRunSummary | null;
+  output: TaskFlowStepOutputSummary;
+}
+
+export interface TaskFlowDetailResponse {
+  flow: TaskFlowRecord;
+  steps: TaskFlowStepDetail[];
+  report: ArtifactRecord | null;
 }
 
 export interface ProviderSecretMap {

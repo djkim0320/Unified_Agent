@@ -20,22 +20,31 @@ import type {
 } from "./types";
 
 vi.mock("./api", () => ({
+  applySkillTemplateToHeartbeat: vi.fn(),
+  applySkillTemplateToStandingOrders: vi.fn(),
   cancelAgentTask: vi.fn(),
   cancelSubagentSession: vi.fn(),
   cancelTaskFlow: vi.fn(),
   createAgentAutomationRule: vi.fn(),
   createAgentTask: vi.fn(),
+  createMcpTestRun: vi.fn(),
   createSubagentSession: vi.fn(),
   createTaskFlow: vi.fn(),
   deleteAgent: vi.fn(),
   deleteAgentAutomationRule: vi.fn(),
   deleteConversation: vi.fn(),
   deleteTaskFlow: vi.fn(),
+  draftFlowFromPrompt: vi.fn(),
   getAgentHeartbeat: vi.fn(),
   getAgentSoul: vi.fn(),
   getAgentStandingOrders: vi.fn(),
+  getConversationSummary: vi.fn(),
   getConversationMessages: vi.fn(),
   getEngineStatus: vi.fn(),
+  getMcpCatalog: vi.fn(),
+  getMcpConfigStatus: vi.fn(),
+  getPreflightStatus: vi.fn(),
+  getRunDebug: vi.fn(),
   getTaskFlow: vi.fn(),
   importCodexCliAuth: vi.fn(),
   listAgentAutomationRules: vi.fn(),
@@ -46,6 +55,8 @@ vi.mock("./api", () => ({
   listModels: vi.fn(),
   listPlatformMetadata: vi.fn(),
   listProviders: vi.fn(),
+  listSkillTemplates: vi.fn(),
+  listRunArtifacts: vi.fn(),
   listSubagentSessions: vi.fn(),
   listTaskEvents: vi.fn(),
   listTaskFlows: vi.fn(),
@@ -55,11 +66,13 @@ vi.mock("./api", () => ({
   resumeTaskFlow: vi.fn(),
   retryTaskFlowStep: vi.fn(),
   refreshOpenCodeModels: vi.fn(),
+  refreshConversationSummary: vi.fn(),
   saveAgent: vi.fn(),
   saveAgentHeartbeat: vi.fn(),
   saveAgentSoul: vi.fn(),
   saveAgentStandingOrders: vi.fn(),
   saveConversation: vi.fn(),
+  saveConversationSummary: vi.fn(),
   saveTaskFlowSteps: vi.fn(),
   saveProviderAccount: vi.fn(),
   skipTaskFlowStep: vi.fn(),
@@ -68,6 +81,7 @@ vi.mock("./api", () => ({
   startTaskFlow: vi.fn(),
   streamChat: vi.fn(),
   testProvider: vi.fn(),
+  previewArtifact: vi.fn(),
   triggerAgentAutomationRule: vi.fn(),
   triggerAgentHeartbeat: vi.fn(),
   updateAgentAutomationRule: vi.fn(),
@@ -305,6 +319,124 @@ function mockDefaults() {
     messages: [],
   });
   vi.mocked(api.getEngineStatus).mockResolvedValue(engineStatus);
+  vi.mocked(api.getMcpCatalog).mockResolvedValue({
+    boundary: "AetherOps는 MCP를 직접 실행하지 않습니다.",
+    servers: [
+      {
+        id: "filesystem",
+        name: "Filesystem",
+        category: "filesystem",
+        status: "candidate",
+        riskLevel: "high",
+        permissions: ["workspace file read"],
+        description: "세션 sandbox 파일 접근 후보입니다.",
+        configSnippet: "{}",
+        warnings: ["좁은 경계를 사용하세요."],
+        recommendedBoundary: "session sandbox",
+        testPrompt: "Check Filesystem MCP.",
+      },
+    ],
+  });
+  vi.mocked(api.getMcpConfigStatus).mockResolvedValue({
+    status: {
+      engineAvailable: true,
+      configDirSource: "default",
+      displayPath: "opencode 기본 설정 경로",
+      configuredCount: 0,
+      configuredServers: [],
+      warnings: [],
+    },
+  });
+  vi.mocked(api.getPreflightStatus).mockResolvedValue({
+    ok: true,
+    checks: [
+      {
+        id: "backend",
+        label: "Backend",
+        status: "ok",
+        message: "Backend online",
+      },
+    ],
+  });
+  vi.mocked(api.listSkillTemplates).mockResolvedValue({
+    boundary: "Skill templates are metadata only.",
+    templates: [
+      {
+        id: "codebase-review",
+        name: "Codebase Review",
+        category: "Engineering",
+        summary: "코드베이스를 검토합니다.",
+        description: "실행형 플러그인이 아닌 리뷰 템플릿입니다.",
+        standingOrderPatch: "- Review security and tests.",
+        flowTemplate: {
+          title: "Codebase Review Flow",
+          steps: [
+            {
+              stepKey: "inspect",
+              title: "Inspect",
+              prompt: "Inspect code.",
+              dependencyStepKey: null,
+            },
+          ],
+        },
+        verificationChecklist: ["Run tests"],
+        heartbeatInstructions: "Check review status.",
+        suggestedPrompt: "Review this codebase.",
+        tags: ["review"],
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+  });
+  vi.mocked(api.applySkillTemplateToStandingOrders).mockResolvedValue({
+    standingOrders: {
+      path: "STANDING_ORDERS.md",
+      content: "# orders\n\n<!-- aetherops-skill-template:standing-orders:codebase-review -->",
+    },
+    template: {
+      id: "codebase-review",
+      name: "Codebase Review",
+      category: "Engineering",
+      summary: "코드베이스를 검토합니다.",
+      description: "실행형 플러그인이 아닌 리뷰 템플릿입니다.",
+      standingOrderPatch: "- Review security and tests.",
+      flowTemplate: { title: "Codebase Review Flow", steps: [] },
+      verificationChecklist: ["Run tests"],
+      heartbeatInstructions: "Check review status.",
+      suggestedPrompt: "Review this codebase.",
+      tags: ["review"],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    applied: true,
+    message: "ok",
+    boundary: "metadata only",
+  });
+  vi.mocked(api.applySkillTemplateToHeartbeat).mockResolvedValue({
+    heartbeat: {
+      ...defaultAgentHeartbeat,
+      instructions:
+        "Check in on the active session.\n\n<!-- aetherops-skill-template:heartbeat:codebase-review -->",
+    },
+    template: {
+      id: "codebase-review",
+      name: "Codebase Review",
+      category: "Engineering",
+      summary: "코드베이스를 검토합니다.",
+      description: "실행형 플러그인이 아닌 리뷰 템플릿입니다.",
+      standingOrderPatch: "- Review security and tests.",
+      flowTemplate: { title: "Codebase Review Flow", steps: [] },
+      verificationChecklist: ["Run tests"],
+      heartbeatInstructions: "Check review status.",
+      suggestedPrompt: "Review this codebase.",
+      tags: ["review"],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    applied: true,
+    message: "ok",
+    boundary: "metadata only",
+  });
   vi.mocked(api.refreshOpenCodeModels).mockResolvedValue({
     ok: true,
     message: "모델 캐시를 갱신했습니다.",
@@ -426,6 +558,90 @@ function mockDefaults() {
   });
   vi.mocked(api.listWorkspaceRuns).mockResolvedValue({ runs: [latestRun] });
   vi.mocked(api.listWorkspaceRunEvents).mockResolvedValue({ events: latestRunEvents });
+  vi.mocked(api.listRunArtifacts).mockResolvedValue({ artifacts: [] });
+  vi.mocked(api.getRunDebug).mockResolvedValue({
+    run: {
+      id: latestRun.id,
+      conversationId: latestRun.conversationId,
+      taskId: latestRun.taskId,
+      parentRunId: latestRun.parentRunId,
+      providerKind: latestRun.providerKind,
+      model: latestRun.model,
+      status: latestRun.status,
+      phase: latestRun.phase,
+      createdAt: latestRun.createdAt,
+      updatedAt: latestRun.updatedAt,
+      hasCheckpoint: false,
+      hasResumeToken: false,
+      hasUserMessage: true,
+    },
+    task: null,
+    engineRun: null,
+    summary: {
+      status: "completed",
+      phase: latestRun.phase,
+      durationMs: 1,
+      model: latestRun.model,
+      changedFiles: [],
+      error: null,
+      lastEvents: [],
+      artifactCount: 0,
+      taskKind: null,
+    },
+  });
+  vi.mocked(api.previewArtifact).mockResolvedValue({
+    artifact: {
+      id: "artifact-1",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      runId: latestRun.id,
+      taskId: null,
+      kind: "file",
+      title: "README.md",
+      path: "README.md",
+      summary: null,
+      metadata: {},
+      createdAt: 1,
+      updatedAt: 1,
+    },
+    preview: { content: "ok", binary: false, truncated: false },
+  });
+  vi.mocked(api.getConversationSummary).mockResolvedValue({ summary: null });
+  vi.mocked(api.refreshConversationSummary).mockResolvedValue({
+    summary: {
+      conversationId: firstConversation.id,
+      summary: "세션 요약",
+      decisions: [],
+      openQuestions: [],
+      nextActions: [],
+      createdAt: 1,
+      updatedAt: 1,
+    },
+  });
+  vi.mocked(api.saveConversationSummary).mockResolvedValue({
+    summary: {
+      conversationId: firstConversation.id,
+      summary: "저장된 요약",
+      decisions: [],
+      openQuestions: [],
+      nextActions: [],
+      createdAt: 1,
+      updatedAt: 2,
+    },
+  });
+  vi.mocked(api.draftFlowFromPrompt).mockResolvedValue({
+    draft: {
+      title: "Draft",
+      steps: [
+        {
+          stepKey: "requirements",
+          title: "요구사항 정리",
+          prompt: "요구사항을 정리합니다.",
+          dependencyStepKey: null,
+        },
+      ],
+    },
+  });
   vi.mocked(api.listAgentTasks).mockResolvedValue({ tasks: [] });
   vi.mocked(api.listTaskEvents).mockResolvedValue({ events: [] });
   vi.mocked(api.createAgentTask).mockResolvedValue({
@@ -454,6 +670,36 @@ function mockDefaults() {
       scheduledFor: null,
       updatedAt: 10,
     },
+  });
+  vi.mocked(api.createMcpTestRun).mockResolvedValue({
+    task: {
+      id: "mcp-test-task",
+      agentId: defaultAgent.id,
+      conversationId: firstConversation.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: null,
+      automationRuleId: null,
+      taskKind: "detached",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "Filesystem MCP 테스트",
+      prompt: "Check Filesystem MCP.",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      status: "queued",
+      resultText: null,
+      createdAt: 1,
+      startedAt: null,
+      completedAt: null,
+      scheduledFor: null,
+      updatedAt: 1,
+    },
+    conversation: firstConversation,
+    prompt: "Check Filesystem MCP.",
+    boundary: "AetherOps did not execute MCP directly.",
   });
   vi.mocked(api.triggerAgentAutomationRule).mockResolvedValue({
     rule: {
@@ -552,10 +798,10 @@ describe("App frontend", () => {
     const shell = getShell(container);
     const user = userEvent.setup();
 
-    await shell.findByRole("heading", { name: firstConversation.title });
+    await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
     expect(shell.queryByRole("button", { name: "개요" })).not.toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" })).toBeInTheDocument();
-    expect(await shell.findByLabelText("워크플로우 관제 패널")).toBeInTheDocument();
+    expect(await shell.findByLabelText("오늘 상태 패널")).toBeInTheDocument();
     expect(container.querySelector(".cockpit-chat-card__tabs")).not.toBeInTheDocument();
     expect(container.querySelector(".chat-panel__current-model")).not.toBeInTheDocument();
     expect(shell.queryByRole("button", { name: "프로바이더" })).not.toBeInTheDocument();
@@ -564,6 +810,14 @@ describe("App frontend", () => {
 
     expect(await shell.findByRole("heading", { name: "워크플로우 관제" })).toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "Outline으로 빠르게 만들기" })).toBeInTheDocument();
+
+    await user.click(await shell.findByRole("button", { name: "MCP" }));
+    expect(await shell.findByRole("heading", { name: "MCP 서버 관리" })).toBeInTheDocument();
+    expect(await shell.findByRole("heading", { name: "연결 후보" })).toBeInTheDocument();
+
+    await user.click(await shell.findByRole("button", { name: "스킬" }));
+    expect(await shell.findByRole("heading", { name: "스킬 템플릿 라이브러리" })).toBeInTheDocument();
+    expect(await shell.findByRole("heading", { name: "템플릿 목록" })).toBeInTheDocument();
   });
 
   it("opens the settings tab as a cockpit page with working settings actions", async () => {
@@ -571,7 +825,7 @@ describe("App frontend", () => {
     const shell = getShell(container);
     const user = userEvent.setup();
 
-    await shell.findByRole("heading", { name: firstConversation.title });
+    await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
     await user.click(await shell.findByRole("button", { name: "설정 탭" }));
 
     expect(await shell.findByRole("heading", { name: "로컬 실행 환경을 한곳에서 관리합니다" })).toBeInTheDocument();
@@ -590,12 +844,51 @@ describe("App frontend", () => {
     expect(await waitFor(() => container.querySelector('[role="dialog"]'))).toBeInTheDocument();
   });
 
+  it("uses skill templates as reusable metadata actions, not executable skills", async () => {
+    const { container } = render(<App />);
+    const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
+    await user.click(await shell.findByRole("button", { name: "스킬" }));
+    expect(await shell.findByRole("heading", { name: "스킬 템플릿 라이브러리" })).toBeInTheDocument();
+    expect((await shell.findAllByText("Codebase Review")).length).toBeGreaterThan(0);
+
+    await user.click(await shell.findByRole("button", { name: "상시 지침에 추가" }));
+    await waitFor(() => {
+      expect(api.applySkillTemplateToStandingOrders).toHaveBeenCalledWith(
+        defaultAgent.id,
+        "codebase-review",
+      );
+    });
+
+    await user.click(await shell.findByRole("button", { name: "Heartbeat에 적용" }));
+    await waitFor(() => {
+      expect(api.applySkillTemplateToHeartbeat).toHaveBeenCalledWith(
+        defaultAgent.id,
+        "codebase-review",
+      );
+    });
+
+    await user.click(await shell.findByRole("button", { name: "Flow로 만들기" }));
+    await waitFor(() => {
+      expect(api.createTaskFlow).toHaveBeenCalledWith(
+        defaultAgent.id,
+        expect.objectContaining({
+          title: "Codebase Review Flow",
+          autoStart: false,
+        }),
+      );
+    });
+    expect(container.querySelector('[aria-label="스킬 템플릿 관리"]')).not.toBeInTheDocument();
+  });
+
   it("opens the standing orders tab in agent settings", async () => {
     const { container } = render(<App />);
     const shell = getShell(container);
     const user = userEvent.setup();
 
-    await shell.findByRole("heading", { name: firstConversation.title });
+    await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
     await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
 
     const dialog = await waitFor(() => {
@@ -613,7 +906,7 @@ describe("App frontend", () => {
     const shell = getShell(container);
     const user = userEvent.setup();
 
-    await shell.findByRole("heading", { name: firstConversation.title });
+    await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
     await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
 
     const dialog = await waitFor(() => {
@@ -628,6 +921,107 @@ describe("App frontend", () => {
       expect(api.saveAgentStandingOrders).toHaveBeenCalledWith(defaultAgent.id, {
         content: "# orders",
       });
+    });
+  });
+
+  it("creates, opens, and cancels sub-agent sessions from the chat cockpit", async () => {
+    const subSession: ConversationRecord = {
+      ...firstConversation,
+      id: "22222222-2222-4222-8222-222222222222",
+      title: "Sub-agent session",
+      sessionKind: "subagent",
+      parentConversationId: firstConversation.id,
+      ownerRunId: latestRun.id,
+      updatedAt: 20,
+    };
+    const subTask = {
+      id: "task-sub-1",
+      agentId: defaultAgent.id,
+      conversationId: subSession.id,
+      runId: null,
+      taskFlowId: null,
+      flowStepKey: null,
+      originRunId: latestRun.id,
+      automationRuleId: null,
+      taskKind: "subagent" as const,
+      parentTaskId: null,
+      nestingDepth: 1,
+      title: "Sub-agent session",
+      prompt: "help me",
+      providerKind: "openai" as const,
+      model: "gpt-5.4",
+      reasoningLevel: "high" as const,
+      status: "running" as const,
+      resultText: null,
+      createdAt: 20,
+      startedAt: 21,
+      completedAt: null,
+      scheduledFor: null,
+      updatedAt: 21,
+    };
+    vi.mocked(api.listSubagentSessions).mockResolvedValue({ sessions: [subSession] });
+    vi.mocked(api.listAgentTasks).mockResolvedValue({ tasks: [subTask] });
+    vi.mocked(api.createSubagentSession).mockResolvedValue({
+      session: {
+        ...subSession,
+        id: "33333333-3333-4333-8333-333333333333",
+        title: "조사 서브에이전트",
+        updatedAt: 22,
+      },
+      task: {
+        ...subTask,
+        id: "task-sub-2",
+        conversationId: "33333333-3333-4333-8333-333333333333",
+        status: "queued",
+        updatedAt: 22,
+      },
+    });
+    vi.mocked(api.cancelSubagentSession).mockResolvedValue({
+      ok: true,
+      task: {
+        ...subTask,
+        status: "cancelled",
+        completedAt: 23,
+        updatedAt: 23,
+      },
+    });
+
+    const { container } = render(<App />);
+    const shell = getShell(container);
+    const user = userEvent.setup();
+
+    await user.click((await shell.findAllByText("서브에이전트"))[0]);
+    const subagentPanel = within(await shell.findByLabelText("서브에이전트"));
+    await user.click(await subagentPanel.findByRole("button", { name: "서브에이전트 시작" }));
+
+    await waitFor(() => {
+      expect(api.createSubagentSession).toHaveBeenCalledWith(
+        firstConversation.id,
+        expect.objectContaining({
+          title: "조사 서브에이전트",
+          providerKind: "openai",
+          model: "gpt-5.4",
+          reasoningLevel: "high",
+        }),
+      );
+    });
+
+    const subagentItem = (await subagentPanel.findByText("Sub-agent session")).closest("article");
+    expect(subagentItem).not.toBeNull();
+
+    await user.click(within(subagentItem as HTMLElement).getByRole("button", { name: "취소" }));
+
+    await waitFor(() => {
+      expect(api.cancelSubagentSession).toHaveBeenCalledWith(subSession.id);
+    });
+
+    await user.click(within(subagentItem as HTMLElement).getByRole("button", { name: "열기" }));
+
+    await waitFor(() => {
+      expect(api.getConversationMessages).toHaveBeenCalledWith(
+        subSession.id,
+        expect.any(AbortSignal),
+      );
     });
   });
 });

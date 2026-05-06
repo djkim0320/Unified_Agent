@@ -8,7 +8,7 @@ function normalizeHostname(hostname: string) {
   return hostname.replace(/^\[|\]$/g, "").toLowerCase();
 }
 
-function isLocalHostname(hostname: string) {
+export function isLocalHostname(hostname: string) {
   const normalized = normalizeHostname(hostname);
   return (
     normalized === "localhost" ||
@@ -18,11 +18,32 @@ function isLocalHostname(hostname: string) {
   );
 }
 
+export function isLoopbackRemoteAddress(address: string | undefined) {
+  if (!address) {
+    return false;
+  }
+  const normalized = normalizeHostname(address.replace(/^::ffff:/i, ""));
+  return isLocalHostname(normalized);
+}
+
 function originPort(origin: URL) {
   if (origin.port) {
     return Number(origin.port);
   }
   return origin.protocol === "https:" ? 443 : 80;
+}
+
+export function isAllowedLocalHostHeader(hostHeader: string | undefined, allowedPorts: number[]) {
+  if (!hostHeader || hostHeader.includes(",")) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(`http://${hostHeader}`);
+    return isLocalHostname(parsed.hostname) && allowedPorts.includes(originPort(parsed));
+  } catch {
+    return false;
+  }
 }
 
 export function isAllowedLocalOrigin(originHeader: string | undefined, allowedPorts: number[]) {
@@ -41,8 +62,11 @@ export function isAllowedLocalOrigin(originHeader: string | undefined, allowedPo
 export function createLocalApiAuthMiddleware(params: {
   token: string;
   allowedPorts: number[];
+  exposeTokenEndpoint?: boolean;
 }): express.RequestHandler {
   const allowedPorts = Array.from(new Set(params.allowedPorts.filter(Number.isFinite)));
+  const exposeTokenEndpoint =
+    params.exposeTokenEndpoint ?? process.env.AETHEROPS_EXPOSE_LOCAL_API_TOKEN !== "false";
 
   return (request, response, next) => {
     if (!isAllowedLocalOrigin(request.header("origin"), allowedPorts)) {
@@ -52,10 +76,30 @@ export function createLocalApiAuthMiddleware(params: {
       return;
     }
 
+    if (request.path === "/api/local-api-token") {
+      if (!exposeTokenEndpoint) {
+        response.status(404).json({ error: "Not found" });
+        return;
+      }
+      if (!isLoopbackRemoteAddress(request.socket.remoteAddress)) {
+        response.status(403).json({
+          error: "Local API token bootstrap requires a loopback client address.",
+        });
+        return;
+      }
+      if (!isAllowedLocalHostHeader(request.header("host"), allowedPorts)) {
+        response.status(403).json({
+          error: "Local API token bootstrap requires a local Host header.",
+        });
+        return;
+      }
+      next();
+      return;
+    }
+
     if (
       request.method === "OPTIONS" ||
-      !UNSAFE_METHODS.has(request.method.toUpperCase()) ||
-      request.path === "/api/local-api-token"
+      !UNSAFE_METHODS.has(request.method.toUpperCase())
     ) {
       next();
       return;

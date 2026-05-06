@@ -454,6 +454,20 @@ describe("OpenCodeEngine", () => {
         sendEvent() {},
       });
       expect(observedArgs[1]).toContain("--dangerously-skip-permissions");
+      const permissionEvents = store
+        .listWorkspaceRuns(conversation.id)
+        .flatMap((run) => store.listWorkspaceRunEvents(conversation.id, run.id))
+        .filter((event) => event.payload.permissionMode === "dangerous_skip_permissions");
+      expect(permissionEvents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            eventType: "status",
+            payload: expect.objectContaining({
+              permissionWarning: expect.stringContaining("Dangerous opencode permission skipping"),
+            }),
+          }),
+        ]),
+      );
     } finally {
       if (previousAutoApprove === undefined) {
         delete process.env.AETHEROPS_OPENCODE_AUTO_APPROVE;

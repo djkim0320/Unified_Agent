@@ -3,7 +3,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CockpitSectionView } from "./CockpitSectionView";
-import type { TaskFlowRecord, TaskFlowStepDetail } from "../types";
+import type { TaskFlowRecord, TaskFlowStepDetail, TaskRecord } from "../types";
 
 const queuedFlow: TaskFlowRecord = {
   id: "flow-1",
@@ -37,6 +37,13 @@ const steps: TaskFlowStepDetail[] = [
     updatedAt: 1,
     task: null,
     run: null,
+    output: {
+      resultSummary: null,
+      changedFiles: [],
+      artifactCount: 0,
+      lastError: null,
+      lastEventSummary: null,
+    },
   },
   {
     id: "step-2",
@@ -52,6 +59,13 @@ const steps: TaskFlowStepDetail[] = [
     updatedAt: 1,
     task: null,
     run: null,
+    output: {
+      resultSummary: null,
+      changedFiles: [],
+      artifactCount: 0,
+      lastError: null,
+      lastEventSummary: null,
+    },
   },
 ];
 
@@ -68,14 +82,22 @@ function renderWorkflow(overrides: Partial<Parameters<typeof CockpitSectionView>
       onDeleteTaskFlow={vi.fn()}
       onNavigate={vi.fn()}
       onOpenAgentSettings={vi.fn()}
+      onOpenArtifacts={vi.fn()}
       onOpenProviderSettings={vi.fn()}
+      onOpenRun={vi.fn()}
       onRefreshPlatformMetadata={vi.fn()}
+      onRefreshPreflight={vi.fn()}
       onResumeTaskFlow={vi.fn()}
       onRetryTaskFlowStep={vi.fn()}
       onSaveTaskFlowSteps={vi.fn()}
       onSelectTaskFlow={vi.fn()}
       onSkipTaskFlowStep={vi.fn()}
       onStartTaskFlow={vi.fn()}
+      preflight={{
+        ok: true,
+        checks: [{ id: "backend", label: "Backend", status: "ok", message: "Backend online" }],
+      }}
+      preflightLoading={false}
       providerLabel="OpenAI"
       reasoningLabel="High"
       runEvents={null}
@@ -139,7 +161,7 @@ describe("CockpitSectionView workflow editor", () => {
     expect(onSaveTaskFlowSteps).toHaveBeenCalledWith(emptyFlow.id, [], "새 워크플로우");
   });
 
-  it("adds, deletes, reorders, and saves queued flow steps", async () => {
+  it("adds, deletes, reorders, and saves queued flow steps with dependencies", async () => {
     const user = userEvent.setup();
     const onSaveTaskFlowSteps = vi.fn();
     renderWorkflow({ onSaveTaskFlowSteps });
@@ -155,8 +177,29 @@ describe("CockpitSectionView workflow editor", () => {
     await user.click(screen.getByRole("button", { name: "변경 저장" }));
 
     expect(onSaveTaskFlowSteps).toHaveBeenCalledWith(queuedFlow.id, [
-      { stepKey: "research", title: "Research", prompt: "Research prompt" },
-      { stepKey: "requirements", title: "Requirements", prompt: "Requirements prompt" },
+      { stepKey: "research", title: "Research", prompt: "Research prompt", dependencyStepKey: "requirements" },
+      { stepKey: "requirements", title: "Requirements", prompt: "Requirements prompt", dependencyStepKey: null },
+    ], "Queued Flow");
+  });
+
+  it("edits step dependencies and can auto-apply a linear chain", async () => {
+    const user = userEvent.setup();
+    const onSaveTaskFlowSteps = vi.fn();
+    renderWorkflow({ onSaveTaskFlowSteps });
+
+    await user.click(screen.getByRole("button", { name: "선택 Flow 수정" }));
+    await user.selectOptions(screen.getByLabelText("선택 단계 의존성"), "research");
+
+    expect(screen.getByText("1번 단계의 의존성 그래프에 순환이 있습니다.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "변경 저장" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "선형 연결 자동 적용" }));
+    expect(screen.getByRole("button", { name: "변경 저장" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "변경 저장" }));
+
+    expect(onSaveTaskFlowSteps).toHaveBeenCalledWith(queuedFlow.id, [
+      { stepKey: "requirements", title: "Requirements", prompt: "Requirements prompt", dependencyStepKey: null },
+      { stepKey: "research", title: "Research", prompt: "Research prompt", dependencyStepKey: "requirements" },
     ], "Queued Flow");
   });
 
@@ -176,8 +219,8 @@ describe("CockpitSectionView workflow editor", () => {
     await user.click(screen.getByRole("button", { name: "변경 저장" }));
 
     expect(onSaveTaskFlowSteps).toHaveBeenCalledWith(queuedFlow.id, [
-      { stepKey: "research", title: "Research", prompt: "Research prompt" },
-      { stepKey: "requirements", title: "Requirements", prompt: "Requirements prompt" },
+      { stepKey: "research", title: "Research", prompt: "Research prompt", dependencyStepKey: "requirements" },
+      { stepKey: "requirements", title: "Requirements", prompt: "Requirements prompt", dependencyStepKey: null },
     ], "Queued Flow");
   });
 
@@ -218,6 +261,87 @@ describe("CockpitSectionView workflow editor", () => {
     expect(screen.getByRole("heading", { name: "Outline으로 빠르게 만들기" })).toBeInTheDocument();
     expect(screen.getByText("아직 생성된 Flow가 없습니다.")).toBeInTheDocument();
     expect(container.textContent).not.toMatch(/\uFFFD/);
+  });
+
+  it("shows step output visibility and task queue attention items", () => {
+    const onOpenRun = vi.fn();
+    const onOpenArtifacts = vi.fn();
+    const failedTask: TaskRecord = {
+      id: "task-failed",
+      agentId: "agent-1",
+      conversationId: "conversation-1",
+      runId: "run-1",
+      taskFlowId: queuedFlow.id,
+      flowStepKey: "research",
+      originRunId: null,
+      automationRuleId: null,
+      taskKind: "flow_step",
+      parentTaskId: null,
+      nestingDepth: 0,
+      title: "Research",
+      prompt: "Research prompt",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      status: "failed",
+      resultText: null,
+      createdAt: 1,
+      startedAt: 2,
+      completedAt: 3,
+      scheduledFor: null,
+      updatedAt: 4,
+    };
+    renderWorkflow({
+      onOpenArtifacts,
+      onOpenRun,
+      selectedTaskFlow: {
+        flow: queuedFlow,
+        steps: [
+          steps[0],
+          {
+            ...steps[1],
+            status: "failed",
+            taskId: failedTask.id,
+            task: {
+              id: failedTask.id,
+              status: "failed",
+              runId: "run-1",
+              resultText: "자료 조사 실패",
+              createdAt: 1,
+              startedAt: 2,
+              completedAt: 3,
+              updatedAt: 4,
+            },
+            run: {
+              id: "run-1",
+              status: "failed",
+              phase: "engine_run",
+              createdAt: 1,
+              updatedAt: 4,
+            },
+            output: {
+              resultSummary: "자료 조사 실패",
+              changedFiles: ["notes.md"],
+              artifactCount: 1,
+              lastError: "opencode failed",
+              lastEventSummary: "run failed",
+            },
+          },
+        ],
+      },
+      tasks: [failedTask],
+    });
+
+    expect(screen.getByText("오류: opencode failed")).toBeInTheDocument();
+    const runButtons = screen.getAllByRole("button", { name: "Run 보기" });
+    const artifactButtons = screen.getAllByRole("button", { name: "산출물 보기" });
+    fireEvent.click(runButtons[1]);
+    fireEvent.click(artifactButtons[1]);
+    expect(onOpenRun).toHaveBeenCalledWith("run-1");
+    expect(onOpenArtifacts).toHaveBeenCalledWith("run-1");
+    expect(screen.getByRole("heading", { name: "Task Queue / 실패함" })).toBeInTheDocument();
+    expect(screen.getByText("주의 필요")).toBeInTheDocument();
+    expect(screen.getAllByText("Research").length).toBeGreaterThan(0);
   });
 });
 

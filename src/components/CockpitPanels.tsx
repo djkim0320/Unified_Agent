@@ -113,10 +113,13 @@ function collectOpenCodeExtensionEntries(platformMetadata: PlatformMetadata | nu
 }
 
 export function CockpitRightRail({
+  changedFiles,
   liveEvents,
   onOpenWorkspace,
   onResumeTaskFlow,
   onStartTaskFlow,
+  platformMetadata,
+  runEvents,
   selectedTaskFlow,
   taskFlows,
 }: CockpitPanelsProps) {
@@ -129,10 +132,45 @@ export function CockpitRightRail({
         }
       : null);
   const counts = flowStatusCounts(taskFlows);
-  const traceEvents = liveEvents.slice(-6).reverse();
+  const traceEvents = collectExecutionEvents([...(runEvents ?? []), ...liveEvents]).slice(0, 4);
+  const extensionEntries = collectOpenCodeExtensionEntries(platformMetadata);
+  const activeFlowCount = (counts.queued ?? 0) + (counts.running ?? 0);
 
   return (
-    <aside className="cockpit-right-rail" aria-label="워크플로우 관제 패널">
+    <aside className="cockpit-right-rail cockpit-right-rail--summary" aria-label="오늘 상태 패널">
+      <section className="cockpit-card cockpit-card--status">
+        <div className="cockpit-card__header">
+          <div>
+            <p className="cockpit-eyebrow">오늘 상태</p>
+            <h3>현재 세션 요약</h3>
+          </div>
+          <span className="cockpit-pill">LIVE</span>
+        </div>
+
+        <div className="cockpit-status-grid">
+          <div>
+            <span>진행 Flow</span>
+            <strong>{activeFlowCount}</strong>
+          </div>
+          <div>
+            <span>최근 이벤트</span>
+            <strong>{traceEvents.length}</strong>
+          </div>
+          <div>
+            <span>변경 파일</span>
+            <strong>{changedFiles.length}</strong>
+          </div>
+          <div>
+            <span>opencode 확장</span>
+            <strong>{extensionEntries.length}</strong>
+          </div>
+        </div>
+
+        <p className="cockpit-card__copy">
+          세부 실행 로그와 변경 파일은 아래 보조 패널에서 펼쳐 볼 수 있습니다.
+        </p>
+      </section>
+
       <section className="cockpit-card cockpit-card--workflow">
         <div className="cockpit-card__header">
           <div>
@@ -160,7 +198,7 @@ export function CockpitRightRail({
           </button>
         </div>
 
-        <div className="cockpit-step-stack">
+        <div className="cockpit-step-stack cockpit-step-stack--compact">
           {(activeFlow?.steps.length
             ? activeFlow.steps
             : [
@@ -169,7 +207,7 @@ export function CockpitRightRail({
                 { id: "placeholder-3", stepKey: "variants", title: "후보안 비교", status: "queued" },
                 { id: "placeholder-4", stepKey: "plan", title: "실행 계획", status: "queued" },
                 { id: "placeholder-5", stepKey: "decision", title: "결정 로그", status: "queued" },
-              ]).map((step, index) => (
+              ]).slice(0, 4).map((step, index) => (
             <article className={`cockpit-step cockpit-step--${stepTone(step.status)}`} key={step.id}>
               <span className="cockpit-step__index">{index + 1}</span>
               <div>
@@ -185,10 +223,10 @@ export function CockpitRightRail({
       <section className="cockpit-card cockpit-card--trace">
         <div className="cockpit-card__header">
           <div>
-            <p className="cockpit-eyebrow">실시간 흐름 추적</p>
-            <h3>opencode 실행 이벤트</h3>
+            <p className="cockpit-eyebrow">최근 실행</p>
+            <h3>opencode 이벤트</h3>
           </div>
-          <span className="cockpit-pill">live</span>
+          <span className="cockpit-pill">{traceEvents.length}</span>
         </div>
         <div className="cockpit-timeline">
           {traceEvents.length ? (
@@ -204,24 +242,9 @@ export function CockpitRightRail({
             ))
           ) : (
             <p className="cockpit-empty">
-              아직 실시간 이벤트가 없습니다. 채팅을 보내면 opencode 실행 이벤트가 여기에 표시됩니다.
+              아직 실행 이벤트가 없습니다. 채팅을 보내면 opencode 진행 상황이 여기에 표시됩니다.
             </p>
           )}
-        </div>
-      </section>
-
-      <section className="cockpit-card cockpit-card--metrics">
-        <div className="cockpit-metric">
-          <span>활성 Flow</span>
-          <strong>{(counts.queued ?? 0) + (counts.running ?? 0)}</strong>
-        </div>
-        <div className="cockpit-metric">
-          <span>완료</span>
-          <strong>{counts.completed ?? 0}</strong>
-        </div>
-        <div className="cockpit-metric">
-          <span>주의</span>
-          <strong>{(counts.failed ?? 0) + (counts.cancelled ?? 0)}</strong>
         </div>
       </section>
     </aside>

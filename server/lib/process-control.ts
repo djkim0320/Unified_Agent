@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 
 const WINDOWS_SAFE_ENV_KEYS = [
   "PATH",
@@ -68,14 +69,38 @@ export function createSanitizedEnvironment(overrides?: NodeJS.ProcessEnv) {
   };
 }
 
-export async function terminateProcessTree(pid: number | undefined) {
+export type ProcessTreeLaunchOptions = {
+  detached: boolean;
+  windowsHide: true;
+};
+
+export function createProcessTreeLaunchOptions(): ProcessTreeLaunchOptions {
+  return {
+    detached: process.platform !== "win32",
+    windowsHide: true,
+  };
+}
+
+export async function terminateProcessTree(
+  pid: number | undefined,
+  options?: {
+    processGroup?: boolean;
+    killProcess?: typeof process.kill;
+    spawnProcess?: typeof spawn;
+    platform?: NodeJS.Platform;
+  },
+) {
   if (!pid || pid <= 0) {
     return;
   }
 
-  if (process.platform === "win32") {
+  const platform = options?.platform ?? process.platform;
+  const spawnProcess = options?.spawnProcess ?? spawn;
+  const killProcess = options?.killProcess ?? process.kill;
+
+  if (platform === "win32") {
     await new Promise<void>((resolve) => {
-      const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      const killer = spawnProcess("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
       });
@@ -85,11 +110,19 @@ export async function terminateProcessTree(pid: number | undefined) {
     return;
   }
 
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // Ignore races where the process already exited.
+  const targets = options?.processGroup ? [-pid, pid] : [pid];
+  for (const target of targets) {
+    try {
+      killProcess(target, "SIGKILL");
+      return;
+    } catch {
+      // Ignore races where the process or process group already exited.
+    }
   }
+}
+
+export function spawnedAsProcessGroup(child: Pick<ChildProcess, "pid">) {
+  return process.platform !== "win32" && Boolean(child.pid);
 }
 
 export function appendCappedText(

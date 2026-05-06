@@ -3,8 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   appendCappedText,
+  createProcessTreeLaunchOptions,
   createSanitizedEnvironment,
   isAbortError,
+  spawnedAsProcessGroup,
   terminateProcessTree,
 } from "./process-control.js";
 import {
@@ -150,19 +152,27 @@ function makeOpenCodeRunner(launcher: OpenCodeLauncher): OpenCodeCommandRunner {
         // opencode treats an open non-TTY stdin as extra prompt input. The server never streams
         // stdin to CLI runs, so close it explicitly to avoid silent hangs in background tasks.
         stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
+        ...createProcessTreeLaunchOptions(),
       });
+      const processGroup = spawnedAsProcessGroup(child);
+      let abortHandler: (() => void) | null = null;
+      const cleanupAbortListener = () => {
+        if (abortHandler) {
+          options.signal?.removeEventListener("abort", abortHandler);
+        }
+      };
       const finish = (result: OpenCodeCommandResult) => {
         if (settled) {
           return;
         }
         settled = true;
         clearTimeout(timeout);
+        cleanupAbortListener();
         resolve(result);
       };
       const timeout = setTimeout(() => {
         timedOut = true;
-        void terminateProcessTree(child.pid).finally(() => {
+        void terminateProcessTree(child.pid, { processGroup }).finally(() => {
           finish({
             exitCode: null,
             stdout,
@@ -174,9 +184,9 @@ function makeOpenCodeRunner(launcher: OpenCodeLauncher): OpenCodeCommandRunner {
         });
       }, options.timeoutMs);
 
-      const abortHandler = () => {
+      abortHandler = () => {
         cancelled = true;
-        void terminateProcessTree(child.pid).finally(() => {
+        void terminateProcessTree(child.pid, { processGroup }).finally(() => {
           finish({
             exitCode: null,
             stdout,
@@ -212,7 +222,6 @@ function makeOpenCodeRunner(launcher: OpenCodeLauncher): OpenCodeCommandRunner {
         });
       });
       child.on("close", (exitCode) => {
-        options.signal?.removeEventListener("abort", abortHandler);
         finish({
           exitCode,
           stdout,
@@ -390,6 +399,7 @@ function buildPrompt(params: {
   const guides = params.workspace.readGuides();
   const soul = params.workspace.readAgentSoul(input.agentId).content;
   const standingOrders = params.workspace.readAgentStandingOrders(input.agentId).content;
+  const summary = input.sessionSummary;
   const recentMessages = input.messages
     .slice(-8)
     .map((message) => `${message.role.toUpperCase()}: ${clip(message.content, 1600)}`)
@@ -436,6 +446,18 @@ function buildPrompt(params: {
     "",
     "## STANDING_ORDERS.md",
     standingOrders.trim() || "(empty)",
+    "",
+    "Persistent session summary:",
+    summary
+      ? [
+          summary.summary.trim() || "(empty)",
+          summary.decisions.length ? `Decisions: ${summary.decisions.join("; ")}` : "",
+          summary.openQuestions.length ? `Open questions: ${summary.openQuestions.join("; ")}` : "",
+          summary.nextActions.length ? `Next actions: ${summary.nextActions.join("; ")}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : "(none)",
     "",
     "Recent conversation:",
     recentMessages || "(none)",
@@ -803,6 +825,10 @@ export function createOpenCodeEngine(params: {
     ];
     const command = commandForStorage(launcher.displayName, args);
     const env = buildOpenCodeEnvironment({ credentialSync });
+    const permissionMode = autoApprovePermissions ? "dangerous_skip_permissions" : "default";
+    const permissionWarning = autoApprovePermissions
+      ? "Dangerous opencode permission skipping is enabled by AetherOps environment flags."
+      : null;
     const jsonEvents: unknown[] = [];
     const assistantChunks: string[] = [];
     const nonJsonOutputChunks: string[] = [];
@@ -909,11 +935,15 @@ export function createOpenCodeEngine(params: {
             runtimeEnvKeys: [...entry.runtimeEnvKeys],
           })),
         },
+        permissionMode,
+        permissionWarning,
       });
       send("status", {
         message: "opencode Workspace Engine 실행을 시작했습니다.",
         phase: "engine_run_started",
         engineKind: "opencode",
+        permissionMode,
+        permissionWarning,
       });
       patchRun("planning");
 
@@ -939,6 +969,28 @@ export function createOpenCodeEngine(params: {
 
       const afterSnapshot = snapshotWorkspace(workspaceDirectory);
       const changedFiles = changedFilesBetween(beforeSnapshot, afterSnapshot);
+      if (changedFiles.length && params.store.createArtifactsForRun) {
+        try {
+          const artifacts = params.store.createArtifactsForRun({
+            agentId: input.agentId,
+            conversationId: input.conversationId,
+            runId: run.id,
+            taskId: input.currentTaskId ?? null,
+            changedFiles,
+          });
+          emit("status", {
+            phase: "artifact_indexed",
+            engineKind: "opencode",
+            artifactCount: Array.isArray(artifacts) ? artifacts.length : changedFiles.length,
+          });
+        } catch (error) {
+          emit("error", {
+            phase: "artifact_index_failed",
+            engineKind: "opencode",
+            error: error instanceof Error ? error.message : "Artifact indexing failed.",
+          });
+        }
+      }
       const assistantText = assistantChunks.join("");
       const completedAt = Date.now();
       const eventSummary = {
@@ -971,6 +1023,7 @@ export function createOpenCodeEngine(params: {
         params.store.finalizeWorkspaceRun(run.id, "cancelled", "run_cancelled", {
           changedFiles,
           engineRun,
+          stderrSummary: eventSummary.stderr,
         });
         throw new EngineRunError(
           result.errorMessage ?? "opencode run was cancelled.",
@@ -1004,6 +1057,7 @@ export function createOpenCodeEngine(params: {
           error: message,
           changedFiles,
           engineRun,
+          stderrSummary: eventSummary.stderr,
         });
         throw new EngineRunError(message, "failed", run.id, result.timedOut ? "timed_out" : "failed");
       }
@@ -1030,6 +1084,7 @@ export function createOpenCodeEngine(params: {
           error: message,
           changedFiles,
           engineRun,
+          stderrSummary: eventSummary.stderr,
         });
         throw new EngineRunError(message, "failed", run.id, "failed");
       }
@@ -1056,6 +1111,7 @@ export function createOpenCodeEngine(params: {
           error: message,
           changedFiles,
           engineRun,
+          stderrSummary: eventSummary.stderr,
         });
         throw new EngineRunError(message, "failed", run.id, "failed");
       }
@@ -1093,6 +1149,7 @@ export function createOpenCodeEngine(params: {
       params.store.finalizeWorkspaceRun(run.id, "completed", "run_complete", {
         changedFiles,
         engineRun,
+        assistantSummary: clip(assistantText, 1600),
       });
       return {
         runId: run.id,

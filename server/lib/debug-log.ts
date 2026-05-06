@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { toSafeLocalName } from "./safe-local-name.js";
 
 export interface DebugLogEntry {
   timestamp: string;
@@ -28,7 +29,7 @@ export function createDebugLog(params: {
   fileName: string;
   namespace: string;
 }) {
-  const logPath = path.join(params.dataDir, params.fileName);
+  const logPath = path.join(params.dataDir, toSafeLocalName(params.fileName, "debug.log"));
   const entries: DebugLogEntry[] = [];
 
   const append = (event: string, details: Record<string, unknown>) => {

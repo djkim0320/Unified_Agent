@@ -8,6 +8,7 @@ import type {
   ProviderKind,
   ProviderSecret,
   ReasoningLevel,
+  SessionSummaryRecord,
   TaskKind,
   TaskFlowRecord,
   TaskFlowStepRecord,
@@ -91,6 +92,14 @@ export function createAgentGateway(params: {
     getWorkspaceRun?: (runId: string) => WorkspaceRunRecord | null;
     listWorkspaceRuns?: (conversationId: string) => WorkspaceRunRecord[];
     listWorkspaceRunEvents?: (conversationId: string, runId: string) => WorkspaceRunEventRecord[];
+    getSessionSummary?: (conversationId: string) => SessionSummaryRecord | null;
+    createArtifactsForRun?: (input: {
+      agentId: string;
+      conversationId: string;
+      runId: string;
+      taskId?: string | null;
+      changedFiles: string[];
+    }) => unknown;
     appendWorkspaceRunEvent: (input: {
       runId: string;
       eventType: "status" | "tool_call" | "tool_result" | "error" | "run_complete" | "run_failed" | "run_cancelled";
@@ -286,6 +295,7 @@ export function createAgentGateway(params: {
       agentId: agent.id,
       userMessage: paramsInput.task.prompt,
       messages,
+      sessionSummary: params.store.getSessionSummary?.(conversation.id) ?? null,
       signal: paramsInput.signal,
       isDetachedTask: paramsInput.task.taskKind !== "heartbeat" && paramsInput.task.taskKind !== "subagent",
       isHeartbeatRun: paramsInput.task.taskKind === "heartbeat",
@@ -532,6 +542,7 @@ export function createAgentGateway(params: {
         role: message.role,
         content: message.content,
       })),
+      sessionSummary: params.store.getSessionSummary?.(conversation.id) ?? null,
       sendEvent: paramsInput.sendEvent,
       signal: paramsInput.signal,
       unsafeShellEnabled: paramsInput.unsafeShellEnabled,

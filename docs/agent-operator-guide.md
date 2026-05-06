@@ -31,10 +31,14 @@ Current domain model:
   - use `channel_kind=webchat`
 - `messages`
   - persistent session transcript
+- `session_summaries`
+  - persistent compact session memory injected into future opencode prompts
 - `workspace_runs`
   - one foreground or detached agent execution
 - `workspace_run_events`
   - status, tool calls, tool results, terminal events
+- `artifacts`
+  - run-scoped records for changed files and future reports/summaries
 - `tasks`
   - detached background work
 - `task_events`
@@ -59,6 +63,8 @@ AetherOps is the local control plane: cockpit UI, scheduler, and log store. It o
 - Status and operations: `GET /api/engine/status`, `POST /api/engine/opencode/refresh-models`, `POST /api/engine/opencode/auth/login`, `GET /api/engine/runs/:runId?conversationId=<id>`.
 
 The opencode engine always runs inside the active conversation sandbox and uses an allowlisted process environment. It records command metadata, JSON event summaries, external session ids when available, changed files, and exit state into workspace run events.
+
+When a conversation has a saved session summary, `OpenCodeEngine` includes a concise "Persistent session summary" section in the run prompt. The summary is owned by AetherOps persistence, but it is refreshed deterministically from local data rather than by a hidden model call.
 
 ## 2.1 Source Of Truth
 
@@ -123,6 +129,19 @@ For detached tasks, the path is:
 
 AetherOps no longer owns an internal executable tool runtime in the product path. Filesystem, command, browser, MCP, and external-tool behavior should be configured in opencode itself. AetherOps records opencode run events and changed-file summaries.
 
+### MCP configuration assistant
+
+The MCP tab is useful by design, but it is still not an AetherOps-owned MCP runtime.
+
+- Catalog route: `GET /api/mcp/catalog`.
+- Safe config metadata route: `GET /api/mcp/config/status`.
+- Test route: `POST /api/mcp/test-run`.
+- Deprecated execution/registration route: `POST /api/mcp/servers` returns `410 Gone`.
+
+The catalog provides copyable opencode config snippets, risk notes, recommended boundaries, and test prompts for common categories such as Filesystem, Browser/Web, GitHub, and Database. The test route creates a normal detached task through `TaskManager -> AgentEngine.runTurn(...) -> opencode`; it does not directly execute an MCP server.
+
+Path-safety rule: normal API responses show display-safe config labels. Absolute local config paths are only returned when debug path exposure is explicitly enabled.
+
 ### Computer Use
 
 Custom AetherOps Computer Use was removed from the product path. `/api/computer-use/*` returns `410 Gone`. Browser/computer automation should be configured in opencode or an opencode MCP integration.
@@ -130,6 +149,15 @@ Custom AetherOps Computer Use was removed from the product path. `/api/computer-
 ### Skills and plugins
 
 Internal skill/plugin execution was removed from the product path. Put repeatable behavior in agent standing orders, workflow step prompts, or opencode configuration.
+
+The Skill tab now exposes a template library, not an execution runtime.
+
+- Catalog route: `GET /api/skill-templates`.
+- Standing-order application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-standing-orders`.
+- Heartbeat application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-heartbeat`.
+- Deprecated execution route: `GET/POST /api/agents/:agentId/skills` still returns `410 Gone`.
+
+Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
 
 ### Memory
 
@@ -186,17 +214,33 @@ Task flows are ordered, observable long-running workflows on top of detached tas
 
 - storage: `task_flows` and `task_flow_steps`
 - runtime: [`server/lib/task-manager.ts`](../server/lib/task-manager.ts)
-- API: `POST /api/agents/:agentId/flows`, `GET /api/flows/:flowId`, `POST /api/flows/:flowId/start`, `POST /api/flows/:flowId/resume`, `POST /api/flows/:flowId/steps/:stepId/retry`, `POST /api/flows/:flowId/steps/:stepId/skip`, `POST /api/flows/:flowId/cancel`
+- API: `POST /api/agents/:agentId/flows`, `POST /api/agents/:agentId/flows/draft`, `GET /api/flows/:flowId`, `POST /api/flows/:flowId/start`, `POST /api/flows/:flowId/resume`, `POST /api/flows/:flowId/steps/:stepId/retry`, `POST /api/flows/:flowId/steps/:stepId/skip`, `POST /api/flows/:flowId/cancel`
 - UI: [`src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
 
 Rules:
 
 - only one runnable step is executed at a time
+- flow drafts are deterministic review objects and do not create DB flows until the operator saves them
 - a queued step runs only after its dependency is `completed` or `skipped`
 - failed steps fail the flow until the operator retries or resumes
 - retry resets the selected step and downstream dependency chain
 - skip counts as dependency-satisfied
 - `GET /api/flows/:flowId` includes linked task/run summaries for each step
+
+### Session summaries, artifacts, and run debugger
+
+These features improve observability without adding another execution runtime.
+
+- Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`.
+- Artifact routes: `GET /api/runs/:runId/artifacts?conversationId=<id>`, `GET /api/artifacts/:artifactId/preview`, `GET /api/artifacts/:artifactId/diff`.
+- Debug route: `GET /api/runs/:runId/debug?conversationId=<id>`.
+
+Safety invariants:
+
+- artifact paths are stored and returned as relative paths
+- preview is read-only and tied to the artifact's run/conversation ownership
+- unsupported or binary previews stay explicit instead of being coerced
+- debugger payloads are capped and intended for local diagnosis, not public log export
 
 ## 4. Frontend Architecture
 
@@ -285,10 +329,15 @@ High-value routes:
 - `GET /api/agents/:agentId/tasks/:taskId/events`
 - `GET/POST /api/conversations`
 - `GET /api/conversations/:id/messages`
+- `GET/PUT/POST /api/conversations/:id/summary`
 - `POST /api/chat/stream`
 - Removed workspace file CRUD routes return `410 Gone`; use opencode runs for file work.
 - `GET /api/workspace/runs`
 - `GET /api/workspace/runs/:runId/events`
+- `GET /api/runs/:runId/artifacts?conversationId=<id>`
+- `GET /api/runs/:runId/debug?conversationId=<id>`
+- `GET /api/artifacts/:artifactId/preview`
+- `GET /api/artifacts/:artifactId/diff`
 - `GET /api/plugins` returns empty local-plugin metadata for compatibility.
 - Removed internal tool/profile routes return `410 Gone`; use opencode MCP/tool configuration.
 - Removed memory and skill routes return `410 Gone`; use standing orders, workflow prompts, session history, and opencode artifacts.

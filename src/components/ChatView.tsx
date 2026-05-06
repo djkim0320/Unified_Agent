@@ -59,18 +59,18 @@ export function ChatView(props: ChatViewProps) {
             opencode 실행 이벤트와 변경 파일은 조종석 패널에 함께 기록됩니다.
           </p>
 
-          <div className="chat-view__starter-grid" aria-hidden="true">
+          <div className="chat-view__starter-grid" aria-label="빠른 시작 예시">
             <div className="chat-view__starter-card">
-              <strong>장기 작업 흐름</strong>
-              <span>요구사항, 조사, 후보안 비교, 실행 계획을 단계별 flow로 분해합니다.</span>
+              <strong>파일 생성</strong>
+              <span>예: 현재 세션 워크스페이스에 README 초안을 만들고 변경 파일을 요약해 줘.</span>
             </div>
             <div className="chat-view__starter-card">
-              <strong>opencode 실행</strong>
-              <span>파일 조사, 코드 변경, 명령 실행 결과를 run timeline으로 추적합니다.</span>
+              <strong>워크플로우 작성</strong>
+              <span>예: 요구사항 정리부터 결정 로그까지 긴 작업을 단계별 Flow로 나눠 줘.</span>
             </div>
             <div className="chat-view__starter-card">
-              <strong>연결 상태</strong>
-              <span>API/OAuth 설정과 엔진 상태를 분리해서 확인하고 실행 실패를 빠르게 파악합니다.</span>
+              <strong>조사 / 요약</strong>
+              <span>예: 이 세션의 최근 실행 로그와 변경 파일을 읽고 다음 액션을 제안해 줘.</span>
             </div>
           </div>
         </div>

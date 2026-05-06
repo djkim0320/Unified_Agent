@@ -157,6 +157,7 @@ describe("createApp", () => {
 
     const tokenResponse = await supertest(app)
       .get("/api/local-api-token")
+      .set("Host", "127.0.0.1:8787")
       .set("Origin", "http://127.0.0.1:5173")
       .expect(200);
     const token = tokenResponse.body.token as string;
@@ -185,6 +186,50 @@ describe("createApp", () => {
       .set("X-Local-API-Token", token)
       .send({ apiKey: "sk-valid" })
       .expect(200);
+  });
+
+  it("hardens local API token bootstrap to local hosts and origins", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    await supertest(app)
+      .get("/api/local-api-token")
+      .set("Host", "localhost:8787")
+      .set("Origin", "http://localhost:5173")
+      .expect(200);
+
+    await supertest(app)
+      .get("/api/local-api-token")
+      .set("Host", "evil.example:8787")
+      .set("Origin", "http://127.0.0.1:5173")
+      .expect(403);
+
+    await supertest(app)
+      .get("/api/local-api-token")
+      .set("Host", "127.0.0.1:8787")
+      .set("Origin", "https://evil.example")
+      .expect(403);
+  });
+
+  it("can disable local API token bootstrap exposure in stricter mode", async () => {
+    const previous = process.env.AETHEROPS_EXPOSE_LOCAL_API_TOKEN;
+    process.env.AETHEROPS_EXPOSE_LOCAL_API_TOKEN = "false";
+    try {
+      const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+      openStores.push(store);
+
+      await supertest(app)
+        .get("/api/local-api-token")
+        .set("Host", "127.0.0.1:8787")
+        .set("Origin", "http://127.0.0.1:5173")
+        .expect(404);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AETHEROPS_EXPOSE_LOCAL_API_TOKEN;
+      } else {
+        process.env.AETHEROPS_EXPOSE_LOCAL_API_TOKEN = previous;
+      }
+    }
   });
 
   it("returns a backend health status for the local UI", async () => {
@@ -314,6 +359,65 @@ describe("createApp", () => {
     expect(response.body.engineKind).toBe("opencode");
     expect(skillsResponse.body.engineKind).toBe("opencode");
     expect(fs.existsSync(path.join(projectRoot, "workspace", "agents"))).toBe(false);
+  });
+
+  it("exposes skill templates and applies them only as opencode prompt metadata", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+
+    const catalogResponse = await request(app).get("/api/skill-templates").expect(200);
+    expect(catalogResponse.body.boundary).toContain("does not execute skills directly");
+    expect(catalogResponse.body.templates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "codebase-review",
+          name: "Codebase Review",
+          flowTemplate: expect.objectContaining({
+            steps: expect.arrayContaining([
+              expect.objectContaining({ stepKey: "scope" }),
+            ]),
+          }),
+        }),
+        expect.objectContaining({ id: "aircraft-research-flow" }),
+        expect.objectContaining({ id: "cfd-preparation-flow" }),
+      ]),
+    );
+    expect(catalogResponse.body.templates).toHaveLength(9);
+
+    const standingResponse = await request(app)
+      .post("/api/agents/default-agent/skill-templates/codebase-review/apply-standing-orders")
+      .send({})
+      .expect(200);
+    expect(standingResponse.body.applied).toBe(true);
+    expect(standingResponse.body.standingOrders.content).toContain("## Skill: Codebase Review");
+    expect(standingResponse.body.boundary).toContain("opencode-only");
+
+    const duplicateStandingResponse = await request(app)
+      .post("/api/agents/default-agent/skill-templates/codebase-review/apply-standing-orders")
+      .send({})
+      .expect(200);
+    expect(duplicateStandingResponse.body.applied).toBe(false);
+    expect(
+      (
+        duplicateStandingResponse.body.standingOrders.content.match(
+          /aetherops-skill-template:standing-orders:codebase-review/g,
+        ) ?? []
+      ).length,
+    ).toBe(1);
+
+    const heartbeatBefore = await request(app).get("/api/agents/default-agent/heartbeat").expect(200);
+    expect(heartbeatBefore.body.heartbeat.enabled).toBe(false);
+
+    const heartbeatResponse = await request(app)
+      .post("/api/agents/default-agent/skill-templates/codebase-review/apply-heartbeat")
+      .send({})
+      .expect(200);
+    expect(heartbeatResponse.body.applied).toBe(true);
+    expect(heartbeatResponse.body.heartbeat.enabled).toBe(false);
+    expect(heartbeatResponse.body.heartbeat.instructions).toContain("## Skill: Codebase Review");
+
+    const legacySkillsResponse = await request(app).get("/api/agents/default-agent/skills").expect(410);
+    expect(legacySkillsResponse.body.engineKind).toBe("opencode");
   });
 
   it("returns Gone for metadata-only MCP bridge profiles in opencode-only mode", async () => {
@@ -906,6 +1010,45 @@ describe("createApp", () => {
     expect(eventsResponse.status).toBe(200);
     expect(eventsResponse.body.events.map((event: { eventType: string }) => event.eventType)).toEqual(
       expect.arrayContaining(["queued", "cancelled"]),
+    );
+
+    const debugResponse = await request(app).get(`/api/agents/${owner.id}/tasks/${taskId}/debug`);
+    expect(debugResponse.status).toBe(200);
+    expect(debugResponse.body.summary).toEqual(
+      expect.objectContaining({
+        status: "cancelled",
+        taskKind: "detached",
+      }),
+    );
+    expect(debugResponse.body.task.prompt).toBeUndefined();
+  });
+
+  it("returns execution preflight checks for the selected agent and conversation", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      agentId: "default-agent",
+      title: "Preflight session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+
+    const response = await request(app)
+      .get(`/api/preflight?agentId=default-agent&conversationId=${conversation.id}`)
+      .expect(200);
+
+    expect(response.body).toEqual(
+      expect.objectContaining({
+        ok: expect.any(Boolean),
+        checks: expect.arrayContaining([
+          expect.objectContaining({ id: "backend", status: "ok" }),
+          expect.objectContaining({ id: "agent", status: "ok" }),
+          expect.objectContaining({ id: "conversation", status: "ok" }),
+          expect.objectContaining({ id: "workspace", status: "ok" }),
+          expect.objectContaining({ id: "scheduler" }),
+        ]),
+      }),
     );
   });
 
@@ -1536,6 +1679,16 @@ describe("createApp", () => {
         }),
       ]),
     );
+    expect(flowResponse.body.report).toEqual(
+      expect.objectContaining({
+        kind: "report",
+        title: "Flow Report: Ship patch",
+        metadata: expect.objectContaining({
+          reportType: "flow",
+          flowId,
+        }),
+      }),
+    );
 
     const retryResponse = await request(app).post(
       `/api/flows/${flowId}/steps/${flowResponse.body.steps[0].id}/retry`,
@@ -1721,8 +1874,8 @@ describe("createApp", () => {
         title: "Editable flow revised",
         steps: [
           { stepKey: "summarize", title: "Summarize revised", prompt: "Summarize revised." },
-          { stepKey: "inspect", title: "Inspect revised", prompt: "Inspect revised." },
-          { stepKey: "verify", title: "Verify", prompt: "Verify." },
+          { stepKey: "inspect", title: "Inspect revised", prompt: "Inspect revised.", dependencyStepKey: "summarize" },
+          { stepKey: "verify", title: "Verify", prompt: "Verify.", dependencyStepKey: "inspect" },
         ],
       })
       .expect(200);
@@ -1751,6 +1904,16 @@ describe("createApp", () => {
         steps: [
           { stepKey: "same", title: "Same 1", prompt: "Same 1." },
           { stepKey: "same", title: "Same 2", prompt: "Same 2." },
+        ],
+      })
+      .expect(400);
+
+    await request(app)
+      .put(`/api/flows/${flowId}/steps`)
+      .send({
+        steps: [
+          { stepKey: "a", title: "A", prompt: "A.", dependencyStepKey: "b" },
+          { stepKey: "b", title: "B", prompt: "B.", dependencyStepKey: "a" },
         ],
       })
       .expect(400);
@@ -2070,5 +2233,274 @@ describe("createApp", () => {
     expect(runs[0].status).toBe("cancelled");
     const events = store.listWorkspaceRunEvents(conversationId, runs[0].id);
     expect(events.filter((event) => event.eventType === "run_cancelled")).toHaveLength(1);
+  });
+
+  it("generates deterministic flow drafts without creating database flows", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Flow draft session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+
+    const response = await request(app)
+      .post("/api/agents/default-agent/flows/draft")
+      .send({
+        conversationId: conversation.id,
+        prompt: "1. 요구사항 정리\n2. 자료 조사\n3. 검증",
+        title: "항공 연구 Flow",
+      })
+      .expect(200);
+
+    expect(response.body.draft.title).toBe("항공 연구 Flow");
+    expect(response.body.draft.steps.map((step: { stepKey: string }) => step.stepKey)).toEqual([
+      "requirements",
+      "research",
+      "verification",
+    ]);
+    expect(response.body.draft.steps[1].dependencyStepKey).toBe("requirements");
+    expect(store.listTaskFlows("default-agent")).toEqual([]);
+  });
+
+  it("stores, refreshes, and reads session summaries", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Summary session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    store.appendMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "항공 연구 자동화 계획을 정리해줘.",
+    });
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Create report",
+    });
+    store.finalizeWorkspaceRun(run.id, "completed", "run_complete", {
+      changedFiles: ["report.md"],
+    });
+
+    const refreshed = await request(app)
+      .post(`/api/conversations/${conversation.id}/summary/refresh`)
+      .send({})
+      .expect(200);
+    expect(refreshed.body.summary.summary).toContain("항공 연구 자동화");
+    expect(refreshed.body.summary.summary).toContain("report.md");
+
+    const saved = await request(app)
+      .put(`/api/conversations/${conversation.id}/summary`)
+      .send({
+        summary: "사용자가 직접 정리한 세션 요약",
+        decisions: ["opencode-only 유지"],
+        openQuestions: ["검증 범위"],
+        nextActions: ["Flow 생성"],
+      })
+      .expect(200);
+    expect(saved.body.summary.decisions).toEqual(["opencode-only 유지"]);
+
+    const read = await request(app)
+      .get(`/api/conversations/${conversation.id}/summary`)
+      .expect(200);
+    expect(read.body.summary.summary).toBe("사용자가 직접 정리한 세션 요약");
+  });
+
+  it("indexes run-scoped artifacts, previews text safely, and returns run debug data", async () => {
+    const { app, store, workspace } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Artifact session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    workspace.createConversationWorkspace(conversation.id);
+    workspace.writeFile({
+      conversationId: conversation.id,
+      scope: "sandbox",
+      relativePath: "notes/report.md",
+      content: "# Report\n\nhello artifact",
+    });
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "write report",
+    });
+    const artifacts = store.createArtifactsForRun({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      runId: run.id,
+      changedFiles: ["notes/report.md"],
+    });
+    store.finalizeWorkspaceRun(run.id, "completed", "run_complete", {
+      changedFiles: ["notes/report.md"],
+      engineRun: {
+        runId: run.id,
+        engineKind: "opencode",
+        status: "completed",
+        externalSessionId: "opencode-session",
+        workspacePath: ".",
+        model: "openai/gpt-5.4",
+        command: null,
+        exitCode: 0,
+        eventSummary: {},
+        startedAt: run.createdAt,
+        completedAt: Date.now(),
+      },
+    });
+
+    const listResponse = await request(app)
+      .get(`/api/runs/${run.id}/artifacts?conversationId=${conversation.id}`)
+      .expect(200);
+    expect(listResponse.body.artifacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "notes/report.md",
+          title: "report.md",
+        }),
+        expect.objectContaining({
+          kind: "report",
+          title: "Run Completion Report",
+          metadata: expect.objectContaining({
+            reportType: "run",
+          }),
+        }),
+      ]),
+    );
+    const reportArtifact = listResponse.body.artifacts.find(
+      (artifact: { kind: string }) => artifact.kind === "report",
+    );
+    expect(reportArtifact).toBeTruthy();
+
+    const previewResponse = await request(app)
+      .get(`/api/artifacts/${artifacts[0].id}/preview`)
+      .expect(200);
+    expect(previewResponse.body.preview.content).toContain("hello artifact");
+    expect(JSON.stringify(previewResponse.body)).not.toContain(dataDir);
+
+    const reportPreviewResponse = await request(app)
+      .get(`/api/artifacts/${reportArtifact.id}/preview`)
+      .expect(200);
+    expect(reportPreviewResponse.body.preview.content).toContain("Run Completion Report");
+    expect(reportPreviewResponse.body.preview.content).not.toContain(dataDir);
+
+    const diffResponse = await request(app)
+      .get(`/api/artifacts/${artifacts[0].id}/diff`)
+      .expect(200);
+    expect(diffResponse.body.diff.available).toBe(false);
+
+    const debugResponse = await request(app)
+      .get(`/api/runs/${run.id}/debug?conversationId=${conversation.id}`)
+      .expect(200);
+    expect(debugResponse.body.summary).toEqual(
+      expect.objectContaining({
+        status: "completed",
+        artifactCount: 2,
+        changedFiles: ["notes/report.md"],
+      }),
+    );
+    expect(debugResponse.body.report).toEqual(
+      expect.objectContaining({
+        id: reportArtifact.id,
+        kind: "report",
+      }),
+    );
+    expect(debugResponse.body.engineRun).toEqual(
+      expect.objectContaining({
+        engineKind: "opencode",
+      }),
+    );
+    expect(JSON.stringify(debugResponse.body)).not.toContain("write report");
+    expect(debugResponse.body.run).toEqual(
+      expect.objectContaining({
+        hasUserMessage: true,
+      }),
+    );
+  });
+
+  it("exposes opencode MCP catalog/status and creates only opencode-backed test tasks", async () => {
+    const previousConfigContent = process.env.OPENCODE_CONFIG_CONTENT;
+    const previousConfigDir = process.env.OPENCODE_CONFIG_DIR;
+    process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify({
+      mcp: {
+        filesystem: {
+          type: "stdio",
+          command: "mock-filesystem-mcp",
+          args: ["D:\\sensitive\\absolute\\path"],
+        },
+      },
+    });
+    delete process.env.OPENCODE_CONFIG_DIR;
+
+    try {
+      const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+      openStores.push(store);
+      const conversation = store.saveConversation({
+        title: "MCP test session",
+        providerKind: "openai",
+        model: "gpt-5.4",
+        reasoningLevel: "medium",
+      });
+
+      const catalogResponse = await request(app).get("/api/mcp/catalog").expect(200);
+      expect(catalogResponse.body.boundary).toContain("직접 실행하지 않습니다");
+      expect(catalogResponse.body.servers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "filesystem",
+            riskLevel: "high",
+          }),
+        ]),
+      );
+
+      const statusResponse = await request(app).get("/api/mcp/config/status").expect(200);
+      expect(statusResponse.body.status.configuredCount).toBe(1);
+      expect(statusResponse.body.status.configuredServers[0]).toEqual(
+        expect.objectContaining({
+          id: "filesystem",
+          status: "configured",
+        }),
+      );
+      expect(JSON.stringify(statusResponse.body)).not.toContain(dataDir);
+      expect(statusResponse.body.status.displayPath).toBe("opencode 기본 설정 경로");
+
+      const testRunResponse = await request(app)
+        .post("/api/mcp/test-run")
+        .send({
+          agentId: "default-agent",
+          conversationId: conversation.id,
+          catalogId: "filesystem",
+          autoStart: false,
+        })
+        .expect(200);
+      expect(testRunResponse.body.boundary).toContain("did not execute MCP directly");
+      expect(testRunResponse.body.task).toEqual(
+        expect.objectContaining({
+          taskKind: "detached",
+          status: "queued",
+          conversationId: conversation.id,
+        }),
+      );
+      expect(testRunResponse.body.prompt).toContain("Do not modify files");
+    } finally {
+      if (previousConfigContent === undefined) {
+        delete process.env.OPENCODE_CONFIG_CONTENT;
+      } else {
+        process.env.OPENCODE_CONFIG_CONTENT = previousConfigContent;
+      }
+      if (previousConfigDir === undefined) {
+        delete process.env.OPENCODE_CONFIG_DIR;
+      } else {
+        process.env.OPENCODE_CONFIG_DIR = previousConfigDir;
+      }
+    }
   });
 });

@@ -8,14 +8,28 @@ import { createStore } from "./db.js";
 describe("workspace run persistence consistency", () => {
   let dataDir: string;
   let store: ReturnType<typeof createStore>;
+  let originalMaxRunEvents: string | undefined;
+  let originalMaxTaskEvents: string | undefined;
 
   beforeEach(() => {
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-db-"));
+    originalMaxRunEvents = process.env.AETHEROPS_MAX_RUN_EVENTS_PER_RUN;
+    originalMaxTaskEvents = process.env.AETHEROPS_MAX_TASK_EVENTS_PER_TASK;
     store = createStore(dataDir);
   });
 
   afterEach(() => {
     store.rawDb.close();
+    if (originalMaxRunEvents === undefined) {
+      delete process.env.AETHEROPS_MAX_RUN_EVENTS_PER_RUN;
+    } else {
+      process.env.AETHEROPS_MAX_RUN_EVENTS_PER_RUN = originalMaxRunEvents;
+    }
+    if (originalMaxTaskEvents === undefined) {
+      delete process.env.AETHEROPS_MAX_TASK_EVENTS_PER_TASK;
+    } else {
+      process.env.AETHEROPS_MAX_TASK_EVENTS_PER_TASK = originalMaxTaskEvents;
+    }
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
@@ -34,7 +48,7 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ version: number; name: string }>;
 
     expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
     );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
@@ -517,6 +531,217 @@ describe("workspace run persistence consistency", () => {
       }),
     );
     expect(store.listTaskEvents(agent.id, task.id)).toHaveLength(eventCountAfterComplete);
+  });
+
+  it("recovers stale running tasks, runs, heartbeat logs, and flow steps after restart", () => {
+    const agent = store.getDefaultAgent();
+    const conversation = createConversation("restart recovery");
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "long run",
+    });
+    const task = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Detached work",
+      prompt: "Keep working",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "high",
+      taskKind: "detached",
+    });
+    store.transitionTask({
+      taskId: task.id,
+      status: "running",
+      eventType: "running",
+      runId: run.id,
+      payload: { started: true },
+    });
+    const heartbeat = store.createHeartbeatLog({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      triggerSource: "manual",
+      summary: "Heartbeat queued",
+    });
+    store.transitionHeartbeatLog({
+      id: heartbeat.id,
+      taskId: task.id,
+      status: "running",
+      summary: "Heartbeat running",
+    });
+
+    const flow = store.createTaskFlow({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Recovery flow",
+    });
+    const step = store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "step-1",
+      title: "Step one",
+      prompt: "Do step one",
+    });
+    const flowTask = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: step.title,
+      prompt: step.prompt,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      taskKind: "flow_step",
+      taskFlowId: flow.id,
+      flowStepKey: step.stepKey,
+    });
+    store.transitionTaskFlow({ flowId: flow.id, status: "running" });
+    store.transitionTaskFlowStep({ stepId: step.id, taskId: flowTask.id, status: "running" });
+    store.transitionTask({
+      taskId: flowTask.id,
+      status: "running",
+      eventType: "running",
+      payload: { flowStep: true },
+    });
+
+    const completedTask = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Already done",
+      prompt: "Done",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    store.transitionTask({
+      taskId: completedTask.id,
+      status: "completed",
+      eventType: "completed",
+      resultText: "complete",
+    });
+
+    const recovery = store.recoverStaleRunningWork();
+
+    expect(recovery).toEqual({
+      tasks: 2,
+      workspaceRuns: 1,
+      taskFlowSteps: 1,
+      taskFlows: 1,
+    });
+    expect(store.getTask(task.id)).toEqual(
+      expect.objectContaining({
+        status: "cancelled",
+        resultText: expect.stringContaining("server restarted"),
+      }),
+    );
+    expect(store.getTask(flowTask.id)).toEqual(expect.objectContaining({ status: "cancelled" }));
+    expect(store.getTask(completedTask.id)).toEqual(expect.objectContaining({ status: "completed" }));
+    expect(store.getWorkspaceRun(run.id)).toEqual(
+      expect.objectContaining({
+        status: "cancelled",
+        phase: "cancelled",
+      }),
+    );
+    expect(store.getTaskFlow(flow.id)).toEqual(
+      expect.objectContaining({
+        status: "cancelled",
+        errorText: expect.stringContaining("server restarted"),
+      }),
+    );
+    expect(store.getTaskFlowStep(step.id)).toEqual(expect.objectContaining({ status: "cancelled" }));
+    expect(store.listHeartbeatLogs(agent.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: heartbeat.id,
+          status: "cancelled",
+          errorText: expect.stringContaining("server restarted"),
+        }),
+      ]),
+    );
+    expect(store.listTaskEvents(agent.id, task.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "cancelled",
+          payload: expect.objectContaining({ reason: "server_restart_recovery" }),
+        }),
+      ]),
+    );
+    expect(store.listWorkspaceRunEvents(conversation.id, run.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: "run_cancelled",
+          payload: expect.objectContaining({ reason: "server_restart_recovery" }),
+        }),
+      ]),
+    );
+  });
+
+  it("applies configurable retention limits to run and task events without deleting messages", () => {
+    store.rawDb.close();
+    process.env.AETHEROPS_MAX_RUN_EVENTS_PER_RUN = "3";
+    process.env.AETHEROPS_MAX_TASK_EVENTS_PER_TASK = "2";
+    store = createStore(dataDir);
+
+    const agent = store.getDefaultAgent();
+    const conversation = createConversation("retention");
+    store.appendMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "keep this message",
+    });
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "retention run",
+    });
+    for (let index = 0; index < 5; index += 1) {
+      const timestamp = Date.now();
+      while (Date.now() === timestamp) {
+        // Keep retention ordering deterministic for this millisecond-resolution store.
+      }
+      store.appendWorkspaceRunEvent({
+        runId: run.id,
+        eventType: "status",
+        payload: { index },
+      });
+    }
+
+    const task = store.createTask({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      title: "Retention task",
+      prompt: "Prune task events",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    for (let index = 0; index < 4; index += 1) {
+      const timestamp = Date.now();
+      while (Date.now() === timestamp) {
+        // Keep retention ordering deterministic for this millisecond-resolution store.
+      }
+      store.appendTaskEvent({
+        taskId: task.id,
+        eventType: "status",
+        payload: { index },
+      });
+    }
+
+    const runEvents = store.listWorkspaceRunEvents(conversation.id, run.id);
+    const taskEvents = store.listTaskEvents(agent.id, task.id);
+
+    expect(runEvents).toHaveLength(3);
+    expect(runEvents.map((event) => event.payload.index)).toEqual([2, 3, 4]);
+    expect(taskEvents).toHaveLength(2);
+    expect(taskEvents.map((event) => event.payload.index)).toEqual([2, 3]);
+    expect(store.listMessages(conversation.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "keep this message",
+        }),
+      ]),
+    );
   });
 
   it("stores task metadata and heartbeat logs", () => {

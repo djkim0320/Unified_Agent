@@ -1,30 +1,45 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  applySkillTemplateToHeartbeat,
+  applySkillTemplateToStandingOrders,
   cancelAgentTask,
   cancelSubagentSession,
   cancelTaskFlow,
   createAgentAutomationRule,
   createAgentTask,
+  createMcpTestRun,
   createSubagentSession,
   createTaskFlow,
+  draftFlowFromPrompt,
   deleteAgent,
   deleteAgentAutomationRule,
   deleteTaskFlow,
   getAgentHeartbeat,
   getEngineRun,
+  getMcpCatalog,
+  getMcpConfigStatus,
+  getPreflightStatus,
+  getRunDebug,
+  getTaskDebug,
   getAgentSoul,
   getAgentStandingOrders,
+  getConversationSummary,
   listChannels,
   listAgentAutomationRules,
   listAgentTasks,
   listHeartbeatLogs,
   listPlatformMetadata,
   listPlugins,
+  listRunArtifacts,
+  listSkillTemplates,
   listSubagentSessions,
   listTaskEvents,
   listTaskFlows,
   listWorkspaceRunEvents,
+  previewArtifact,
+  refreshConversationSummary,
   saveAgentStandingOrders,
+  saveConversationSummary,
   saveAgentHeartbeat,
   saveAgentSoul,
   saveTaskFlowSteps,
@@ -152,6 +167,242 @@ describe("api helpers", () => {
           "Content-Type": "application/json",
         }),
       }),
+    );
+  });
+
+  it("uses flow draft, summary, artifacts, preview, and run debug endpoints", async () => {
+    vi.mocked(fetch).mockImplementation(async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/flows/draft")) {
+        return new Response(JSON.stringify({ draft: { title: "Draft", steps: [] } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/summary/refresh")) {
+        return new Response(JSON.stringify({ summary: { conversationId: "conversation-1", summary: "fresh" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/summary")) {
+        return new Response(JSON.stringify({ summary: { conversationId: "conversation-1", summary: "saved" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/artifacts") && !url.includes("/preview")) {
+        return new Response(JSON.stringify({ artifacts: [] }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/preview")) {
+        return new Response(JSON.stringify({ artifact: { id: "artifact-1" }, preview: { content: "ok" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/debug")) {
+        return new Response(JSON.stringify({ run: { id: "run-1" }, summary: { status: "completed" } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await draftFlowFromPrompt("agent-1", { conversationId: "conversation-1", prompt: "make a flow" });
+    await getConversationSummary("conversation-1");
+    await saveConversationSummary("conversation-1", { summary: "saved" });
+    await refreshConversationSummary("conversation-1");
+    await listRunArtifacts("conversation-1", "run-1");
+    await previewArtifact("artifact-1");
+    await getRunDebug("conversation-1", "run-1");
+    await getPreflightStatus({ agentId: "agent-1", conversationId: "conversation-1" });
+    await getTaskDebug("agent-1", "task-1");
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/agents/agent-1/flows/draft",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/conversations/conversation-1/summary",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      "/api/conversations/conversation-1/summary",
+      expect.objectContaining({ method: "PUT" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      4,
+      "/api/conversations/conversation-1/summary/refresh",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      5,
+      "/api/runs/run-1/artifacts?conversationId=conversation-1",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      6,
+      "/api/artifacts/artifact-1/preview",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      7,
+      "/api/runs/run-1/debug?conversationId=conversation-1",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      8,
+      "/api/preflight?agentId=agent-1&conversationId=conversation-1",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      9,
+      "/api/agents/agent-1/tasks/task-1/debug",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "Content-Type": "application/json",
+        }),
+      }),
+    );
+  });
+
+  it("uses opencode MCP metadata and test-run endpoints", async () => {
+    vi.mocked(fetch).mockImplementation(async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.includes("/catalog")) {
+        return new Response(JSON.stringify({ servers: [], boundary: "opencode only" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/config/status")) {
+        return new Response(
+          JSON.stringify({
+            status: {
+              engineAvailable: true,
+              configDirSource: "default",
+              displayPath: "opencode 기본 설정 경로",
+              configuredCount: 0,
+              configuredServers: [],
+              warnings: [],
+            },
+          }),
+          {
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      return new Response(JSON.stringify({ task: {}, conversation: {}, prompt: "", boundary: "" }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await getMcpCatalog();
+    await getMcpConfigStatus();
+    await createMcpTestRun({ agentId: "agent-1", conversationId: "conversation-1", catalogId: "filesystem" });
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/mcp/catalog",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/mcp/config/status",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      "/api/mcp/test-run",
+      expect.objectContaining({
+        method: "POST",
+      }),
+    );
+  });
+
+  it("uses skill template catalog and apply endpoints", async () => {
+    vi.mocked(fetch).mockImplementation(async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url === "/api/skill-templates") {
+        return new Response(JSON.stringify({ templates: [], boundary: "metadata only" }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/apply-standing-orders")) {
+        return new Response(
+          JSON.stringify({
+            standingOrders: { path: "STANDING_ORDERS.md", content: "# orders" },
+            template: { id: "codebase-review" },
+            applied: true,
+            message: "ok",
+            boundary: "metadata only",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.includes("/apply-heartbeat")) {
+        return new Response(
+          JSON.stringify({
+            heartbeat: {
+              path: "HEARTBEAT.md",
+              content: "",
+              enabled: false,
+              intervalMinutes: 60,
+              lastRun: null,
+              instructions: "review",
+              parseError: null,
+            },
+            template: { id: "codebase-review" },
+            applied: true,
+            message: "ok",
+            boundary: "metadata only",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await listSkillTemplates();
+    await applySkillTemplateToStandingOrders("agent-1", "codebase-review");
+    await applySkillTemplateToHeartbeat("agent-1", "codebase-review");
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      "/api/skill-templates",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/agent-1/skill-templates/codebase-review/apply-standing-orders",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetch).toHaveBeenNthCalledWith(
+      3,
+      "/api/agents/agent-1/skill-templates/codebase-review/apply-heartbeat",
+      expect.objectContaining({ method: "POST" }),
     );
   });
 

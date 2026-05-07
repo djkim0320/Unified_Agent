@@ -14,6 +14,7 @@ import {
 } from "./db/migrations.js";
 import {
   createArtifactsSql,
+  createArtifactVersionsSql,
   createAutomationRulesSql,
   createConversationsSql,
   createHeartbeatLogsSql,
@@ -22,6 +23,7 @@ import {
   createTaskFlowsSql,
   createTaskFlowStepsSql,
   createTasksSql,
+  createSkillTemplatesSql,
   createWorkspaceRunEventsSql,
   createWorkspaceRunsSql,
 } from "./db/schema.js";
@@ -29,11 +31,13 @@ import {
   mapAccount,
   mapAgent,
   mapArtifact,
+  mapArtifactVersion,
   mapAutomationRule,
   mapConversation,
   mapHeartbeatLog,
   mapMessage,
   mapSessionSummary,
+  mapSkillTemplate,
   mapTask,
   mapTaskEvent,
   mapTaskFlow,
@@ -43,12 +47,14 @@ import {
   type AccountRow,
   type AgentRow,
   type ArtifactRow,
+  type ArtifactVersionRow,
   type AutomationRuleRow,
   type ConversationRow,
   type HeartbeatLogRow,
   type MessageRow,
   type SecretRow,
   type SessionSummaryRow,
+  type SkillTemplateRow,
   type TaskEventRow,
   type TaskFlowRow,
   type TaskFlowStepRow,
@@ -60,6 +66,7 @@ import type {
   AgentRecord,
   ArtifactKind,
   ArtifactRecord,
+  ArtifactVersionRecord,
   AutomationRuleRecord,
   ConversationRecord,
   HeartbeatLogRecord,
@@ -72,6 +79,7 @@ import type {
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
+  SkillTemplateRecord,
   TaskKind,
   TaskFlowRecord,
   TaskFlowStatus,
@@ -510,6 +518,10 @@ export function createStore(dataDir: string) {
 
     ${createArtifactsSql("artifacts")}
 
+    ${createArtifactVersionsSql("artifact_versions")}
+
+    ${createSkillTemplatesSql("skill_templates")}
+
     ${createHeartbeatLogsSql("heartbeat_logs")}
 
     ${createAutomationRulesSql("automation_rules")}
@@ -558,6 +570,24 @@ export function createStore(dataDir: string) {
       ${createArtifactsSql("artifacts")}
     `);
   });
+  runSchemaMigration(db, 12, "artifact_versions_summary_metadata_and_skill_templates", () => {
+    const summaryColumns = db
+      .prepare(`PRAGMA table_info(session_summaries)`)
+      .all() as Array<{ name: string }>;
+    if (!summaryColumns.some((column) => column.name === "metadata_json")) {
+      db.exec(`ALTER TABLE session_summaries ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'`);
+    }
+    db.exec(`
+      ${createArtifactVersionsSql("artifact_versions")}
+      ${createSkillTemplatesSql("skill_templates")}
+    `);
+  });
+  const summaryColumns = db
+    .prepare(`PRAGMA table_info(session_summaries)`)
+    .all() as Array<{ name: string }>;
+  if (!summaryColumns.some((column) => column.name === "metadata_json")) {
+    db.exec(`ALTER TABLE session_summaries ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'`);
+  }
   migrateAutomationRuleColumns(db);
   db.exec(`
     CREATE INDEX IF NOT EXISTS automation_rules_agent_due_idx
@@ -568,6 +598,10 @@ export function createStore(dataDir: string) {
       ON artifacts(conversation_id, run_id, created_at);
     CREATE INDEX IF NOT EXISTS artifacts_run_path_idx
       ON artifacts(run_id, path);
+    CREATE INDEX IF NOT EXISTS artifact_versions_artifact_idx
+      ON artifact_versions(artifact_id, created_at);
+    CREATE INDEX IF NOT EXISTS skill_templates_agent_scope_idx
+      ON skill_templates(agent_id, scope, updated_at);
   `);
 
   const upsertProviderAccount = db.prepare(`
@@ -678,15 +712,16 @@ export function createStore(dataDir: string) {
 
   const upsertSessionSummaryStmt = db.prepare(`
     INSERT INTO session_summaries (
-      conversation_id, summary, decisions_json, open_questions_json, next_actions_json, created_at, updated_at
+      conversation_id, summary, decisions_json, open_questions_json, next_actions_json, metadata_json, created_at, updated_at
     ) VALUES (
-      @conversation_id, @summary, @decisions_json, @open_questions_json, @next_actions_json, @created_at, @updated_at
+      @conversation_id, @summary, @decisions_json, @open_questions_json, @next_actions_json, @metadata_json, @created_at, @updated_at
     )
     ON CONFLICT(conversation_id) DO UPDATE SET
       summary = excluded.summary,
       decisions_json = excluded.decisions_json,
       open_questions_json = excluded.open_questions_json,
       next_actions_json = excluded.next_actions_json,
+      metadata_json = excluded.metadata_json,
       updated_at = excluded.updated_at;
   `);
 
@@ -696,6 +731,42 @@ export function createStore(dataDir: string) {
     ) VALUES (
       @id, @agent_id, @conversation_id, @run_id, @task_id, @kind, @title, @path, @summary, @metadata_json, @created_at, @updated_at
     );
+  `);
+
+  const insertArtifactVersionStmt = db.prepare(`
+    INSERT INTO artifact_versions (
+      id, artifact_id, run_id, path, before_content, after_content, before_hash, after_hash,
+      size_bytes, encoding, binary, truncated, created_at
+    ) VALUES (
+      @id, @artifact_id, @run_id, @path, @before_content, @after_content, @before_hash, @after_hash,
+      @size_bytes, @encoding, @binary, @truncated, @created_at
+    );
+  `);
+
+  const upsertSkillTemplateStmt = db.prepare(`
+    INSERT INTO skill_templates (
+      id, agent_id, scope, name, category, summary, description, standing_order_patch,
+      flow_template_json, verification_checklist_json, heartbeat_instructions, suggested_prompt,
+      tags_json, created_at, updated_at
+    ) VALUES (
+      @id, @agent_id, @scope, @name, @category, @summary, @description, @standing_order_patch,
+      @flow_template_json, @verification_checklist_json, @heartbeat_instructions, @suggested_prompt,
+      @tags_json, @created_at, @updated_at
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      agent_id = excluded.agent_id,
+      scope = excluded.scope,
+      name = excluded.name,
+      category = excluded.category,
+      summary = excluded.summary,
+      description = excluded.description,
+      standing_order_patch = excluded.standing_order_patch,
+      flow_template_json = excluded.flow_template_json,
+      verification_checklist_json = excluded.verification_checklist_json,
+      heartbeat_instructions = excluded.heartbeat_instructions,
+      suggested_prompt = excluded.suggested_prompt,
+      tags_json = excluded.tags_json,
+      updated_at = excluded.updated_at;
   `);
 
   const deleteRunFileArtifactsStmt = db.prepare(`
@@ -1279,6 +1350,19 @@ export function createStore(dataDir: string) {
       return rows.map(mapWorkspaceRun);
     },
 
+    getLatestSuccessfulWorkspaceRun(): WorkspaceRunRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
+           FROM workspace_runs
+           WHERE status = 'completed'
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get() as WorkspaceRunRow | undefined;
+      return row ? mapWorkspaceRun(row) : null;
+    },
+
     patchWorkspaceRun(input: {
       runId: string;
       taskId?: string | null;
@@ -1385,7 +1469,7 @@ export function createStore(dataDir: string) {
     getSessionSummary(conversationId: string): SessionSummaryRecord | null {
       const row = db
         .prepare(
-          `SELECT conversation_id, summary, decisions_json, open_questions_json, next_actions_json, created_at, updated_at
+          `SELECT conversation_id, summary, decisions_json, open_questions_json, next_actions_json, metadata_json, created_at, updated_at
            FROM session_summaries
            WHERE conversation_id = ?`,
         )
@@ -1399,6 +1483,7 @@ export function createStore(dataDir: string) {
       decisions?: string[];
       openQuestions?: string[];
       nextActions?: string[];
+      metadata?: SessionSummaryRecord["metadata"];
     }): SessionSummaryRecord {
       if (!store.getConversation(input.conversationId)) {
         throw new Error("Conversation not found.");
@@ -1411,6 +1496,7 @@ export function createStore(dataDir: string) {
         decisions_json: JSON.stringify(input.decisions ?? []),
         open_questions_json: JSON.stringify(input.openQuestions ?? []),
         next_actions_json: JSON.stringify(input.nextActions ?? []),
+        metadata_json: JSON.stringify(input.metadata ?? existing?.metadata ?? {}),
         created_at: existing?.createdAt ?? timestamp,
         updated_at: timestamp,
       });
@@ -1528,18 +1614,34 @@ export function createStore(dataDir: string) {
       runId: string;
       taskId?: string | null;
       changedFiles: string[];
+      snapshots?: Array<{
+        path: string;
+        beforeContent?: string | null;
+        afterContent?: string | null;
+        beforeHash?: string | null;
+        afterHash?: string | null;
+        sizeBytes?: number | null;
+        encoding?: string | null;
+        binary?: boolean;
+        truncated?: boolean;
+      }>;
     }): ArtifactRecord[] {
       const run = store.getWorkspaceRunForConversation(input.conversationId, input.runId);
       if (!run) {
         throw new Error("Workspace run not found.");
       }
       const uniquePaths = [...new Set(input.changedFiles.map(normalizeArtifactPath))];
+      const snapshotsByPath = new Map(
+        (input.snapshots ?? []).map((snapshot) => [normalizeArtifactPath(snapshot.path), snapshot]),
+      );
       const timestamp = now();
       db.transaction(() => {
         deleteRunFileArtifactsStmt.run(input.runId);
         for (const filePath of uniquePaths) {
+          const artifactId = crypto.randomUUID();
+          const snapshot = snapshotsByPath.get(filePath);
           insertArtifactStmt.run({
-            id: crypto.randomUUID(),
+            id: artifactId,
             agent_id: input.agentId,
             conversation_id: input.conversationId,
             run_id: input.runId,
@@ -1548,13 +1650,54 @@ export function createStore(dataDir: string) {
             title: path.basename(filePath),
             path: filePath,
             summary: `Changed file from opencode run ${input.runId}.`,
-            metadata_json: JSON.stringify({ source: "opencode.changedFiles" }),
+            metadata_json: JSON.stringify({
+              source: "opencode.changedFiles",
+              snapshot: snapshot
+                ? {
+                    available: true,
+                    binary: Boolean(snapshot.binary),
+                    truncated: Boolean(snapshot.truncated),
+                    encoding: snapshot.encoding ?? null,
+                  }
+                : { available: false },
+            }),
             created_at: timestamp,
             updated_at: timestamp,
           });
+          if (snapshot) {
+            insertArtifactVersionStmt.run({
+              id: crypto.randomUUID(),
+              artifact_id: artifactId,
+              run_id: input.runId,
+              path: filePath,
+              before_content: snapshot.beforeContent ?? null,
+              after_content: snapshot.afterContent ?? null,
+              before_hash: snapshot.beforeHash ?? null,
+              after_hash: snapshot.afterHash ?? null,
+              size_bytes: snapshot.sizeBytes ?? null,
+              encoding: snapshot.encoding ?? null,
+              binary: snapshot.binary ? 1 : 0,
+              truncated: snapshot.truncated ? 1 : 0,
+              created_at: timestamp,
+            });
+          }
         }
       })();
       return store.listArtifactsForRun(input.conversationId, input.runId);
+    },
+
+    getArtifactVersion(artifactId: string): ArtifactVersionRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, artifact_id, run_id, path, before_content, after_content, before_hash, after_hash,
+                  size_bytes, encoding, binary, truncated, created_at
+           FROM artifact_versions
+           WHERE artifact_id = ?
+           ORDER BY created_at DESC
+           LIMIT 1`,
+        )
+        .get(artifactId) as ArtifactVersionRow | undefined;
+      return row ? mapArtifactVersion(row) : null;
     },
 
     listArtifactsForRun(conversationId: string, runId: string): ArtifactRecord[] {
@@ -2534,6 +2677,101 @@ export function createStore(dataDir: string) {
         clear_completed_at: input.clearCompletedAt ? 1 : 0,
       });
       return store.getTaskFlowStep(input.stepId);
+    },
+
+    listCustomSkillTemplates(agentId?: string | null): SkillTemplateRecord[] {
+      const rows = agentId
+        ? (db
+            .prepare(
+              `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
+                      flow_template_json, verification_checklist_json, heartbeat_instructions,
+                      suggested_prompt, tags_json, created_at, updated_at
+               FROM skill_templates
+               WHERE scope = 'shared' OR agent_id = ?
+               ORDER BY updated_at DESC, name ASC`,
+            )
+            .all(agentId) as SkillTemplateRow[])
+        : (db
+            .prepare(
+              `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
+                      flow_template_json, verification_checklist_json, heartbeat_instructions,
+                      suggested_prompt, tags_json, created_at, updated_at
+               FROM skill_templates
+               ORDER BY updated_at DESC, name ASC`,
+            )
+            .all() as SkillTemplateRow[]);
+      return rows.map(mapSkillTemplate);
+    },
+
+    getCustomSkillTemplate(agentId: string, templateId: string): SkillTemplateRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
+                  flow_template_json, verification_checklist_json, heartbeat_instructions,
+                  suggested_prompt, tags_json, created_at, updated_at
+           FROM skill_templates
+           WHERE id = ?
+             AND (scope = 'shared' OR agent_id = ?)
+           LIMIT 1`,
+        )
+        .get(templateId, agentId) as SkillTemplateRow | undefined;
+      return row ? mapSkillTemplate(row) : null;
+    },
+
+    saveCustomSkillTemplate(input: {
+      id?: string;
+      agentId: string | null;
+      scope?: "agent" | "shared";
+      name: string;
+      category: string;
+      summary: string;
+      description: string;
+      standingOrderPatch: string;
+      flowTemplate: SkillTemplateRecord["flowTemplate"];
+      verificationChecklist: string[];
+      heartbeatInstructions: string;
+      suggestedPrompt: string;
+      tags?: string[];
+    }): SkillTemplateRecord {
+      if (input.agentId && !store.getAgent(input.agentId)) {
+        throw new Error("Agent not found.");
+      }
+      const id = input.id ?? crypto.randomUUID();
+      const existing = input.id ? store.getCustomSkillTemplate(input.agentId ?? DEFAULT_AGENT_ID, input.id) : null;
+      const timestamp = now();
+      upsertSkillTemplateStmt.run({
+        id,
+        agent_id: input.scope === "shared" ? null : input.agentId,
+        scope: input.scope ?? "agent",
+        name: input.name,
+        category: input.category,
+        summary: input.summary,
+        description: input.description,
+        standing_order_patch: input.standingOrderPatch,
+        flow_template_json: JSON.stringify(input.flowTemplate),
+        verification_checklist_json: JSON.stringify(input.verificationChecklist),
+        heartbeat_instructions: input.heartbeatInstructions,
+        suggested_prompt: input.suggestedPrompt,
+        tags_json: JSON.stringify(input.tags ?? []),
+        created_at: existing?.createdAt ?? timestamp,
+        updated_at: timestamp,
+      });
+      const saved = store.getCustomSkillTemplate(input.agentId ?? DEFAULT_AGENT_ID, id);
+      if (!saved) {
+        throw new Error("Failed to save skill template.");
+      }
+      return saved;
+    },
+
+    deleteCustomSkillTemplate(agentId: string, templateId: string): boolean {
+      const result = db
+        .prepare(
+          `DELETE FROM skill_templates
+           WHERE id = ?
+             AND (scope = 'shared' OR agent_id = ?)`,
+        )
+        .run(templateId, agentId);
+      return result.changes > 0;
     },
 
     getProviderAccount(kind: ProviderKind): ProviderAccountRecord | null {

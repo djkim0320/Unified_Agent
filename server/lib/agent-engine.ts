@@ -117,6 +117,17 @@ export interface AgentEngineStore {
     runId: string;
     taskId?: string | null;
     changedFiles: string[];
+    snapshots?: Array<{
+      path: string;
+      beforeContent?: string | null;
+      afterContent?: string | null;
+      beforeHash?: string | null;
+      afterHash?: string | null;
+      sizeBytes?: number | null;
+      encoding?: string | null;
+      binary?: boolean;
+      truncated?: boolean;
+    }>;
   }) => unknown;
   getProviderSecret?: <K extends ProviderKind>(kind: K) => ProviderSecret<K> | null;
 }

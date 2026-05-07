@@ -1,5 +1,6 @@
 import type {
   AgentRecord,
+  ArtifactVersionRecord,
   ArtifactKind,
   ArtifactRecord,
   AutomationRuleRecord,
@@ -13,6 +14,7 @@ import type {
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
+  SkillTemplateRecord,
   TaskEventRecord,
   TaskFlowRecord,
   TaskFlowStatus,
@@ -108,6 +110,7 @@ export type SessionSummaryRow = {
   decisions_json: string;
   open_questions_json: string;
   next_actions_json: string;
+  metadata_json?: string;
   created_at: number;
   updated_at: number;
 };
@@ -123,6 +126,40 @@ export type ArtifactRow = {
   path: string | null;
   summary: string | null;
   metadata_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ArtifactVersionRow = {
+  id: string;
+  artifact_id: string;
+  run_id: string | null;
+  path: string;
+  before_content: string | null;
+  after_content: string | null;
+  before_hash: string | null;
+  after_hash: string | null;
+  size_bytes: number | null;
+  encoding: string | null;
+  binary: number;
+  truncated: number;
+  created_at: number;
+};
+
+export type SkillTemplateRow = {
+  id: string;
+  agent_id: string | null;
+  scope: "agent" | "shared";
+  name: string;
+  category: string;
+  summary: string;
+  description: string;
+  standing_order_patch: string;
+  flow_template_json: string;
+  verification_checklist_json: string;
+  heartbeat_instructions: string;
+  suggested_prompt: string;
+  tags_json: string;
   created_at: number;
   updated_at: number;
 };
@@ -321,9 +358,21 @@ export function mapSessionSummary(row: SessionSummaryRow): SessionSummaryRecord 
     decisions: parseStringArray(row.decisions_json),
     openQuestions: parseStringArray(row.open_questions_json),
     nextActions: parseStringArray(row.next_actions_json),
+    metadata: parseJsonObject(row.metadata_json ?? "{}"),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function parseJsonObject(value: string) {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 export function mapArtifact(row: ArtifactRow): ArtifactRecord {
@@ -338,6 +387,45 @@ export function mapArtifact(row: ArtifactRow): ArtifactRecord {
     path: row.path,
     summary: row.summary,
     metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapArtifactVersion(row: ArtifactVersionRow): ArtifactVersionRecord {
+  return {
+    id: row.id,
+    artifactId: row.artifact_id,
+    runId: row.run_id,
+    path: row.path,
+    beforeContent: row.before_content,
+    afterContent: row.after_content,
+    beforeHash: row.before_hash,
+    afterHash: row.after_hash,
+    sizeBytes: row.size_bytes,
+    encoding: row.encoding,
+    binary: row.binary === 1,
+    truncated: row.truncated === 1,
+    createdAt: row.created_at,
+  };
+}
+
+export function mapSkillTemplate(row: SkillTemplateRow): SkillTemplateRecord {
+  return {
+    id: row.id,
+    agentId: row.agent_id,
+    scope: row.scope,
+    builtIn: false,
+    name: row.name,
+    category: row.category,
+    summary: row.summary,
+    description: row.description,
+    standingOrderPatch: row.standing_order_patch,
+    flowTemplate: JSON.parse(row.flow_template_json) as SkillTemplateRecord["flowTemplate"],
+    verificationChecklist: parseStringArray(row.verification_checklist_json),
+    heartbeatInstructions: row.heartbeat_instructions,
+    suggestedPrompt: row.suggested_prompt,
+    tags: parseStringArray(row.tags_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

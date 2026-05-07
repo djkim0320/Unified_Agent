@@ -21,8 +21,6 @@ import {
   getConversationSummary,
   getEngineStatus,
   getConversationMessages,
-  getMcpCatalog,
-  getMcpConfigStatus,
   getPreflightStatus,
   getRunDebug,
   importCodexCliAuth,
@@ -35,7 +33,6 @@ import {
   listHeartbeatLogs,
   listPlatformMetadata,
   listProviders,
-  listSkillTemplates,
   listRunArtifacts,
   listTaskEvents,
   listTaskFlows,
@@ -43,9 +40,11 @@ import {
   listWorkspaceRuns,
   logoutCodex,
   resumeTaskFlow,
+  retryAgentTask,
   retryTaskFlowStep,
   refreshOpenCodeModels,
   refreshConversationSummary,
+  refreshConversationSummaryTask,
   saveAgentStandingOrders,
   saveAgent,
   saveAgentHeartbeat,
@@ -65,6 +64,7 @@ import {
   streamChat,
   testProvider,
   previewArtifact,
+  getArtifactDiff,
 } from "./api";
 import { ChatView } from "./components/ChatView";
 import { CockpitOpsDrawer, CockpitRightRail } from "./components/CockpitPanels";
@@ -88,6 +88,12 @@ import { SubagentPanel } from "./components/SubagentPanel";
 import { createAgentDraft } from "./app/agentDraft";
 import { getModelOption } from "./model-catalog";
 import { getReasoningLabel, normalizeReasoningLevel } from "./reasoning-options";
+import { useMcpMetadata } from "./hooks/useMcpMetadata";
+import {
+  type CustomSkillTemplateCreatePayload,
+  type CustomSkillTemplateUpdatePayload,
+  useSkillTemplates,
+} from "./hooks/useSkillTemplates";
 import {
   defaultModels,
   defaultReasoningLevels,
@@ -116,9 +122,9 @@ import {
   type WorkspaceRunEventRecord,
   type WorkspaceRunRecord,
   type EngineStatusRecord,
-  type McpConfigStatus,
   type McpServerSummary,
   type ArtifactPreviewResponse,
+  type ArtifactDiffResponse,
   type ArtifactRecord,
   type FlowDraft,
   type RunDebugResponse,
@@ -208,12 +214,7 @@ export default function App() {
   const [workspaceRunEvents, setWorkspaceRunEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [taskEvents, setTaskEvents] = useState<TaskEventRecord[]>([]);
   const [platformMetadata, setPlatformMetadata] = useState<PlatformMetadata | null>(null);
-  const [mcpCatalog, setMcpCatalog] = useState<McpServerSummary[]>([]);
-  const [mcpStatus, setMcpStatus] = useState<McpConfigStatus | null>(null);
-  const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpTestRunPendingId, setMcpTestRunPendingId] = useState<string | null>(null);
-  const [skillTemplates, setSkillTemplates] = useState<SkillTemplateRecord[]>([]);
-  const [skillTemplatesLoading, setSkillTemplatesLoading] = useState(false);
   const [skillActionPendingId, setSkillActionPendingId] = useState<string | null>(null);
   const [liveEvents, setLiveEvents] = useState<WorkspaceRunEventRecord[]>([]);
   const [changedFiles, setChangedFiles] = useState<string[]>([]);
@@ -228,8 +229,27 @@ export default function App() {
   const [flowDraftError, setFlowDraftError] = useState<string | null>(null);
   const [runArtifacts, setRunArtifacts] = useState<ArtifactRecord[]>([]);
   const [artifactPreview, setArtifactPreview] = useState<ArtifactPreviewResponse | null>(null);
+  const [artifactDiff, setArtifactDiff] = useState<ArtifactDiffResponse | null>(null);
   const [runDebug, setRunDebug] = useState<RunDebugResponse | null>(null);
   const [runDetailLoading, setRunDetailLoading] = useState(false);
+  const {
+    abortMcpMetadataRequests,
+    handleValidateMcpSnippet,
+    mcpCatalog,
+    mcpLoading,
+    mcpSnippetValidation,
+    mcpStatus,
+    refreshMcpMetadata,
+  } = useMcpMetadata({ onNotice: setAppNotice });
+  const {
+    abortSkillTemplateRequests,
+    createTemplate: createCustomSkillTemplateFromHook,
+    deleteTemplate: deleteCustomSkillTemplateFromHook,
+    refreshSkillTemplates: refreshSkillTemplatesFromHook,
+    skillTemplates,
+    skillTemplatesLoading,
+    updateTemplate: updateCustomSkillTemplateFromHook,
+  } = useSkillTemplates({ onNotice: setAppNotice });
 
   const activeConversationIdRef = useRef<string | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
@@ -273,12 +293,8 @@ export default function App() {
   const taskFlowDetailControllerRef = useRef<AbortController | null>(null);
   const platformMetadataSeqRef = useRef(0);
   const platformMetadataControllerRef = useRef<AbortController | null>(null);
-  const mcpMetadataSeqRef = useRef(0);
-  const mcpMetadataControllerRef = useRef<AbortController | null>(null);
   const preflightSeqRef = useRef(0);
   const preflightControllerRef = useRef<AbortController | null>(null);
-  const skillTemplatesSeqRef = useRef(0);
-  const skillTemplatesControllerRef = useRef<AbortController | null>(null);
   const workspaceEventsSeqRef = useRef(0);
   const workspaceEventsControllerRef = useRef<AbortController | null>(null);
   const streamSeqRef = useRef(0);
@@ -389,9 +405,9 @@ export default function App() {
   function abortAllPendingRequests() {
     abortAgentScopedRequests();
     abortRef(platformMetadataControllerRef);
-    abortRef(mcpMetadataControllerRef);
+    abortMcpMetadataRequests();
     abortRef(preflightControllerRef);
-    abortRef(skillTemplatesControllerRef);
+    abortSkillTemplateRequests();
   }
 
   function abortConversationScopedRequests() {
@@ -420,6 +436,7 @@ export default function App() {
     setFlowDraftError(null);
     setRunArtifacts([]);
     setArtifactPreview(null);
+    setArtifactDiff(null);
     setRunDebug(null);
     setSubagentSessions([]);
   }
@@ -955,6 +972,7 @@ export default function App() {
     if (!runId) {
       setRunArtifacts([]);
       setArtifactPreview(null);
+      setArtifactDiff(null);
       setRunDebug(null);
       abortRef(runArtifactsControllerRef);
       return;
@@ -1442,54 +1460,8 @@ export default function App() {
     setActiveSection(target);
   }
 
-  async function refreshMcpMetadata() {
-    const request = beginRequest(mcpMetadataSeqRef, mcpMetadataControllerRef);
-    setMcpLoading(true);
-
-    try {
-      const [catalogResponse, statusResponse] = await Promise.all([
-        getMcpCatalog(request.controller.signal),
-        getMcpConfigStatus(request.controller.signal),
-      ]);
-      if (request.controller.signal.aborted || mcpMetadataSeqRef.current !== request.seq) {
-        return;
-      }
-      setMcpCatalog(catalogResponse.servers);
-      setMcpStatus(statusResponse.status);
-    } catch (error) {
-      if (request.controller.signal.aborted || mcpMetadataSeqRef.current !== request.seq) {
-        return;
-      }
-      setAppNotice(error instanceof Error ? error.message : "MCP 설정 정보를 불러오지 못했습니다.");
-    } finally {
-      if (mcpMetadataSeqRef.current === request.seq) {
-        setMcpLoading(false);
-        abortRef(mcpMetadataControllerRef);
-      }
-    }
-  }
-
   async function refreshSkillTemplates() {
-    const request = beginRequest(skillTemplatesSeqRef, skillTemplatesControllerRef);
-    setSkillTemplatesLoading(true);
-
-    try {
-      const response = await listSkillTemplates(request.controller.signal);
-      if (request.controller.signal.aborted || skillTemplatesSeqRef.current !== request.seq) {
-        return;
-      }
-      setSkillTemplates(response.templates);
-    } catch (error) {
-      if (request.controller.signal.aborted || skillTemplatesSeqRef.current !== request.seq) {
-        return;
-      }
-      setAppNotice(error instanceof Error ? error.message : "스킬 템플릿을 불러오지 못했습니다.");
-    } finally {
-      if (skillTemplatesSeqRef.current === request.seq) {
-        setSkillTemplatesLoading(false);
-        abortRef(skillTemplatesControllerRef);
-      }
-    }
+    await refreshSkillTemplatesFromHook(activeAgentIdRef.current);
   }
 
   async function handleSaveAgentDefaults() {
@@ -1775,6 +1747,46 @@ export default function App() {
     setAppNotice(`${template.name} 프롬프트를 채팅 입력창에 삽입했습니다.`);
   }
 
+  async function handleCreateCustomSkillTemplate(
+    payload: CustomSkillTemplateCreatePayload,
+  ) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    const template = await createCustomSkillTemplateFromHook(agentId, payload);
+    if (template && activeAgentIdRef.current === agentId) {
+      void refreshSkillTemplates();
+    }
+  }
+
+  async function handleUpdateCustomSkillTemplate(
+    template: SkillTemplateRecord,
+    payload: CustomSkillTemplateUpdatePayload,
+  ) {
+    if (!activeAgentId) {
+      setAppNotice("에이전트를 먼저 선택하세요.");
+      return;
+    }
+    const agentId = activeAgentId;
+    const updatedTemplate = await updateCustomSkillTemplateFromHook(agentId, template.id, payload);
+    if (updatedTemplate && activeAgentIdRef.current === agentId) {
+      void refreshSkillTemplates();
+    }
+  }
+
+  async function handleDeleteCustomSkillTemplate(template: SkillTemplateRecord) {
+    if (!activeAgentId || template.builtIn) {
+      return;
+    }
+    if (!window.confirm(`"${template.name}" Skill을 삭제할까요?`)) {
+      return;
+    }
+    const agentId = activeAgentId;
+    await deleteCustomSkillTemplateFromHook(agentId, template);
+  }
+
   async function handleCancelTask(taskId: string) {
     if (!activeAgentId) {
       return;
@@ -1794,6 +1806,26 @@ export default function App() {
       void refreshTaskEvents(agentId, taskId);
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "백그라운드 작업을 취소하지 못했습니다.");
+    }
+  }
+
+  async function handleRetryTask(taskId: string, force = false) {
+    if (!activeAgentId) {
+      return;
+    }
+    const agentId = activeAgentId;
+    try {
+      const response = await retryAgentTask(agentId, taskId, { autoStart: true, force });
+      if (activeAgentIdRef.current !== agentId) {
+        return;
+      }
+      setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+      setSelectedTaskId(response.task.id);
+      setAppNotice("Task 재시도 작업을 만들었습니다.");
+      void refreshAgentTasks(agentId);
+      void refreshTaskEvents(agentId, response.task.id);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "Task 재시도에 실패했습니다.");
     }
   }
 
@@ -2097,6 +2129,25 @@ export default function App() {
     }
   }
 
+  async function handleRefreshSummaryTask() {
+    if (!activeConversationId || !activeAgentId) {
+      setAppNotice("요약 제안을 만들 세션이 없습니다.");
+      return;
+    }
+    setSummaryLoading(true);
+    try {
+      const response = await refreshConversationSummaryTask(activeConversationId);
+      setTasks((current) => [response.task, ...current.filter((task) => task.id !== response.task.id)]);
+      setSelectedTaskId(response.task.id);
+      setAppNotice(response.message);
+      void refreshAgentTasks(activeAgentId);
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "opencode 요약 제안 Task 생성에 실패했습니다.");
+    } finally {
+      setSummaryLoading(false);
+    }
+  }
+
   async function handleSaveSummary() {
     if (!activeConversationId) {
       return;
@@ -2108,6 +2159,7 @@ export default function App() {
         decisions: sessionSummary?.decisions ?? [],
         openQuestions: sessionSummary?.openQuestions ?? [],
         nextActions: sessionSummary?.nextActions ?? [],
+        metadata: sessionSummary?.metadata ?? {},
       });
       setSessionSummary(response.summary);
       setSessionSummaryDraft(response.summary.summary);
@@ -2126,6 +2178,17 @@ export default function App() {
       setArtifactPreview(await previewArtifact(artifactId));
     } catch (error) {
       setAppNotice(error instanceof Error ? error.message : "산출물 미리보기를 불러오지 못했습니다.");
+    } finally {
+      setRunDetailLoading(false);
+    }
+  }
+
+  async function handleArtifactDiff(artifactId: string) {
+    setRunDetailLoading(true);
+    try {
+      setArtifactDiff(await getArtifactDiff(artifactId));
+    } catch (error) {
+      setAppNotice(error instanceof Error ? error.message : "산출물 diff를 불러오지 못했습니다.");
     } finally {
       setRunDetailLoading(false);
     }
@@ -2871,6 +2934,9 @@ export default function App() {
                   onRefresh={() => {
                     void handleRefreshSummary();
                   }}
+                  onRefreshTask={() => {
+                    void handleRefreshSummaryTask();
+                  }}
                   onSave={() => {
                     void handleSaveSummary();
                   }}
@@ -2939,8 +3005,10 @@ export default function App() {
                 <RunArtifactsPanel
                   artifacts={runArtifacts}
                   debug={runDebug}
+                  diff={artifactDiff}
                   latestRun={selectedRun}
                   loading={runDetailLoading}
+                  onCloseDiff={() => setArtifactDiff(null)}
                   onClosePreview={() => setArtifactPreview(null)}
                   onCopyDebug={handleCopyDebugBundle}
                   onCopyReport={(artifactId) => {
@@ -2957,6 +3025,9 @@ export default function App() {
                   }}
                   onPreview={(artifactId) => {
                     void handlePreviewArtifact(artifactId);
+                  }}
+                  onDiff={(artifactId) => {
+                    void handleArtifactDiff(artifactId);
                   }}
                   preview={artifactPreview}
                 />
@@ -3014,6 +3085,9 @@ export default function App() {
               onResumeTaskFlow={(flowId) => {
                 void handleTaskFlowControl(flowId, "resume");
               }}
+              onRetryTask={(taskId, force) => {
+                void handleRetryTask(taskId, force);
+              }}
               onRetryTaskFlowStep={(flowId, stepId) => {
                 void handleTaskFlowStepControl(flowId, stepId, "retry");
               }}
@@ -3045,6 +3119,7 @@ export default function App() {
               heartbeat={agentHeartbeat}
               mcpCatalog={mcpCatalog}
               mcpLoading={mcpLoading}
+              mcpSnippetValidation={mcpSnippetValidation}
               mcpStatus={mcpStatus}
               mcpTestRunPendingId={mcpTestRunPendingId}
               skillActionPendingId={skillActionPendingId}
@@ -3059,8 +3134,14 @@ export default function App() {
               onCreateMcpTestRun={(server) => {
                 void handleCreateMcpTestRun(server);
               }}
+              onCreateCustomSkill={(payload) => {
+                void handleCreateCustomSkillTemplate(payload);
+              }}
               onCreateSkillFlow={(template) => {
                 void handleCreateSkillFlow(template);
+              }}
+              onDeleteCustomSkill={(template) => {
+                void handleDeleteCustomSkillTemplate(template);
               }}
               onInsertSkillPrompt={handleInsertSkillPrompt}
               onNavigate={handleCockpitNavigate}
@@ -3080,6 +3161,12 @@ export default function App() {
               }}
               onTriggerHeartbeat={() => {
                 void handleTriggerHeartbeat();
+              }}
+              onUpdateCustomSkill={(template, payload) => {
+                void handleUpdateCustomSkillTemplate(template, payload);
+              }}
+              onValidateMcpSnippet={(snippet) => {
+                void handleValidateMcpSnippet(snippet);
               }}
               platformMetadata={platformMetadata}
               providers={providers}

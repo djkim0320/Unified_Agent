@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { createStore } from "../db.js";
 import type { createWorkspaceManager } from "../lib/workspace.js";
 import type { EngineRunRecord, ProviderKind, ReasoningLevel } from "../types.js";
+import { redactSensitiveText, redactUnknown } from "../lib/redaction.js";
 import { sendLegacyGone } from "./legacy-gone.js";
 
 type WorkspaceRouteStore = ReturnType<typeof createStore>;
@@ -130,6 +131,44 @@ function artifactReportContent(artifact: ReturnType<WorkspaceRouteStore["getArti
   }
   const content = artifact.metadata.content;
   return typeof content === "string" ? content : artifact.summary;
+}
+
+function safeExportMode(request: express.Request) {
+  return request.query.mode === "full" ? "full" : "redacted";
+}
+
+function redactedReportContent(content: string | null, mode: "full" | "redacted") {
+  return mode === "full" ? content : redactSensitiveText(content ?? "");
+}
+
+function unifiedDiff(pathLabel: string, before: string | null, after: string | null) {
+  const beforeLines = (before ?? "").split(/\r?\n/);
+  const afterLines = (after ?? "").split(/\r?\n/);
+  const lines = [`--- a/${pathLabel}`, `+++ b/${pathLabel}`];
+  if (before === null) {
+    lines.push("@@ new file @@");
+    lines.push(...afterLines.map((line) => `+${line}`));
+    return lines.join("\n");
+  }
+  lines.push("@@ -1 +1 @@");
+  const max = Math.max(beforeLines.length, afterLines.length);
+  for (let index = 0; index < max; index += 1) {
+    const left = beforeLines[index];
+    const right = afterLines[index];
+    if (left === right) {
+      if (left !== undefined) {
+        lines.push(` ${left}`);
+      }
+      continue;
+    }
+    if (left !== undefined) {
+      lines.push(`-${left}`);
+    }
+    if (right !== undefined) {
+      lines.push(`+${right}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function buildSafeReportDebugRecord(artifact: ReturnType<WorkspaceRouteStore["getArtifact"]>) {
@@ -293,15 +332,19 @@ export function registerWorkspaceRoutes(
       response.status(404).json({ error: "Artifact not found" });
       return;
     }
+    const mode = safeExportMode(request);
     const reportContent = artifactReportContent(artifact);
     if (reportContent !== null) {
       response.json({
         artifact,
         preview: {
-          content: reportContent,
+          content: redactedReportContent(reportContent, mode),
           binary: false,
           unsupportedEncoding: false,
           truncated: false,
+          source: "report",
+          sensitiveFieldsHidden: mode !== "full",
+          fullContentAvailable: mode !== "full",
         },
       });
       return;
@@ -312,6 +355,34 @@ export function registerWorkspaceRoutes(
     }
     if (!artifact.runId || !store.getWorkspaceRunForConversation(artifact.conversationId, artifact.runId)) {
       response.status(404).json({ error: "Artifact run was not found." });
+      return;
+    }
+
+    const snapshot = store.getArtifactVersion?.(artifact.id) ?? null;
+    if (snapshot?.afterContent !== null && snapshot?.afterContent !== undefined) {
+      response.json({
+        artifact,
+        preview: {
+          content: snapshot.afterContent,
+          binary: snapshot.binary,
+          unsupportedEncoding: snapshot.binary,
+          truncated: snapshot.truncated,
+          source: "snapshot",
+        },
+      });
+      return;
+    }
+    if (snapshot?.binary || snapshot?.truncated) {
+      response.json({
+        artifact,
+        preview: {
+          content: "",
+          binary: snapshot.binary,
+          unsupportedEncoding: snapshot.binary,
+          truncated: snapshot.truncated,
+          source: "snapshot",
+        },
+      });
       return;
     }
 
@@ -342,6 +413,7 @@ export function registerWorkspaceRoutes(
         binary,
         unsupportedEncoding: binary,
         truncated: stat.size > bytesToRead,
+        source: "current-workspace",
       },
     });
   });
@@ -352,11 +424,49 @@ export function registerWorkspaceRoutes(
       response.status(404).json({ error: "Artifact not found" });
       return;
     }
+    const snapshot = store.getArtifactVersion?.(artifact.id) ?? null;
+    if (!snapshot) {
+      response.json({
+        artifact,
+        diff: {
+          available: false,
+          reason: "변경 전 기준이 없어 diff를 만들 수 없습니다. 현재 파일 미리보기만 제공됩니다.",
+        },
+      });
+      return;
+    }
+    if (snapshot.binary || snapshot.truncated) {
+      response.json({
+        artifact,
+        diff: {
+          available: false,
+          reason: snapshot.binary
+            ? "바이너리 파일은 텍스트 diff를 만들 수 없습니다."
+            : "스냅샷이 너무 커서 diff 저장 한도를 초과했습니다.",
+          binary: snapshot.binary,
+          truncated: snapshot.truncated,
+        },
+      });
+      return;
+    }
+    if (snapshot.afterContent == null) {
+      response.json({
+        artifact,
+        diff: {
+          available: false,
+          reason: "삭제되었거나 텍스트 스냅샷이 없어 diff를 만들 수 없습니다.",
+        },
+      });
+      return;
+    }
     response.json({
       artifact,
       diff: {
-        available: false,
-        reason: "AetherOps stores run-scoped artifact metadata in this version, but previous-file snapshots are not available yet.",
+        available: true,
+        reason: snapshot.beforeContent == null ? "new-file" : "snapshot",
+        content: unifiedDiff(artifact.path ?? snapshot.path, snapshot.beforeContent, snapshot.afterContent),
+        binary: false,
+        truncated: false,
       },
     });
   });
@@ -369,7 +479,10 @@ export function registerWorkspaceRoutes(
     }
     const task = run.taskId ? store.getTask(run.taskId) : null;
     const events = store.listWorkspaceRunEvents(conversationId, run.id);
-    const lastEvents = events.slice(-12);
+    const lastEvents = events.slice(-12).map((event) => ({
+      ...event,
+      payload: redactUnknown(event.payload) as Record<string, unknown>,
+    }));
     const changedFiles = [
       ...new Set(
         events.flatMap((event) => {

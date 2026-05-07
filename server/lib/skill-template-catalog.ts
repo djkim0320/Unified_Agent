@@ -14,6 +14,8 @@ function chainSteps(
 function template(input: Omit<SkillTemplateRecord, "createdAt" | "updatedAt">): SkillTemplateRecord {
   return {
     ...input,
+    scope: "built-in",
+    builtIn: true,
     createdAt: CATALOG_TIMESTAMP,
     updatedAt: CATALOG_TIMESTAMP,
   };
@@ -453,8 +455,12 @@ export const BUILT_IN_SKILL_TEMPLATES: SkillTemplateRecord[] = [
   }),
 ];
 
-export function listSkillTemplates() {
+export function listBuiltInSkillTemplates() {
   return BUILT_IN_SKILL_TEMPLATES;
+}
+
+export function listSkillTemplates(customTemplates: SkillTemplateRecord[] = []) {
+  return [...BUILT_IN_SKILL_TEMPLATES, ...customTemplates];
 }
 
 export function getSkillTemplate(templateId: string) {

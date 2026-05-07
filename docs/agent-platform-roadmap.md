@@ -16,10 +16,10 @@ The repository already supports:
 - task-flow scheduling
 - chat-to-flow draft generation
 - persistent session summaries injected into opencode prompt context
-- run-scoped artifacts with safe text preview
+- run-scoped artifacts with stable text snapshots, safe preview, and small-file diff
 - structured run debugger summaries
-- MCP configuration assistant for opencode config snippets, risk notes, and opencode-backed test tasks
-- skill template library for reusable prompts, flow templates, standing-order patches, verification checklists, and heartbeat recipes
+- MCP configuration assistant for opencode config snippets, dry-run validation, risk notes, and opencode-backed test tasks
+- skill template library for built-in and custom reusable prompts, flow templates, standing-order patches, verification checklists, and heartbeat recipes
 - opencode-backed execution through the embedded `opencode-ai` launcher
 - multi-provider account and model selection
 
@@ -57,7 +57,8 @@ The current implementation is opencode-only for execution. The remaining work is
 
 ### 2. Persistent context
 
-- implemented: session summaries can be saved, deterministically refreshed, and injected into future opencode runs
+- implemented: session summaries can be saved, deterministically refreshed with report/artifact/task signals, structured as project memory, and injected into future opencode runs
+- implemented: opencode-backed summary suggestion tasks are normal detached tasks and do not mutate memory automatically
 - add better session-summary compaction
 - keep session history, opencode workspace artifacts, and agent control files visible
 
@@ -70,14 +71,14 @@ The current implementation is opencode-only for execution. The remaining work is
 
 ### 4. External capabilities
 
-- implemented: surface opencode MCP catalog/status/test-run metadata without adding an AetherOps runtime
+- implemented: surface opencode MCP catalog/status/test-run metadata and snippet validation without adding an AetherOps runtime
 - improve guidance for configuring filesystem, command, browser, and MCP behavior in opencode
 - keep removed compatibility routes explicit with `410 Gone`
 
 ### 5. Frontend operations UX
 
 - better agent/session/task navigation
-- implemented: flow draft review, summary panel, artifact preview, and run debugger entry points in the cockpit
+- implemented: flow draft dependency editing, structured summary panel, snapshot-backed artifact preview/diff, redacted report copy, custom skills, and run debugger entry points in the cockpit
 - clearer run timeline presentation
 - stronger changed-file and run-log inspection workflows, including future baseline diffs
 - reduce state race conditions and stale refresh hazards

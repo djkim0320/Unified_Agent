@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -36,6 +37,7 @@ const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_STATUS_TIMEOUT_MS = 15_000;
 const MAX_CAPTURED_OUTPUT_BYTES = 128_000;
 const MAX_STORED_JSON_EVENTS = 200;
+const MAX_ARTIFACT_SNAPSHOT_BYTES = 64 * 1024;
 const SNAPSHOT_SKIP_DIRS = new Set([
   ".git",
   ".hg",
@@ -74,6 +76,11 @@ export interface OpenCodeRunnerOptions {
 type SnapshotEntry = {
   size: number;
   mtimeMs: number;
+  hash: string | null;
+  textContent: string | null;
+  binary: boolean;
+  truncated: boolean;
+  encoding: string | null;
 };
 
 function readProviderSecrets(store: AgentEngineStore) {
@@ -630,6 +637,42 @@ function parseSessionsFromOutput(output: string) {
   return sessions.filter((session): session is Record<string, unknown> => typeof session === "object" && session !== null);
 }
 
+function safeDisplayPath(input: unknown, projectRoot: string) {
+  if (typeof input !== "string" || !input.trim()) {
+    return null;
+  }
+
+  try {
+    const resolvedRoot = path.resolve(projectRoot);
+    const resolvedPath = path.resolve(input);
+    const relativePath = path.relative(resolvedRoot, resolvedPath);
+    if (relativePath && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)) {
+      return relativePath.split(path.sep).join(path.posix.sep);
+    }
+  } catch {
+    // Fall through to the generic hidden label. Engine status is a normal UI/API
+    // surface, so it should never expose raw absolute host paths.
+  }
+
+  return "[path hidden]";
+}
+
+function sanitizeSessionForStatus(session: Record<string, unknown>, projectRoot: string) {
+  const sanitized: Record<string, unknown> = {};
+  for (const key of ["id", "title", "updated", "created", "projectId"]) {
+    const value = session[key];
+    if (["string", "number", "boolean"].includes(typeof value) || value === null) {
+      sanitized[key] = value;
+    }
+  }
+
+  if ("directory" in session) {
+    sanitized.directory = safeDisplayPath(session.directory, projectRoot) ?? "[path unavailable]";
+  }
+
+  return sanitized;
+}
+
 function parseAuthProvidersFromOutput(output: string) {
   const parsed = parseJsonLine(output.trim());
   const providerValues = Array.isArray(parsed)
@@ -668,6 +711,41 @@ function normalizeOpenCodeAuthProvider(provider: string | undefined) {
   return aliases[normalized] ?? normalized;
 }
 
+function captureSnapshotEntry(absolutePath: string, size: number): Omit<SnapshotEntry, "size" | "mtimeMs"> {
+  const truncated = size > MAX_ARTIFACT_SNAPSHOT_BYTES;
+  const bytesToRead = Math.min(size, MAX_ARTIFACT_SNAPSHOT_BYTES);
+  const buffer = bytesToRead > 0 ? fs.readFileSync(absolutePath).subarray(0, bytesToRead) : Buffer.alloc(0);
+  const binary = buffer.includes(0);
+  const hash = crypto.createHash("sha256").update(fs.readFileSync(absolutePath)).digest("hex");
+  if (binary || truncated) {
+    return {
+      hash,
+      textContent: null,
+      binary,
+      truncated,
+      encoding: binary ? null : "utf8",
+    };
+  }
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    return {
+      hash,
+      textContent: decoder.decode(buffer),
+      binary: false,
+      truncated: false,
+      encoding: "utf8",
+    };
+  } catch {
+    return {
+      hash,
+      textContent: null,
+      binary: true,
+      truncated: false,
+      encoding: null,
+    };
+  }
+}
+
 function snapshotWorkspace(root: string) {
   const snapshot = new Map<string, SnapshotEntry>();
   const visit = (directory: string, relativeBase: string) => {
@@ -686,9 +764,11 @@ function snapshotWorkspace(root: string) {
         continue;
       }
       if (stat.isFile()) {
+        const captured = captureSnapshotEntry(absolutePath, stat.size);
         snapshot.set(relativePath, {
           size: stat.size,
           mtimeMs: stat.mtimeMs,
+          ...captured,
         });
       }
     }
@@ -713,6 +793,28 @@ function changedFilesBetween(before: Map<string, SnapshotEntry>, after: Map<stri
     }
   }
   return [...changed].sort();
+}
+
+function artifactSnapshotsForChangedFiles(
+  before: Map<string, SnapshotEntry>,
+  after: Map<string, SnapshotEntry>,
+  changedFiles: string[],
+) {
+  return changedFiles.map((relativePath) => {
+    const beforeEntry = before.get(relativePath) ?? null;
+    const afterEntry = after.get(relativePath) ?? null;
+    return {
+      path: relativePath,
+      beforeContent: beforeEntry?.textContent ?? null,
+      afterContent: afterEntry?.textContent ?? null,
+      beforeHash: beforeEntry?.hash ?? null,
+      afterHash: afterEntry?.hash ?? null,
+      sizeBytes: afterEntry?.size ?? beforeEntry?.size ?? null,
+      encoding: afterEntry?.encoding ?? beforeEntry?.encoding ?? null,
+      binary: Boolean(afterEntry?.binary ?? beforeEntry?.binary ?? false),
+      truncated: Boolean(afterEntry?.truncated ?? beforeEntry?.truncated ?? false),
+    };
+  });
 }
 
 function latestExternalSessionId(store: AgentEngineStore, conversationId: string, currentRunId: string) {
@@ -969,6 +1071,7 @@ export function createOpenCodeEngine(params: {
 
       const afterSnapshot = snapshotWorkspace(workspaceDirectory);
       const changedFiles = changedFilesBetween(beforeSnapshot, afterSnapshot);
+      const artifactSnapshots = artifactSnapshotsForChangedFiles(beforeSnapshot, afterSnapshot, changedFiles);
       if (changedFiles.length && params.store.createArtifactsForRun) {
         try {
           const artifacts = params.store.createArtifactsForRun({
@@ -977,6 +1080,7 @@ export function createOpenCodeEngine(params: {
             runId: run.id,
             taskId: input.currentTaskId ?? null,
             changedFiles,
+            snapshots: artifactSnapshots,
           });
           emit("status", {
             phase: "artifact_indexed",
@@ -1211,7 +1315,12 @@ export function createOpenCodeEngine(params: {
       : null;
     const version = installed ? (versionResult.stdout || versionResult.stderr).trim() || null : null;
     const models = modelsResult?.exitCode === 0 ? parseModelsFromOutput(modelsResult.stdout) : [];
-    const sessions = sessionsResult?.exitCode === 0 ? parseSessionsFromOutput(sessionsResult.stdout) : [];
+    const sessions =
+      sessionsResult?.exitCode === 0
+        ? parseSessionsFromOutput(sessionsResult.stdout).map((session) =>
+            sanitizeSessionForStatus(session, params.projectRoot),
+          )
+        : [];
     const opencodeAuthProviders =
       authResult?.exitCode === 0 ? parseAuthProvidersFromOutput(authResult.stdout || authResult.stderr) : [];
     const failure =
@@ -1232,7 +1341,7 @@ export function createOpenCodeEngine(params: {
       executable: launcher.displayName,
       executableSource: launcher.source,
       managedPackageVersion: launcher.managedPackageVersion,
-      configDir: configuredOpenCodeConfigDir(),
+      configDir: configuredOpenCodeConfigDir() ? "OPENCODE_CONFIG_DIR configured" : null,
       authStatus: models.length > 0 ? "available" : installed ? "unknown" : "unavailable",
       models,
       sessions,
@@ -1400,6 +1509,7 @@ export function createOpenCodeEngine(params: {
 export const openCodeEngineTestUtils = {
   parseModelsFromOutput,
   parseSessionsFromOutput,
+  sanitizeSessionForStatus,
   parseAuthProvidersFromOutput,
   createRunnerForLauncher: makeOpenCodeRunner,
   shouldAutoApproveOpenCodePermissions,

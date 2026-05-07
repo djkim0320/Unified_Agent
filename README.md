@@ -27,7 +27,7 @@ AetherOps is a React + Express + SQLite local-first cockpit, scheduler, and log 
 - Long-running task flows with ordered steps, dependencies, start/resume/retry/skip/cancel controls, and step-linked task/run traces
 - Chat-to-Flow draft generation that turns a project prompt into a reviewable flow before saving
 - Persistent session summaries that are injected into future opencode runs without introducing a second model path
-- Run-scoped artifacts, safe text previews, and structured run debugger summaries
+- Run-scoped artifacts with immutable text snapshots, safe previews, real small-file diffs, and structured run debugger summaries
 - Embedded `opencode-ai` Workspace Engine integration for local-first execution; chat, tasks, flows, heartbeat, and sub-agents all use the same opencode engine path
 
 ## Run on Windows PowerShell
@@ -109,17 +109,19 @@ Flow operation endpoints:
 - `POST /api/flows/:flowId/cancel`
 
 The cockpit workflow view exposes the same controls, including an outline-to-steps editor and per-step task/run summaries.
+Standalone failed, timed-out, or cancelled tasks can be retried with `POST /api/agents/:agentId/tasks/:taskId/retry`; `flow_step` tasks must still use the flow step retry endpoint so Flow state remains coherent.
 
 ## Flow Drafts, Summaries, and Artifacts
 
 AetherOps now adds operator-facing memory and inspection surfaces around opencode runs while keeping opencode as the only workspace execution engine.
 
 - `POST /api/agents/:agentId/flows/draft` converts a prompt or outline into a deterministic draft with up to 8 ordered steps. It does not create or start a flow until the operator reviews and saves it.
-- `GET/PUT/POST /api/conversations/:conversationId/summary` stores and refreshes session summaries. Refresh is deterministic from local session data, messages, runs, changed files, tasks, and flows.
+- `GET/PUT/POST /api/conversations/:conversationId/summary` stores and refreshes structured project memory. Refresh is deterministic from local session data, messages, reports, artifacts, runs, tasks, and flows.
+- `POST /api/conversations/:conversationId/summary/refresh-task` creates a normal opencode-backed detached task that proposes an updated summary; it does not mutate memory until the operator saves it.
 - `GET /api/runs/:runId/artifacts?conversationId=<id>` lists run-scoped artifacts created from changed files reported by opencode.
-- `GET /api/artifacts/:artifactId/preview` previews only text artifacts tied to their owning run and conversation. It does not expose arbitrary workspace browsing.
-- `GET /api/artifacts/:artifactId/diff` returns structured diff availability. The MVP does not fabricate diffs when no baseline exists.
-- `GET /api/runs/:runId/debug?conversationId=<id>` returns a safe debug summary with status, duration, model, changed files, last events, artifact count, and task linkage.
+- `GET /api/artifacts/:artifactId/preview` prefers the saved run snapshot and only falls back to current workspace content when no snapshot exists. It does not expose arbitrary workspace browsing.
+- `GET /api/artifacts/:artifactId/diff` returns a real unified text diff when before/after snapshots are available, and a clear unavailable reason for binary, truncated, or baseline-less files.
+- `GET /api/runs/:runId/debug?conversationId=<id>` returns a redacted debug summary with status, duration, model, changed files, last events, artifact count, prompt-presence booleans, and task linkage.
 
 The chat cockpit exposes these as "Flow로 만들기", "세션 요약", "산출물", and "디버그 보기" panels.
 
@@ -128,7 +130,8 @@ The chat cockpit exposes these as "Flow로 만들기", "세션 요약", "산출�
 The MCP tab is an opencode configuration assistant, not an MCP runtime.
 
 - `GET /api/mcp/catalog` returns static candidate metadata for Filesystem, Browser/Web, GitHub, and Database MCP categories.
-- `GET /api/mcp/config/status` reports whether AetherOps can safely detect opencode MCP config metadata.
+- `GET /api/mcp/config/status` reports parser type, source label, write safety, validation warnings, configured server metadata, and auth evidence.
+- `POST /api/mcp/config/validate-snippet` dry-runs an opencode MCP config snippet, reports risk warnings and env placeholders, and rejects literal token-looking values. AetherOps still does not write config in this flow.
 - `POST /api/mcp/test-run` creates a normal opencode-backed background task that asks opencode to verify an MCP setup.
 - `POST /api/mcp/servers` remains `410 Gone`; AetherOps does not register or execute MCP servers itself.
 
@@ -138,7 +141,8 @@ The UI shows config source labels, configured server count, risk warnings, copya
 
 The Skill tab is a reusable prompt and workflow template library, not an executable plugin runtime.
 
-- `GET /api/skill-templates` returns built-in templates such as Codebase Review, Aircraft Research Flow, CFD Preparation Flow, and Release Checklist.
+- `GET /api/skill-templates` returns built-in plus DB-backed custom templates such as Codebase Review, Aircraft Research Flow, CFD Preparation Flow, and Release Checklist.
+- `POST/PATCH/DELETE /api/agents/:agentId/skill-templates/:templateId?` manages custom templates. Built-in templates are read-only.
 - `POST /api/agents/:agentId/skill-templates/:templateId/apply-standing-orders` appends a marked section to `STANDING_ORDERS.md` and prevents duplicate insertion.
 - `POST /api/agents/:agentId/skill-templates/:templateId/apply-heartbeat` appends a marked heartbeat recipe without enabling Heartbeat automatically.
 - The UI can turn a template into a queued TaskFlow, copy the suggested opencode prompt, or insert that prompt into the chat composer.

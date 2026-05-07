@@ -85,6 +85,7 @@ export function createSessionSummariesSql(tableName: string) {
       decisions_json TEXT NOT NULL DEFAULT '[]',
       open_questions_json TEXT NOT NULL DEFAULT '[]',
       next_actions_json TEXT NOT NULL DEFAULT '[]',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -104,6 +105,48 @@ export function createArtifactsSql(tableName: string) {
       path TEXT,
       summary TEXT,
       metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createArtifactVersionsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+      run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
+      path TEXT NOT NULL,
+      before_content TEXT,
+      after_content TEXT,
+      before_hash TEXT,
+      after_hash TEXT,
+      size_bytes INTEGER,
+      encoding TEXT,
+      binary INTEGER NOT NULL DEFAULT 0,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createSkillTemplatesSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT REFERENCES agents(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL CHECK(scope IN ('agent', 'shared')),
+      name TEXT NOT NULL,
+      category TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      description TEXT NOT NULL,
+      standing_order_patch TEXT NOT NULL,
+      flow_template_json TEXT NOT NULL,
+      verification_checklist_json TEXT NOT NULL,
+      heartbeat_instructions TEXT NOT NULL,
+      suggested_prompt TEXT NOT NULL,
+      tags_json TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );

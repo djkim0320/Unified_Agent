@@ -15,6 +15,11 @@ const TaskCreateSchema = z.object({
   autoStart: z.boolean().optional().default(true),
 });
 
+const TaskRetrySchema = z.object({
+  autoStart: z.boolean().optional().default(true),
+  force: z.boolean().optional().default(false),
+});
+
 export function registerTasksRoutes(
   app: express.Express,
   params: {
@@ -100,6 +105,82 @@ export function registerTasksRoutes(
       .catch((error) => {
         response.status(400).json({
           error: error instanceof Error ? error.message : "Failed to cancel task.",
+        });
+      });
+  });
+
+  app.post("/api/agents/:agentId/tasks/:taskId/retry", (request, response) => {
+    const task = store.getTaskForAgent(request.params.agentId, request.params.taskId);
+    if (!task) {
+      response.status(404).json({ error: "Task not found" });
+      return;
+    }
+    const body = TaskRetrySchema.parse(request.body ?? {});
+    if (task.taskKind === "flow_step") {
+      const flowStep =
+        task.taskFlowId && task.flowStepKey && store.listTaskFlowSteps
+          ? store.listTaskFlowSteps(task.taskFlowId).find((candidate) => candidate.stepKey === task.flowStepKey)
+          : null;
+      response.status(409).json({
+        error: "Flow step tasks must be retried through the flow step retry endpoint.",
+        flowStepRetryEndpoint:
+          task.taskFlowId && flowStep
+            ? `/api/flows/${encodeURIComponent(task.taskFlowId)}/steps/${encodeURIComponent(flowStep.id)}/retry`
+            : null,
+      });
+      return;
+    }
+    if (task.status === "queued" || task.status === "running") {
+      response.status(409).json({ error: "Queued or running tasks cannot be retried." });
+      return;
+    }
+    if (task.status === "completed" && !body.force) {
+      response.status(409).json({
+        error: "Completed tasks can only be duplicated with force=true.",
+      });
+      return;
+    }
+
+    void gateway.taskManager
+      .enqueueDetachedTask({
+        agentId: task.agentId,
+        conversationId: task.conversationId,
+        title: task.status === "completed" ? `${task.title} 복제` : `${task.title} 재시도`,
+        prompt: task.prompt,
+        providerKind: task.providerKind,
+        model: task.model,
+        reasoningLevel: task.reasoningLevel,
+        taskKind: task.taskKind === "scheduled" ? "scheduled" : task.taskKind,
+        parentTaskId: task.id,
+        originRunId: task.runId ?? task.originRunId,
+        scheduledFor: null,
+        startImmediately: body.autoStart,
+      })
+      .then((retryTask) => {
+        store.appendTaskEvent({
+          taskId: retryTask.id,
+          eventType: "status",
+          payload: {
+            phase: "retry_created",
+            message: "이 Task는 기존 작업을 재시도하기 위해 생성되었습니다.",
+            parentTaskId: task.id,
+            originRunId: task.runId ?? task.originRunId,
+          },
+        });
+        store.appendTaskEvent({
+          taskId: task.id,
+          eventType: "status",
+          payload: {
+            phase: "retry_requested",
+            message: "운영자가 이 Task의 재시도 작업을 생성했습니다.",
+            retryTaskId: retryTask.id,
+          },
+        });
+        response.json({ task: retryTask, parentTask: task });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to retry task.",
         });
       });
   });

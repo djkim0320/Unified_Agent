@@ -9,9 +9,45 @@ import {
 import { requireAgent, type AppStore, type AppWorkspace } from "./context.js";
 
 const SkillTemplateIdSchema = z.string().min(1).max(120);
+const FlowTemplateStepSchema = z.object({
+  stepKey: z.string().min(1).max(80),
+  title: z.string().min(1).max(120),
+  prompt: z.string().min(1).max(20_000),
+  dependencyStepKey: z.string().min(1).max(80).nullable().optional(),
+});
+
+const SkillTemplateSaveSchema = z.object({
+  id: z.string().min(1).max(120).optional(),
+  scope: z.enum(["agent", "shared"]).optional().default("agent"),
+  name: z.string().min(1).max(120),
+  category: z.string().min(1).max(80),
+  summary: z.string().min(1).max(500),
+  description: z.string().min(1).max(5000),
+  standingOrderPatch: z.string().max(10_000).default(""),
+  flowTemplate: z.object({
+    title: z.string().min(1).max(120),
+    steps: z.array(FlowTemplateStepSchema).min(0).max(8),
+  }),
+  verificationChecklist: z.array(z.string().min(1).max(500)).max(20).default([]),
+  heartbeatInstructions: z.string().max(10_000).default(""),
+  suggestedPrompt: z.string().max(20_000).default(""),
+  tags: z.array(z.string().min(1).max(80)).max(20).default([]),
+});
 
 const SKILL_TEMPLATE_BOUNDARY =
   "Skill templates are reusable prompt, flow, standing-order, verification, and heartbeat patterns. AetherOps does not execute skills directly; execution remains opencode-only.";
+
+function normalizeFlowTemplate(flowTemplate: z.infer<typeof SkillTemplateSaveSchema>["flowTemplate"]) {
+  return {
+    title: flowTemplate.title,
+    steps: flowTemplate.steps.map((step) => ({
+      stepKey: step.stepKey,
+      title: step.title,
+      prompt: step.prompt,
+      dependencyStepKey: step.dependencyStepKey ?? null,
+    })),
+  };
+}
 
 export function registerSkillTemplateRoutes(
   app: express.Express,
@@ -22,11 +58,80 @@ export function registerSkillTemplateRoutes(
 ) {
   const { store, workspace } = params;
 
-  app.get("/api/skill-templates", (_request, response) => {
+  function resolveTemplate(agentId: string, templateId: string) {
+    return getSkillTemplate(templateId) ?? store.getCustomSkillTemplate?.(agentId, templateId) ?? null;
+  }
+
+  app.get("/api/skill-templates", (request, response) => {
+    const agentId = typeof request.query.agentId === "string" ? request.query.agentId : undefined;
     response.json({
-      templates: listSkillTemplates(),
+      templates: listSkillTemplates(store.listCustomSkillTemplates?.(agentId ?? null) ?? []),
       boundary: SKILL_TEMPLATE_BOUNDARY,
     });
+  });
+
+  app.post("/api/agents/:agentId/skill-templates", (request, response) => {
+    const agent = requireAgent(store, response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = SkillTemplateSaveSchema.parse(request.body);
+    const template = store.saveCustomSkillTemplate({
+      ...body,
+      flowTemplate: normalizeFlowTemplate(body.flowTemplate),
+      agentId: body.scope === "shared" ? null : agent.id,
+    });
+    response.json({ template, boundary: SKILL_TEMPLATE_BOUNDARY });
+  });
+
+  app.patch("/api/agents/:agentId/skill-templates/:templateId", (request, response) => {
+    const agent = requireAgent(store, response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    if (getSkillTemplate(request.params.templateId)) {
+      response.status(409).json({ error: "Built-in skill templates are read-only." });
+      return;
+    }
+    const existing = store.getCustomSkillTemplate?.(agent.id, request.params.templateId);
+    if (!existing) {
+      response.status(404).json({ error: "Skill template not found." });
+      return;
+    }
+    const body = SkillTemplateSaveSchema.partial().parse(request.body);
+    const template = store.saveCustomSkillTemplate({
+      id: existing.id,
+      agentId: body.scope === "shared" ? null : agent.id,
+      scope: body.scope ?? (existing.scope === "shared" ? "shared" : "agent"),
+      name: body.name ?? existing.name,
+      category: body.category ?? existing.category,
+      summary: body.summary ?? existing.summary,
+      description: body.description ?? existing.description,
+      standingOrderPatch: body.standingOrderPatch ?? existing.standingOrderPatch,
+      flowTemplate: body.flowTemplate ? normalizeFlowTemplate(body.flowTemplate) : existing.flowTemplate,
+      verificationChecklist: body.verificationChecklist ?? existing.verificationChecklist,
+      heartbeatInstructions: body.heartbeatInstructions ?? existing.heartbeatInstructions,
+      suggestedPrompt: body.suggestedPrompt ?? existing.suggestedPrompt,
+      tags: body.tags ?? existing.tags,
+    });
+    response.json({ template, boundary: SKILL_TEMPLATE_BOUNDARY });
+  });
+
+  app.delete("/api/agents/:agentId/skill-templates/:templateId", (request, response) => {
+    const agent = requireAgent(store, response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    if (getSkillTemplate(request.params.templateId)) {
+      response.status(409).json({ error: "Built-in skill templates are read-only." });
+      return;
+    }
+    const deleted = store.deleteCustomSkillTemplate?.(agent.id, request.params.templateId) ?? false;
+    if (!deleted) {
+      response.status(404).json({ error: "Skill template not found." });
+      return;
+    }
+    response.json({ ok: true, templateId: request.params.templateId, boundary: SKILL_TEMPLATE_BOUNDARY });
   });
 
   app.post(
@@ -37,7 +142,7 @@ export function registerSkillTemplateRoutes(
         return;
       }
       const templateId = SkillTemplateIdSchema.parse(request.params.templateId);
-      const template = getSkillTemplate(templateId);
+      const template = resolveTemplate(agent.id, templateId);
       if (!template) {
         response.status(404).json({ error: "Skill template not found." });
         return;
@@ -68,7 +173,7 @@ export function registerSkillTemplateRoutes(
         return;
       }
       const templateId = SkillTemplateIdSchema.parse(request.params.templateId);
-      const template = getSkillTemplate(templateId);
+      const template = resolveTemplate(agent.id, templateId);
       if (!template) {
         response.status(404).json({ error: "Skill template not found." });
         return;

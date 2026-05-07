@@ -57,6 +57,7 @@ interface CockpitSectionViewProps {
   onRefreshPlatformMetadata: () => void;
   onRefreshPreflight: () => void;
   onResumeTaskFlow: (flowId: string) => void;
+  onRetryTask?: (taskId: string, force?: boolean) => void;
   onRetryTaskFlowStep: (flowId: string, stepId: string) => void;
   onSelectTaskFlow: (flowId: string) => void;
   onSaveTaskFlowSteps: (flowId: string, steps: TaskFlowStepDraft[], title?: string) => void;
@@ -348,6 +349,7 @@ export function CockpitSectionView({
   onRefreshPlatformMetadata,
   onRefreshPreflight,
   onResumeTaskFlow,
+  onRetryTask = () => {},
   onRetryTaskFlowStep,
   onSelectTaskFlow,
   onSaveTaskFlowSteps,
@@ -1045,8 +1047,29 @@ export function CockpitSectionView({
                   <small>Flow: {task.taskFlowId ? `${task.taskFlowId.slice(0, 8)} / ${task.flowStepKey ?? "-"}` : "연결 없음"}</small>
                   {task.automationRuleId ? <small>자동화: {task.automationRuleId}</small> : null}
                   {task.status === "failed" || task.status === "timed_out" ? (
-                    <button className="cockpit-mini-button" onClick={() => copyTaskDebug(task)} type="button">
-                      debug 정보 복사
+                    <div className="cockpit-section-actions">
+                      <button className="cockpit-mini-button" onClick={() => onRetryTask(task.id)} type="button">
+                        재시도
+                      </button>
+                      <button className="cockpit-mini-button" onClick={() => copyTaskDebug(task)} type="button">
+                        debug 정보 복사
+                      </button>
+                    </div>
+                  ) : task.status === "cancelled" ? (
+                    <button className="cockpit-mini-button" onClick={() => onRetryTask(task.id)} type="button">
+                      재시도
+                    </button>
+                  ) : task.status === "completed" ? (
+                    <button
+                      className="cockpit-mini-button"
+                      onClick={() => {
+                        if (window.confirm("완료된 Task를 복제해서 다시 실행할까요?")) {
+                          onRetryTask(task.id, true);
+                        }
+                      }}
+                      type="button"
+                    >
+                      복제 실행
                     </button>
                   ) : null}
                 </article>

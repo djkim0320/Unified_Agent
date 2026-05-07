@@ -1,6 +1,12 @@
 import type express from "express";
 import { z } from "zod";
-import { buildMcpConfigStatus, getMcpCatalogEntry, getStaticMcpCatalog } from "../lib/mcp-config-metadata.js";
+import {
+  buildMcpConfigStatus,
+  getMcpCatalogEntry,
+  getStaticMcpCatalog,
+  validateMcpSnippet,
+} from "../lib/mcp-config-metadata.js";
+import { withEngineAuthEvidence } from "../lib/engine-auth-evidence.js";
 import { normalizeReasoningLevel } from "../reasoning-options.js";
 import { requireAgent, type AppGateway, type AppStore } from "./context.js";
 
@@ -10,6 +16,10 @@ const McpTestRunSchema = z.object({
   catalogId: z.string().min(1).max(80).optional(),
   serverId: z.string().min(1).max(120).optional(),
   autoStart: z.boolean().optional().default(true),
+});
+
+const McpSnippetValidateSchema = z.object({
+  snippet: z.string().min(1).max(50_000),
 });
 
 export function registerMcpRoutes(
@@ -30,13 +40,19 @@ export function registerMcpRoutes(
   });
 
   app.get("/api/mcp/config/status", async (_request, response) => {
-    const engineStatus = await gateway.agentEngine.getStatus();
+    const engineStatus = withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store);
     response.json({
       status: buildMcpConfigStatus({
         engineStatus,
         exposeDebugPaths: params.exposeWorkspaceDebugPaths,
       }),
     });
+  });
+
+  app.post("/api/mcp/config/validate-snippet", (request, response) => {
+    const body = McpSnippetValidateSchema.parse(request.body);
+    const result = validateMcpSnippet(body.snippet);
+    response.status(result.ok ? 200 : 400).json({ validation: result });
   });
 
   app.post("/api/mcp/test-run", (request, response) => {

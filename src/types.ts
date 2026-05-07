@@ -280,6 +280,13 @@ export interface SessionSummaryRecord {
   decisions: string[];
   openQuestions: string[];
   nextActions: string[];
+  metadata?: {
+    currentGoal?: string | null;
+    completedWork?: string[];
+    importantArtifacts?: string[];
+    lastVerification?: string | null;
+    [key: string]: unknown;
+  };
   createdAt: number;
   updatedAt: number;
 }
@@ -308,6 +315,9 @@ export interface ArtifactPreviewResponse {
     binary: boolean;
     truncated: boolean;
     unsupportedEncoding?: boolean;
+    source?: "snapshot" | "current-workspace" | "report";
+    sensitiveFieldsHidden?: boolean;
+    fullContentAvailable?: boolean;
   };
 }
 
@@ -316,6 +326,9 @@ export interface ArtifactDiffResponse {
   diff: {
     available: boolean;
     reason: string;
+    content?: string;
+    binary?: boolean;
+    truncated?: boolean;
   };
 }
 
@@ -333,6 +346,9 @@ export interface FlowDraft {
 
 export interface SkillTemplateRecord {
   id: string;
+  agentId?: string | null;
+  scope?: "built-in" | "agent" | "shared";
+  builtIn?: boolean;
   name: string;
   category: string;
   summary: string;
@@ -397,6 +413,19 @@ export interface EngineStatusRecord {
   managedPackageVersion?: string | null;
   configDir: string | null;
   authStatus: "available" | "unknown" | "unavailable";
+  authEvidence?: {
+    status: "usable" | "warning" | "blocked";
+    source:
+      | "auth-command"
+      | "recent-successful-run"
+      | "provider-secret"
+      | "codex-oauth"
+      | "credential-sync"
+      | "unknown";
+    confidence: "high" | "medium" | "low";
+    message: string;
+    lastSuccessfulRunAt?: number | null;
+  };
   models: string[];
   sessions: Array<Record<string, unknown>>;
   lastFailure: string | null;
@@ -444,9 +473,23 @@ export interface McpConfigStatus {
   configDirSource: "default" | "env" | "unavailable";
   displayPath: string;
   debugPath?: string | null;
+  parserType?: "json" | "jsonc" | "unsupported" | "not-found";
+  sourceLabel?: string;
+  canWriteSafely?: boolean;
+  validationWarnings?: string[];
   configuredCount: number;
   configuredServers: McpServerSummary[];
   warnings: string[];
+}
+
+export interface McpSnippetValidationResult {
+  ok: boolean;
+  parserType: "json" | "jsonc" | "unsupported";
+  parsedServerCount: number;
+  riskWarnings: string[];
+  envPlaceholders: string[];
+  errors: string[];
+  configuredServers: McpServerSummary[];
 }
 
 export interface EngineAuthLoginResult {

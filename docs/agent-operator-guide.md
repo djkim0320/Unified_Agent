@@ -38,7 +38,9 @@ Current domain model:
 - `workspace_run_events`
   - status, tool calls, tool results, terminal events
 - `artifacts`
-  - run-scoped records for changed files and future reports/summaries
+  - run-scoped records for changed files, reports, summaries, and logs
+- `artifact_versions`
+  - immutable small-text snapshots captured before/after a run for stable preview and real diff generation
 - `tasks`
   - detached background work
 - `task_events`
@@ -135,10 +137,11 @@ The MCP tab is useful by design, but it is still not an AetherOps-owned MCP runt
 
 - Catalog route: `GET /api/mcp/catalog`.
 - Safe config metadata route: `GET /api/mcp/config/status`.
+- Snippet validation route: `POST /api/mcp/config/validate-snippet`.
 - Test route: `POST /api/mcp/test-run`.
 - Deprecated execution/registration route: `POST /api/mcp/servers` returns `410 Gone`.
 
-The catalog provides copyable opencode config snippets, risk notes, recommended boundaries, and test prompts for common categories such as Filesystem, Browser/Web, GitHub, and Database. The test route creates a normal detached task through `TaskManager -> AgentEngine.runTurn(...) -> opencode`; it does not directly execute an MCP server.
+The catalog provides copyable opencode config snippets, risk notes, recommended boundaries, and test prompts for common categories such as Filesystem, Browser/Web, GitHub, and Database. Snippet validation is dry-run only: it parses JSON/JSONC, reports env placeholders and risk warnings, and rejects literal token-looking values. The test route creates a normal detached task through `TaskManager -> AgentEngine.runTurn(...) -> opencode`; it does not directly execute an MCP server.
 
 Path-safety rule: normal API responses show display-safe config labels. Absolute local config paths are only returned when debug path exposure is explicitly enabled.
 
@@ -153,11 +156,12 @@ Internal skill/plugin execution was removed from the product path. Put repeatabl
 The Skill tab now exposes a template library, not an execution runtime.
 
 - Catalog route: `GET /api/skill-templates`.
+- Custom template routes: `POST/PATCH/DELETE /api/agents/:agentId/skill-templates/:templateId?`.
 - Standing-order application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-standing-orders`.
 - Heartbeat application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-heartbeat`.
 - Deprecated execution route: `GET/POST /api/agents/:agentId/skills` still returns `410 Gone`.
 
-Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
+Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Built-ins are read-only; custom templates are stored in SQLite. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
 
 ### Memory
 
@@ -231,7 +235,7 @@ Rules:
 
 These features improve observability without adding another execution runtime.
 
-- Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`.
+- Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`, `POST /api/conversations/:id/summary/refresh-task`.
 - Artifact routes: `GET /api/runs/:runId/artifacts?conversationId=<id>`, `GET /api/artifacts/:artifactId/preview`, `GET /api/artifacts/:artifactId/diff`.
 - Debug route: `GET /api/runs/:runId/debug?conversationId=<id>`.
 
@@ -239,8 +243,9 @@ Safety invariants:
 
 - artifact paths are stored and returned as relative paths
 - preview is read-only and tied to the artifact's run/conversation ownership
-- unsupported or binary previews stay explicit instead of being coerced
-- debugger payloads are capped and intended for local diagnosis, not public log export
+- preview prefers `artifact_versions.after_content`, falling back to current workspace only with an explicit source flag
+- diff is only produced from real before/after snapshots; binary, truncated, or baseline-less cases return a structured unavailable reason
+- debugger/report export defaults to redacted content and keeps prompt/result text presence as booleans
 
 ## 4. Frontend Architecture
 

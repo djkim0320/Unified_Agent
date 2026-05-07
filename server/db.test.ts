@@ -48,7 +48,7 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ version: number; name: string }>;
 
     expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
     );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
@@ -131,6 +131,110 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ name: string }>;
 
     expect(rows).toEqual([]);
+  });
+
+  it("persists project memory metadata, artifact snapshots, and custom skill templates", () => {
+    const conversation = createConversation("hardening coverage");
+    const summary = store.saveSessionSummary({
+      conversationId: conversation.id,
+      summary: "Current project summary",
+      decisions: ["Keep opencode as the only execution engine"],
+      openQuestions: ["Which validation flow should run next?"],
+      nextActions: ["Review the latest run report"],
+      metadata: {
+        currentGoal: "Polish the operations cockpit",
+        completedWork: ["Added snapshot-backed artifacts"],
+        importantArtifacts: ["report.md"],
+        lastVerification: "pnpm test",
+      },
+    });
+
+    expect(store.getSessionSummary(conversation.id)).toEqual(
+      expect.objectContaining({
+        conversationId: conversation.id,
+        summary: summary.summary,
+        decisions: ["Keep opencode as the only execution engine"],
+        metadata: expect.objectContaining({
+          currentGoal: "Polish the operations cockpit",
+          importantArtifacts: ["report.md"],
+        }),
+      }),
+    );
+
+    const run = store.createWorkspaceRun({
+      conversationId: conversation.id,
+      providerKind: "openai",
+      model: "gpt-5.4",
+      userMessage: "Update a file",
+    });
+    const artifacts = store.createArtifactsForRun({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      runId: run.id,
+      changedFiles: ["src/result.ts"],
+      snapshots: [
+        {
+          path: "src/result.ts",
+          beforeContent: "export const value = 'before';\n",
+          afterContent: "export const value = 'after';\n",
+          beforeHash: "before-hash",
+          afterHash: "after-hash",
+          sizeBytes: 29,
+          encoding: "utf8",
+          binary: false,
+          truncated: false,
+        },
+      ],
+    });
+
+    expect(artifacts).toHaveLength(1);
+    expect(store.getArtifactVersion(artifacts[0].id)).toEqual(
+      expect.objectContaining({
+        path: "src/result.ts",
+        beforeContent: "export const value = 'before';\n",
+        afterContent: "export const value = 'after';\n",
+        binary: false,
+        truncated: false,
+      }),
+    );
+
+    const skill = store.saveCustomSkillTemplate({
+      agentId: conversation.agentId,
+      scope: "agent",
+      name: "Local verification",
+      category: "Quality",
+      summary: "Create a reusable verification plan.",
+      description: "A local-only prompt and flow template.",
+      standingOrderPatch: "Always report verification gaps.",
+      flowTemplate: {
+        title: "Verification flow",
+        steps: [
+          {
+            stepKey: "verify",
+            title: "Verify",
+            prompt: "Run the agreed validation through opencode and summarize results.",
+            dependencyStepKey: null,
+          },
+        ],
+      },
+      verificationChecklist: ["typecheck", "test", "build"],
+      heartbeatInstructions: "Check for stale failed tasks.",
+      suggestedPrompt: "Prepare a verification report.",
+      tags: ["verification"],
+    });
+
+    expect(store.listCustomSkillTemplates(conversation.agentId)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: skill.id,
+          builtIn: false,
+          name: "Local verification",
+          tags: ["verification"],
+        }),
+      ]),
+    );
+    expect(store.deleteCustomSkillTemplate(conversation.agentId, skill.id)).toBe(true);
+    expect(store.getCustomSkillTemplate(conversation.agentId, skill.id)).toBeNull();
   });
 
   it("preserves legacy memory/plugin tables when opening old databases", () => {

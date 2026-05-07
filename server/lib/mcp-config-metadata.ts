@@ -3,6 +3,7 @@ import path from "node:path";
 import type {
   EngineStatusRecord,
   McpConfigStatus,
+  McpSnippetValidationResult,
   McpRiskLevel,
   McpServerCategory,
   McpServerSummary,
@@ -143,6 +144,23 @@ function stripJsonComments(content: string) {
     .replace(/^\s*\/\/.*$/gm, "");
 }
 
+function detectParserType(content: string | undefined): "json" | "jsonc" | "unsupported" | "not-found" {
+  if (!content?.trim()) {
+    return "not-found";
+  }
+  try {
+    JSON.parse(content);
+    return "json";
+  } catch {
+    try {
+      JSON.parse(stripJsonComments(content));
+      return "jsonc";
+    } catch {
+      return "unsupported";
+    }
+  }
+}
+
 function parseMcpObject(content: string | undefined, warnings: string[]) {
   if (!content?.trim()) {
     return null;
@@ -162,11 +180,16 @@ function parseMcpObject(content: string | undefined, warnings: string[]) {
 function readConfiguredMcpFromEnvOrConfig(configDir: string | null, warnings: string[]) {
   const fromEnv = parseMcpObject(process.env.OPENCODE_CONFIG_CONTENT, warnings);
   if (fromEnv) {
-    return { source: "OPENCODE_CONFIG_CONTENT", mcp: fromEnv };
+    return {
+      source: "OPENCODE_CONFIG_CONTENT",
+      mcp: fromEnv,
+      parserType: detectParserType(process.env.OPENCODE_CONFIG_CONTENT),
+      canWriteSafely: false,
+    };
   }
 
   if (!configDir) {
-    return { source: null, mcp: null };
+    return { source: null, mcp: null, parserType: "not-found" as const, canWriteSafely: false };
   }
 
   for (const fileName of ["opencode.json", "opencode.jsonc", "config.json"]) {
@@ -175,16 +198,22 @@ function readConfiguredMcpFromEnvOrConfig(configDir: string | null, warnings: st
       if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
         continue;
       }
-      const mcp = parseMcpObject(fs.readFileSync(candidate, "utf8"), warnings);
+      const content = fs.readFileSync(candidate, "utf8");
+      const mcp = parseMcpObject(content, warnings);
       if (mcp) {
-        return { source: fileName, mcp };
+        return {
+          source: fileName,
+          mcp,
+          parserType: detectParserType(content),
+          canWriteSafely: fileName.endsWith(".json") || fileName.endsWith(".jsonc"),
+        };
       }
     } catch {
       warnings.push(`${fileName} 파일을 읽지 못했습니다. 권한 또는 파일 상태를 확인하세요.`);
     }
   }
 
-  return { source: null, mcp: null };
+  return { source: null, mcp: null, parserType: "not-found" as const, canWriteSafely: false };
 }
 
 function inferCategory(name: string, value: unknown): McpServerCategory {
@@ -281,7 +310,7 @@ export function buildMcpConfigStatus(params: {
       : configDirSource === "default"
         ? "opencode 기본 설정 경로"
         : "opencode 상태 확인 필요";
-  const { source, mcp } = readConfiguredMcpFromEnvOrConfig(configDir, warnings);
+  const { source, mcp, parserType, canWriteSafely } = readConfiguredMcpFromEnvOrConfig(configDir, warnings);
   const configuredServers = isObject(mcp)
     ? Object.entries(mcp).map(([name, value]) => configuredServerSummary(name, value, source))
     : [];
@@ -295,8 +324,76 @@ export function buildMcpConfigStatus(params: {
     configDirSource,
     displayPath,
     ...(params.exposeDebugPaths ? { debugPath: configDir } : {}),
+    parserType,
+    sourceLabel: source ?? "not-found",
+    canWriteSafely,
+    validationWarnings: [...warnings],
     configuredCount: configuredServers.length,
     configuredServers,
     warnings,
+  };
+}
+
+function containsLiteralSecret(value: string) {
+  return (
+    /\b(?:sk|rk|ghp|gho|github_pat|xox[abprs])[-_A-Za-z0-9]{12,}\b/.test(value) ||
+    /\b[A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD)[A-Z0-9_]*\s*:\s*["'][^"{][^"']{8,}["']/i.test(value)
+  );
+}
+
+function envPlaceholdersFromSnippet(snippet: string) {
+  return [
+    ...new Set([
+      ...Array.from(snippet.matchAll(/\{env:([A-Z0-9_]+)\}/gi)).map((match) => match[1]),
+      ...Array.from(snippet.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((match) => match[1]),
+      ...Array.from(snippet.matchAll(/\$([A-Z0-9_]+)/g)).map((match) => match[1]),
+    ]),
+  ].sort();
+}
+
+export function validateMcpSnippet(snippet: string): McpSnippetValidationResult {
+  const trimmed = snippet.trim();
+  const parserType = detectParserType(trimmed);
+  const errors: string[] = [];
+  const riskWarnings: string[] = [];
+  const warnings: string[] = [];
+  if (!trimmed) {
+    return {
+      ok: false,
+      parserType: "unsupported",
+      parsedServerCount: 0,
+      riskWarnings: [],
+      envPlaceholders: [],
+      errors: ["스니펫이 비어 있습니다."],
+      configuredServers: [],
+    };
+  }
+  if (containsLiteralSecret(trimmed)) {
+    errors.push("스니펫에 토큰처럼 보이는 literal secret이 포함되어 있습니다. {env:NAME} placeholder로 바꾸세요.");
+  }
+  if (parserType === "unsupported" || parserType === "not-found") {
+    errors.push("JSON 또는 JSONC 형식의 opencode MCP 스니펫만 검증할 수 있습니다.");
+  }
+  const mcp = parseMcpObject(trimmed, warnings);
+  if (!mcp || !isObject(mcp)) {
+    errors.push("mcp 객체를 찾을 수 없습니다.");
+  }
+  const configuredServers = isObject(mcp)
+    ? Object.entries(mcp).map(([name, value]) => configuredServerSummary(name, value, "snippet"))
+    : [];
+  for (const server of configuredServers) {
+    if (server.riskLevel === "high") {
+      riskWarnings.push(`${server.name}: ${server.recommendedBoundary ?? "고위험 MCP 서버는 명시적 경계가 필요합니다."}`);
+    }
+    riskWarnings.push(...server.warnings.slice(0, 2));
+  }
+  return {
+    ok: errors.length === 0,
+    parserType: parserType === "not-found" ? "unsupported" : parserType,
+    parsedServerCount: configuredServers.length,
+    riskWarnings: [...new Set([...riskWarnings, ...warnings])],
+    envPlaceholders: envPlaceholdersFromSnippet(trimmed),
+    errors,
+    configuredServers,
   };
 }

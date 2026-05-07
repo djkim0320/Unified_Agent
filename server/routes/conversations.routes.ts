@@ -34,6 +34,7 @@ const SessionSummarySaveSchema = z.object({
   decisions: z.array(z.string().max(500)).max(20).optional().default([]),
   openQuestions: z.array(z.string().max(500)).max(20).optional().default([]),
   nextActions: z.array(z.string().max(500)).max(20).optional().default([]),
+  metadata: z.record(z.unknown()).optional().default({}),
 });
 
 function clip(text: string, maxLength = 220) {
@@ -52,39 +53,68 @@ function buildDeterministicSummary(store: AppStore, conversationId: string) {
   if (!conversation) {
     throw new Error("Conversation not found.");
   }
+
   const messages = store.listMessages(conversationId).slice(-12);
-  const runs = store.listWorkspaceRuns(conversationId).slice(0, 5);
+  const runs = store.listWorkspaceRuns(conversationId).slice(0, 8);
   const latestRun = runs[0] ?? null;
   const latestEvents = latestRun ? store.listWorkspaceRunEvents(conversationId, latestRun.id).slice(-12) : [];
   const changedFiles = [
-    ...new Set(
-      latestEvents.flatMap((event) => stringArrayFromRunPayload(event.payload.changedFiles)),
-    ),
+    ...new Set(latestEvents.flatMap((event) => stringArrayFromRunPayload(event.payload.changedFiles))),
   ].slice(0, 12);
   const flows = store.listTaskFlows?.(conversation.agentId).filter((flow) => flow.conversationId === conversationId) ?? [];
-  const tasks = store.listTasksForConversation?.(conversationId).slice(0, 5) ?? [];
+  const tasks = store.listTasksForConversation?.(conversationId).slice(0, 8) ?? [];
+  const latestArtifacts = latestRun ? store.listArtifactsForRun(latestRun.conversationId, latestRun.id) : [];
+  const latestReportArtifact = latestArtifacts.find((artifact) => artifact.kind === "report") ?? null;
+  const latestFlowReport =
+    latestArtifacts.find((artifact) => artifact.kind === "summary" || artifact.title.includes("Flow")) ?? null;
   const lastUserMessage = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
   const completedRuns = runs.filter((run) => run.status === "completed").length;
   const failedRuns = runs.filter((run) => run.status === "failed" || run.status === "cancelled").length;
+  const failedTasks = tasks.filter((task) => task.status === "failed" || task.status === "timed_out");
+  const currentGoal = clip(lastUserMessage || conversation.title || "아직 명확한 목표가 없습니다.");
+  const completedFlowTitles = flows.filter((flow) => flow.status === "completed").slice(0, 4).map((flow) => flow.title);
+  const importantArtifacts = latestArtifacts
+    .filter((artifact) => artifact.kind !== "report")
+    .slice(0, 8)
+    .map((artifact) => artifact.path ?? artifact.title);
 
   return {
     summary: [
-      `현재 목표: ${clip(lastUserMessage || conversation.title || "아직 명확한 목표가 없습니다.")}`,
+      `현재 목표: ${currentGoal}`,
       `완료된 작업: 최근 ${runs.length}개 실행 중 완료 ${completedRuns}개, 실패/취소 ${failedRuns}개입니다.`,
       changedFiles.length ? `최근 변경 파일: ${changedFiles.join(", ")}` : "최근 변경 파일은 아직 없습니다.",
       flows.length ? `연결된 Flow: ${flows.map((flow) => `${flow.title}(${flow.status})`).join(", ")}` : "연결된 Flow는 아직 없습니다.",
       tasks.length ? `최근 Task: ${tasks.map((task) => `${task.title}(${task.status})`).join(", ")}` : "최근 Task는 아직 없습니다.",
+      latestReportArtifact ? `최근 실행 보고서: ${latestReportArtifact.title}` : "최근 실행 보고서는 아직 없습니다.",
+      latestFlowReport ? `최근 Flow 보고서: ${latestFlowReport.title}` : "최근 Flow 보고서는 아직 없습니다.",
     ].join("\n"),
     decisions: flows
       .filter((flow) => flow.resultSummary)
       .slice(0, 5)
       .map((flow) => `${flow.title}: ${clip(flow.resultSummary ?? "", 140)}`),
-    openQuestions: latestRun?.status === "failed" ? [`최근 실행 실패를 확인해야 합니다: ${clip(latestRun.userMessage)}`] : [],
+    openQuestions: failedTasks.length
+      ? failedTasks.slice(0, 4).map((task) => `${task.title}: 실패 원인과 재시도 가능성을 확인해야 합니다.`)
+      : latestRun?.status === "failed"
+        ? [`최근 실행 실패를 확인해야 합니다: ${clip(latestRun.userMessage)}`]
+        : [],
     nextActions: [
       flows.some((flow) => flow.status === "queued" || flow.status === "running")
         ? "진행 중이거나 대기 중인 Flow를 확인합니다."
         : "다음 요청을 채팅으로 입력하거나 Flow 초안을 생성합니다.",
+      latestReportArtifact ? "최근 실행 보고서를 검토하고 필요한 후속 Flow 또는 Task를 만듭니다." : "첫 실행 보고서를 만든 뒤 요약을 갱신합니다.",
     ],
+    metadata: {
+      currentGoal,
+      completedWork: [`${completedRuns} completed run(s)`, ...completedFlowTitles],
+      importantArtifacts,
+      lastVerification:
+        typeof latestReportArtifact?.metadata.nextRecommendedAction === "string"
+          ? latestReportArtifact.metadata.nextRecommendedAction
+          : null,
+      latestReportTitle: latestReportArtifact?.title ?? null,
+      latestFlowReportTitle: latestFlowReport?.title ?? null,
+      failedTaskCount: failedTasks.length,
+    },
   };
 }
 
@@ -123,12 +153,11 @@ export function registerConversationsRoutes(
       model,
       body.reasoningLevel ?? existing?.reasoningLevel ?? agent.reasoningLevel,
     );
-    const normalizedConversationTitle = body.title ?? existing?.title ?? DEFAULT_CONVERSATION_TITLE;
     const conversation = store.saveConversation({
       id: body.conversationId,
       agentId: agent.id,
       channelKind: existing?.channelKind,
-      title: normalizedConversationTitle,
+      title: body.title ?? existing?.title ?? DEFAULT_CONVERSATION_TITLE,
       providerKind,
       model,
       reasoningLevel,
@@ -180,6 +209,7 @@ export function registerConversationsRoutes(
         decisions: body.decisions,
         openQuestions: body.openQuestions,
         nextActions: body.nextActions,
+        metadata: body.metadata,
       }),
     });
   });
@@ -196,6 +226,42 @@ export function registerConversationsRoutes(
         ...generated,
       }),
     });
+  });
+
+  app.post("/api/conversations/:id/summary/refresh-task", (request, response) => {
+    const conversation = requireConversation(store, response, request.params.id);
+    if (!conversation) {
+      return;
+    }
+    const prompt = [
+      "Inspect this AetherOps session workspace, run reports, artifacts, and recent task/flow status.",
+      "Create a concise updated session summary suggestion.",
+      "Do not modify files. Do not reveal secrets.",
+      "Return sections: current goal, completed work, decisions, open questions, next actions, important artifacts, last verification.",
+    ].join("\n");
+    void gateway.taskManager
+      .enqueueDetachedTask({
+        agentId: conversation.agentId,
+        conversationId: conversation.id,
+        title: "세션 요약 제안 생성",
+        prompt,
+        providerKind: conversation.providerKind,
+        model: conversation.model,
+        reasoningLevel: conversation.reasoningLevel,
+        taskKind: "detached",
+        startImmediately: true,
+      })
+      .then((task) => {
+        response.json({
+          task,
+          message: "opencode 기반 요약 제안 Task를 만들었습니다. 결과를 검토한 뒤 직접 요약에 저장하세요.",
+        });
+      })
+      .catch((error) => {
+        response.status(400).json({
+          error: error instanceof Error ? error.message : "Failed to create summary refresh task.",
+        });
+      });
   });
 
   app.delete("/api/conversations/:id", async (request, response) => {

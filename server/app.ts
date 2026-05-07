@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createAgentGateway } from "./lib/agent-gateway.js";
 import { createChannelRegistry } from "./lib/channel-registry.js";
 import { createDebugLog } from "./lib/debug-log.js";
+import { withEngineAuthEvidence } from "./lib/engine-auth-evidence.js";
 import { EngineRunError, isEngineRunError } from "./lib/agent-engine.js";
 import { isAbortError } from "./lib/process-control.js";
 import { createProviderSecretResolver } from "./lib/provider-secret-resolver.js";
@@ -116,7 +117,7 @@ export function createApp(options?: {
 
   registerPlatformRoutes(app, { localApiToken, gateway, channelRegistry });
   app.get("/api/engine/status", async (_request, response) => {
-    response.json(await gateway.agentEngine.getStatus());
+    response.json(withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store));
   });
   app.post("/api/engine/opencode/refresh-models", async (_request, response) => {
     const result = await gateway.agentEngine.refreshModels();
@@ -176,14 +177,14 @@ export function createApp(options?: {
 
     let engineStatus: Awaited<ReturnType<typeof gateway.agentEngine.getStatus>> | null = null;
     try {
-      engineStatus = await gateway.agentEngine.getStatus();
+      engineStatus = withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store);
       checks.push(
         engineStatus.available
           ? checkOk("opencode", "opencode", `opencode 엔진 사용 가능${engineStatus.version ? ` (${engineStatus.version})` : ""}.`)
           : checkError("opencode", "opencode", engineStatus.lastFailure ?? "opencode 엔진을 사용할 수 없습니다."),
       );
       checks.push(
-        engineStatus.authStatus === "available"
+        engineStatus.authEvidence?.status === "usable"
           ? checkOk("opencode-auth", "opencode auth", "opencode 인증 상태가 사용 가능합니다.")
           : checkWarn("opencode-auth", "opencode auth", "opencode 인증 상태가 확인되지 않았습니다. API 프로필 또는 OAuth 설정을 확인하세요."),
       );
@@ -210,7 +211,7 @@ export function createApp(options?: {
 
     if (agent) {
       const configuredProvider = Boolean(store.getProviderAccount(agent.providerKind) || store.getProviderSecret(agent.providerKind));
-      const opencodeAuthAvailable = engineStatus?.authStatus === "available";
+      const opencodeAuthAvailable = engineStatus?.authEvidence?.status === "usable";
       if (configuredProvider || opencodeAuthAvailable) {
         checks.push(checkOk("provider", "Provider", `${agent.providerKind} 실행 인증 경로가 준비되어 있습니다.`));
       } else {

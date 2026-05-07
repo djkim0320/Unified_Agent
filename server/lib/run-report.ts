@@ -7,6 +7,7 @@ import type {
   WorkspaceRunEventRecord,
   WorkspaceRunRecord,
 } from "../types.js";
+import { redactSensitiveText } from "./redaction.js";
 
 export interface VerificationChecklistTemplate {
   id: string;
@@ -54,15 +55,6 @@ export const VERIFICATION_CHECKLIST_TEMPLATES = [
 const MAX_REPORT_TEXT = 1600;
 const MAX_EVENT_TEXT = 240;
 const MAX_LIST_ITEMS = 12;
-
-function redactSensitiveText(value: string) {
-  return value
-    .replace(/\b(?:sk|rk|pk|sess|ghp|gho|ghu|github_pat|xox[abprs])[-_A-Za-z0-9]{12,}\b/g, "[redacted secret]")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "Bearer [redacted]")
-    .replace(/\b[A-Za-z]:[\\/][^\s'"<>]+/g, "[local path]")
-    .replace(/\\\\[^\s'"<>]+/g, "[local path]")
-    .replace(/\/(?:Users|home|var|tmp|mnt|Volumes)\/[^\s'"<>]+/g, "[local path]");
-}
 
 function clip(value: string | null | undefined, max = MAX_REPORT_TEXT) {
   const text = redactSensitiveText((value ?? "").trim());

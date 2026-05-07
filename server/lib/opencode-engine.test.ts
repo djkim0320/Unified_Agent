@@ -258,6 +258,86 @@ describe("OpenCodeEngine", () => {
     expect(status.opencodeAuthProviders).toEqual(["openai"]);
   });
 
+  it("redacts absolute paths from public engine session status", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const externalDirectory = path.join(os.tmpdir(), "outside-aetherops-session");
+    const runner: OpenCodeCommandRunner = {
+      async run(args) {
+        if (args[0] === "--version") {
+          return {
+            exitCode: 0,
+            stdout: "opencode 1.14.28",
+            stderr: "",
+            timedOut: false,
+            cancelled: false,
+            errorMessage: null,
+          };
+        }
+        if (args[0] === "session") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              sessions: [
+                {
+                  id: "inside",
+                  title: "Inside sandbox",
+                  directory: path.join(projectRoot, "workspace", "opencode", "agents", "a", "sessions", "c"),
+                  created: 1,
+                  updated: 2,
+                  projectId: "project-1",
+                },
+                {
+                  id: "outside",
+                  title: "Outside path",
+                  directory: externalDirectory,
+                },
+              ],
+            }),
+            stderr: "",
+            timedOut: false,
+            cancelled: false,
+            errorMessage: null,
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming() {
+        throw new Error("not used");
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    const status = await engine.getStatus();
+
+    expect(status.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "inside",
+          directory: "workspace/opencode/agents/a/sessions/c",
+        }),
+        expect.objectContaining({
+          id: "outside",
+          directory: "[path hidden]",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(status.sessions)).not.toContain(projectRoot);
+    expect(JSON.stringify(status.sessions)).not.toContain(externalDirectory);
+  });
+
   it("returns the official opencode auth login command without copying OAuth tokens", async () => {
     const workspace = createWorkspaceManager(projectRoot);
     const runner: OpenCodeCommandRunner = {

@@ -29,6 +29,7 @@ import type {
   EngineStatusRecord,
   EngineAuthLoginResult,
   McpConfigStatus,
+  McpSnippetValidationResult,
   McpServerSummary,
   ArtifactDiffResponse,
   ArtifactPreviewResponse,
@@ -120,10 +121,58 @@ export async function createMcpTestRun(payload: {
   });
 }
 
-export async function listSkillTemplates(signal?: AbortSignal) {
-  return apiRequest<{ templates: SkillTemplateRecord[]; boundary: string }>("/api/skill-templates", {
+export async function validateMcpSnippet(snippet: string) {
+  return apiRequest<{ validation: McpSnippetValidationResult }>("/api/mcp/config/validate-snippet", {
+    method: "POST",
+    body: JSON.stringify({ snippet }),
+  });
+}
+
+export async function listSkillTemplates(agentId?: string | null, signal?: AbortSignal) {
+  const path = agentId ? `/api/skill-templates?agentId=${encodeURIComponent(agentId)}` : "/api/skill-templates";
+  return apiRequest<{ templates: SkillTemplateRecord[]; boundary: string }>(path, {
     signal,
   });
+}
+
+export async function createCustomSkillTemplate(
+  agentId: string,
+  payload: Omit<SkillTemplateRecord, "id" | "createdAt" | "updatedAt" | "builtIn" | "agentId" | "scope"> & {
+    scope?: "agent" | "shared";
+  },
+) {
+  return apiRequest<{ template: SkillTemplateRecord; boundary: string }>(
+    `/api/agents/${encodeURIComponent(agentId)}/skill-templates`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function updateCustomSkillTemplate(
+  agentId: string,
+  templateId: string,
+  payload: Partial<
+    Omit<SkillTemplateRecord, "createdAt" | "updatedAt" | "builtIn" | "agentId" | "scope"> & {
+      scope: "agent" | "shared";
+    }
+  >,
+) {
+  return apiRequest<{ template: SkillTemplateRecord; boundary: string }>(
+    `/api/agents/${encodeURIComponent(agentId)}/skill-templates/${encodeURIComponent(templateId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deleteCustomSkillTemplate(agentId: string, templateId: string) {
+  return apiRequest<{ ok: boolean; templateId: string; boundary: string }>(
+    `/api/agents/${encodeURIComponent(agentId)}/skill-templates/${encodeURIComponent(templateId)}`,
+    { method: "DELETE" },
+  );
 }
 
 export async function applySkillTemplateToStandingOrders(agentId: string, templateId: string) {
@@ -333,6 +382,20 @@ export async function cancelAgentTask(agentId: string, taskId: string) {
   return apiRequest<{ task: TaskRecord }>(
     `/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
     { method: "POST" },
+  );
+}
+
+export async function retryAgentTask(
+  agentId: string,
+  taskId: string,
+  payload?: { autoStart?: boolean; force?: boolean },
+) {
+  return apiRequest<{ task: TaskRecord; parentTask: TaskRecord }>(
+    `/api/agents/${encodeURIComponent(agentId)}/tasks/${encodeURIComponent(taskId)}/retry`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload ?? {}),
+    },
   );
 }
 
@@ -633,6 +696,7 @@ export async function saveConversationSummary(
     decisions?: string[];
     openQuestions?: string[];
     nextActions?: string[];
+    metadata?: SessionSummaryRecord["metadata"];
   },
 ) {
   return apiRequest<{ summary: SessionSummaryRecord }>(
@@ -647,6 +711,16 @@ export async function saveConversationSummary(
 export async function refreshConversationSummary(conversationId: string) {
   return apiRequest<{ summary: SessionSummaryRecord }>(
     `/api/conversations/${encodeURIComponent(conversationId)}/summary/refresh`,
+    {
+      method: "POST",
+      body: JSON.stringify({}),
+    },
+  );
+}
+
+export async function refreshConversationSummaryTask(conversationId: string) {
+  return apiRequest<{ task: TaskRecord; message: string }>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/summary/refresh-task`,
     {
       method: "POST",
       body: JSON.stringify({}),

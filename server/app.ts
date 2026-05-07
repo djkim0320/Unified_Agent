@@ -23,6 +23,7 @@ import { registerMcpRoutes } from "./routes/mcp.routes.js";
 import { registerPlatformRoutes } from "./routes/platform.routes.js";
 import { registerProvidersRoutes } from "./routes/providers.routes.js";
 import { registerSkillTemplateRoutes } from "./routes/skill-templates.routes.js";
+import { registerSearchRoutes } from "./routes/search.routes.js";
 import { registerTaskFlowRoutes } from "./routes/task-flows.routes.js";
 import { registerTasksRoutes } from "./routes/tasks.routes.js";
 import { registerWorkspaceRoutes } from "./routes/workspace.routes.js";
@@ -78,6 +79,7 @@ export function createApp(options?: {
   const projectRoot = options?.projectRoot ?? process.cwd();
   const dataDir = options?.dataDir ?? path.join(projectRoot, ".data");
   const port = options?.port ?? 8787;
+  const localApiAllowedPorts = [port, 5173];
   const fetchImpl = options?.fetchImpl ?? fetch;
   const localApiToken = loadOrCreateLocalApiToken(dataDir);
   const opencodeOnlyMigration = runOpenCodeOnlyWorkspaceMigration({ projectRoot, dataDir });
@@ -111,7 +113,7 @@ export function createApp(options?: {
   app.use(
     createLocalApiAuthMiddleware({
       token: localApiToken,
-      allowedPorts: [port, 5173],
+      allowedPorts: localApiAllowedPorts,
     }),
   );
 
@@ -177,7 +179,10 @@ export function createApp(options?: {
 
     let engineStatus: Awaited<ReturnType<typeof gateway.agentEngine.getStatus>> | null = null;
     try {
-      engineStatus = withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store);
+      engineStatus = withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store, {
+        providerKind: agent?.providerKind ?? conversation?.providerKind ?? null,
+        model: agent?.model ?? conversation?.model ?? null,
+      });
       checks.push(
         engineStatus.available
           ? checkOk("opencode", "opencode", `opencode 엔진 사용 가능${engineStatus.version ? ` (${engineStatus.version})` : ""}.`)
@@ -188,6 +193,15 @@ export function createApp(options?: {
           ? checkOk("opencode-auth", "opencode auth", "opencode 인증 상태가 사용 가능합니다.")
           : checkWarn("opencode-auth", "opencode auth", "opencode 인증 상태가 확인되지 않았습니다. API 프로필 또는 OAuth 설정을 확인하세요."),
       );
+      if (engineStatus.authEvidence) {
+        checks.push(
+          engineStatus.authEvidence.status === "usable"
+            ? checkOk("opencode-auth-detail", "Auth evidence", engineStatus.authEvidence.message)
+            : engineStatus.authEvidence.status === "blocked"
+              ? checkError("opencode-auth-detail", "Auth evidence", engineStatus.authEvidence.message)
+              : checkWarn("opencode-auth-detail", "Auth evidence", engineStatus.authEvidence.message),
+        );
+      }
       if (engineStatus.environment.autoApprovePermissions) {
         checks.push(
           checkWarn(
@@ -262,7 +276,10 @@ export function createApp(options?: {
     workspace,
     taskManager: gateway.taskManager,
     exposeWorkspaceDebugPaths,
+    localApiToken,
+    localApiAllowedPorts,
   });
+  registerSearchRoutes(app, { store });
   registerMcpRoutes(app, { store, gateway, exposeWorkspaceDebugPaths });
   registerSkillTemplateRoutes(app, { store, workspace });
   app.use("/api/computer-use", (_request, response) => {
@@ -280,7 +297,7 @@ export function createApp(options?: {
     resolveSecret,
     codexOAuthDebug,
   });
-  registerConversationsRoutes(app, { store, workspace, gateway });
+  registerConversationsRoutes(app, { store, workspace, gateway, localApiToken, localApiAllowedPorts });
 
   app.post("/api/chat/stream", async (request, response) => {
     const body = ChatRequestSchema.parse(request.body);

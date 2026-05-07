@@ -150,12 +150,14 @@ export function createTaskManager(params: {
       position?: number;
       title: string;
       prompt: string;
+      stepKind?: TaskFlowStepRecord["stepKind"];
     }) => TaskFlowStepRecord;
     getTaskFlowStep?: (stepId: string) => TaskFlowStepRecord | null;
     listTaskFlowSteps?: (flowId: string) => TaskFlowStepRecord[];
     transitionTaskFlowStep?: (input: {
       stepId: string;
       taskId?: string | null;
+      stepKind?: TaskFlowStepRecord["stepKind"] | null;
       status?: TaskFlowStepRecord["status"];
       completedAt?: number | null;
       clearTaskId?: boolean;
@@ -446,6 +448,21 @@ export function createTaskManager(params: {
       return params.store.getTaskFlow?.(flowId) ?? null;
     }
 
+    if (nextStep.stepKind === "approval_gate" || nextStep.stepKind === "verification_gate") {
+      params.store.transitionTaskFlowStep?.({
+        stepId: nextStep.id,
+        status: "waiting_approval",
+      });
+      params.store.transitionTaskFlow({
+        flowId,
+        status: "running",
+        resultSummary: `${nextStep.title} 단계에서 운영자 승인을 기다립니다.`,
+        clearCompletedAt: true,
+        clearErrorText: true,
+      });
+      return params.store.getTaskFlow?.(flowId) ?? null;
+    }
+
     const conversation = params.store.getConversation?.(flow.conversationId) ?? null;
     if (!conversation) {
       const message = "Cannot start task flow because the linked session no longer exists.";
@@ -504,7 +521,13 @@ export function createTaskManager(params: {
     const steps = params.store.listTaskFlowSteps(flow.id);
     const resetKeys = new Set(
       steps
-        .filter((step) => step.status === "failed" || step.status === "cancelled" || step.status === "running")
+        .filter(
+          (step) =>
+            step.status === "failed" ||
+            step.status === "cancelled" ||
+            step.status === "running" ||
+            step.status === "waiting_approval",
+        )
         .map((step) => step.stepKey),
     );
     await cancelFlowTasksForSteps(flow, resetKeys);
@@ -582,6 +605,57 @@ export function createTaskManager(params: {
     return startTaskFlow(flowId);
   }
 
+  async function approveTaskFlowStep(flowId: string, stepId: string) {
+    const flow = params.store.getTaskFlow?.(flowId);
+    const step = params.store.getTaskFlowStep?.(stepId);
+    if (!flow || !step || step.flowId !== flow.id || !params.store.transitionTaskFlow || !params.store.transitionTaskFlowStep) {
+      throw new Error("Task flow step not found.");
+    }
+    if (step.stepKind === "task") {
+      throw new Error("Only approval or verification gate steps can be approved.");
+    }
+    if (step.status !== "waiting_approval" && step.status !== "running" && step.status !== "queued") {
+      throw new Error("Only pending approval gate steps can be approved.");
+    }
+    params.store.transitionTaskFlowStep({
+      stepId: step.id,
+      status: "completed",
+      completedAt: Date.now(),
+    });
+    params.store.transitionTaskFlow({
+      flowId,
+      status: "queued",
+      resultSummary: `${step.title} gate approved.`,
+      clearCompletedAt: true,
+      clearErrorText: true,
+    });
+    return startTaskFlow(flowId);
+  }
+
+  async function denyTaskFlowStep(flowId: string, stepId: string) {
+    const flow = params.store.getTaskFlow?.(flowId);
+    const step = params.store.getTaskFlowStep?.(stepId);
+    if (!flow || !step || step.flowId !== flow.id || !params.store.transitionTaskFlow || !params.store.transitionTaskFlowStep) {
+      throw new Error("Task flow step not found.");
+    }
+    if (step.stepKind === "task") {
+      throw new Error("Only approval or verification gate steps can be denied.");
+    }
+    const message = `${step.title} gate denied by operator.`;
+    params.store.transitionTaskFlowStep({
+      stepId: step.id,
+      status: "failed",
+      completedAt: Date.now(),
+    });
+    params.store.transitionTaskFlow({
+      flowId,
+      status: "failed",
+      errorText: message,
+      completedAt: Date.now(),
+    });
+    return params.store.getTaskFlow?.(flowId) ?? null;
+  }
+
   async function cancelTaskFlow(flowId: string) {
     const flow = params.store.getTaskFlow?.(flowId);
     if (!flow) {
@@ -602,7 +676,7 @@ export function createTaskManager(params: {
       completedAt: Date.now(),
     });
     for (const step of params.store.listTaskFlowSteps?.(flowId) ?? []) {
-      if (step.status === "queued" || step.status === "running") {
+      if (step.status === "queued" || step.status === "running" || step.status === "waiting_approval") {
         params.store.transitionTaskFlowStep?.({
           stepId: step.id,
           status: "cancelled",
@@ -920,6 +994,8 @@ export function createTaskManager(params: {
     resumeTaskFlow,
     retryTaskFlowStep,
     skipTaskFlowStep,
+    approveTaskFlowStep,
+    denyTaskFlowStep,
     cancelTaskFlow,
     tick,
     getRunningTaskIds: () => [...runningControllers.keys()],

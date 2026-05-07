@@ -10,20 +10,22 @@ import {
   type AppStore,
 } from "./context.js";
 
+const StepKindSchema = z.enum(["task", "approval_gate", "verification_gate"]).default("task");
+const TaskFlowStepInputSchema = z.object({
+  stepKey: z.string().min(1).max(80),
+  title: z.string().min(1).max(120),
+  prompt: z.string().min(1).max(20_000),
+  dependencyStepKey: z.string().min(1).max(80).optional().nullable(),
+  stepKind: StepKindSchema.optional().default("task"),
+});
+
 const TaskFlowCreateSchema = z
   .object({
     conversationId: z.string().uuid().optional().nullable(),
     title: z.string().min(1).max(120),
     autoStart: z.boolean().optional().default(true),
     steps: z
-      .array(
-        z.object({
-          stepKey: z.string().min(1).max(80),
-          title: z.string().min(1).max(120),
-          prompt: z.string().min(1).max(20_000),
-          dependencyStepKey: z.string().min(1).max(80).optional().nullable(),
-        }),
-      )
+      .array(TaskFlowStepInputSchema)
       .min(0)
       .max(8)
       .default([]),
@@ -43,14 +45,7 @@ const TaskFlowStepsReplaceSchema = z
   .object({
     title: z.string().min(1).max(120).optional(),
     steps: z
-      .array(
-        z.object({
-          stepKey: z.string().min(1).max(80),
-          title: z.string().min(1).max(120),
-          prompt: z.string().min(1).max(20_000),
-          dependencyStepKey: z.string().min(1).max(80).optional().nullable(),
-        }),
-      )
+      .array(TaskFlowStepInputSchema)
       .min(0)
       .max(8),
   })
@@ -200,6 +195,7 @@ export function registerTaskFlowRoutes(
           title: step.title,
           prompt: step.prompt,
           dependencyStepKey: step.dependencyStepKey ?? null,
+          stepKind: step.stepKind ?? "task",
         })),
       })
       .then((result) => {
@@ -252,6 +248,7 @@ export function registerTaskFlowRoutes(
         ...step,
         position: index,
         dependencyStepKey: step.dependencyStepKey ?? null,
+        stepKind: step.stepKind ?? "task",
       })),
       parsedBody.data.title,
     );
@@ -356,6 +353,38 @@ export function registerTaskFlowRoutes(
       })
       .catch((error) => {
         response.status(400).json({ error: error instanceof Error ? error.message : "Failed to skip task flow step." });
+      });
+  });
+
+  app.post("/api/flows/:flowId/steps/:stepId/approve", (request, response) => {
+    const flow = requireTaskFlow(store, response, request.params.flowId);
+    if (!flow || !requireTaskFlowStep(store, response, flow, request.params.stepId)) {
+      return;
+    }
+    void gateway.taskManager
+      .approveTaskFlowStep(flow.id, request.params.stepId)
+      .then((updated) => {
+        const nextFlow = updated ?? store.getTaskFlow?.(flow.id) ?? flow;
+        response.json(buildTaskFlowResponse(store, nextFlow));
+      })
+      .catch((error) => {
+        response.status(400).json({ error: error instanceof Error ? error.message : "Failed to approve task flow step." });
+      });
+  });
+
+  app.post("/api/flows/:flowId/steps/:stepId/deny", (request, response) => {
+    const flow = requireTaskFlow(store, response, request.params.flowId);
+    if (!flow || !requireTaskFlowStep(store, response, flow, request.params.stepId)) {
+      return;
+    }
+    void gateway.taskManager
+      .denyTaskFlowStep(flow.id, request.params.stepId)
+      .then((updated) => {
+        const nextFlow = updated ?? store.getTaskFlow?.(flow.id) ?? flow;
+        response.json(buildTaskFlowResponse(store, nextFlow));
+      })
+      .catch((error) => {
+        response.status(400).json({ error: error instanceof Error ? error.message : "Failed to deny task flow step." });
       });
   });
 }

@@ -4,6 +4,11 @@ import { DEFAULT_AGENT_ID, DEFAULT_CONVERSATION_TITLE } from "../db.js";
 import { getProviderAdapter } from "../provider-registry.js";
 import { normalizeReasoningLevel } from "../reasoning-options.js";
 import { ProviderKindSchema, ReasoningLevelSchema } from "../schemas/common.js";
+import { redactSensitiveText, redactUnknown } from "../lib/redaction.js";
+import {
+  exportModeFromRequest,
+  requireFullExportAllowed,
+} from "../lib/full-export-guard.js";
 import {
   requireAgent,
   requireConversation,
@@ -35,6 +40,16 @@ const SessionSummarySaveSchema = z.object({
   openQuestions: z.array(z.string().max(500)).max(20).optional().default([]),
   nextActions: z.array(z.string().max(500)).max(20).optional().default([]),
   metadata: z.record(z.unknown()).optional().default({}),
+});
+
+const SummarySuggestionApplySchema = SessionSummarySaveSchema.extend({
+  taskId: z.string().min(1).optional(),
+});
+
+const ConversationImportSchema = z.object({
+  bundle: z.record(z.unknown()),
+  agentId: z.string().min(1).max(120).optional(),
+  title: z.string().min(1).max(120).optional(),
 });
 
 function clip(text: string, maxLength = 220) {
@@ -118,12 +133,71 @@ function buildDeterministicSummary(store: AppStore, conversationId: string) {
   };
 }
 
+function parseSummarySuggestion(raw: string) {
+  const redacted = redactSensitiveText(raw);
+  const sections: Record<string, string[]> = {};
+  let currentKey: string | null = null;
+  const aliases: Array<[RegExp, string]> = [
+    [/current goal|현재 목표/i, "currentGoal"],
+    [/completed work|완료/i, "completedWork"],
+    [/decisions?|결정/i, "decisions"],
+    [/open questions?|열린 질문|미해결/i, "openQuestions"],
+    [/next actions?|다음/i, "nextActions"],
+    [/important artifacts?|산출물/i, "importantArtifacts"],
+    [/last verification|검증/i, "lastVerification"],
+  ];
+
+  for (const line of redacted.split(/\r?\n/)) {
+    const normalized = line.replace(/^#+\s*/, "").replace(/^[-*\d.)\s]+/, "").trim();
+    const match = aliases.find(([pattern]) => pattern.test(normalized.replace(/:$/, "")));
+    if (match && normalized.length <= 80) {
+      currentKey = match[1];
+      sections[currentKey] ??= [];
+      continue;
+    }
+    if (currentKey && normalized) {
+      sections[currentKey].push(normalized.replace(/^[-*]\s*/, ""));
+    }
+  }
+
+  const first = (key: string) => sections[key]?.join("\n").trim() || "";
+  return {
+    raw: redacted,
+    parsed: {
+      summary: redacted.slice(0, 20_000),
+      decisions: sections.decisions ?? [],
+      openQuestions: sections.openQuestions ?? [],
+      nextActions: sections.nextActions ?? [],
+      metadata: {
+        currentGoal: first("currentGoal") || null,
+        completedWork: sections.completedWork ?? [],
+        importantArtifacts: sections.importantArtifacts ?? [],
+        lastVerification: first("lastVerification") || null,
+      },
+    },
+  };
+}
+
+function latestSummarySuggestionTasks(store: AppStore, conversationId: string) {
+  return (store.listTasksForConversation?.(conversationId) ?? [])
+    .filter(
+      (task) =>
+        task.status === "completed" &&
+        typeof task.resultText === "string" &&
+        task.resultText.trim() &&
+        /session summary suggestion|updated session summary suggestion|요약/i.test(`${task.title}\n${task.prompt}`),
+    )
+    .slice(0, 5);
+}
+
 export function registerConversationsRoutes(
   app: express.Express,
   params: {
     store: AppStore;
     workspace: AppWorkspace;
     gateway: AppGateway;
+    localApiToken: string;
+    localApiAllowedPorts: number[];
   },
 ) {
   const { store, workspace, gateway } = params;
@@ -262,6 +336,179 @@ export function registerConversationsRoutes(
           error: error instanceof Error ? error.message : "Failed to create summary refresh task.",
         });
       });
+  });
+
+  app.get("/api/conversations/:id/summary/suggestions", (request, response) => {
+    const conversation = requireConversation(store, response, request.params.id);
+    if (!conversation) {
+      return;
+    }
+    const suggestions = latestSummarySuggestionTasks(store, conversation.id).map((task) => {
+      const parsed = parseSummarySuggestion(task.resultText ?? "");
+      return {
+        task: {
+          id: task.id,
+          title: task.title,
+          status: task.status,
+          completedAt: task.completedAt,
+          updatedAt: task.updatedAt,
+        },
+        suggestion: parsed,
+      };
+    });
+    response.json({ suggestions });
+  });
+
+  app.post("/api/conversations/:id/summary/apply-suggestion", (request, response) => {
+    const conversation = requireConversation(store, response, request.params.id);
+    if (!conversation) {
+      return;
+    }
+    const body = SummarySuggestionApplySchema.parse(request.body);
+    response.json({
+      summary: store.saveSessionSummary({
+        conversationId: conversation.id,
+        summary: redactSensitiveText(body.summary),
+        decisions: body.decisions.map((item) => redactSensitiveText(item)),
+        openQuestions: body.openQuestions.map((item) => redactSensitiveText(item)),
+        nextActions: body.nextActions.map((item) => redactSensitiveText(item)),
+        metadata: redactUnknown(body.metadata) as Record<string, unknown>,
+      }),
+    });
+  });
+
+  app.get("/api/conversations/:id/export", (request, response) => {
+    const conversation = requireConversation(store, response, request.params.id);
+    if (!conversation) {
+      return;
+    }
+    const mode = exportModeFromRequest(request);
+    if (
+      mode === "full" &&
+      !requireFullExportAllowed(response, {
+        request,
+        token: params.localApiToken,
+        allowedPorts: params.localApiAllowedPorts,
+      })
+    ) {
+      return;
+    }
+    const redactMaybe = (value: string) => (mode === "full" ? value : redactSensitiveText(value));
+    const runs = store.listWorkspaceRuns(conversation.id);
+    const artifacts = runs.flatMap((run) => store.listArtifactsForRun(conversation.id, run.id));
+    const flows =
+      store.listTaskFlows?.(conversation.agentId)
+        .filter((flow) => flow.conversationId === conversation.id)
+        .map((flow) => ({
+          flow,
+          steps: store.listTaskFlowSteps?.(flow.id) ?? [],
+        })) ?? [];
+    response.json({
+      schemaVersion: 1,
+      exportMode: mode,
+      sensitiveFieldsHidden: mode !== "full",
+      exportedAt: Date.now(),
+      conversation: { ...conversation, title: redactMaybe(conversation.title) },
+      messages: store.listMessages(conversation.id).map((message) => ({
+        ...message,
+        content: redactMaybe(message.content),
+      })),
+      summary: store.getSessionSummary(conversation.id),
+      flows,
+      tasks: (store.listTasksForConversation?.(conversation.id) ?? []).map((task) => ({
+        ...task,
+        prompt: mode === "full" ? task.prompt : "[hidden]",
+        resultText: task.resultText ? redactMaybe(task.resultText) : null,
+      })),
+      runs: runs.map((run) => ({
+        ...run,
+        userMessage: mode === "full" ? redactMaybe(run.userMessage) : "[hidden]",
+        checkpoint: null,
+        resumeToken: null,
+      })),
+      artifacts: artifacts.map((artifact) => ({
+        ...artifact,
+        metadata: redactUnknown(artifact.metadata),
+      })),
+    });
+  });
+
+  app.post("/api/conversations/import", (request, response) => {
+    const body = ConversationImportSchema.parse(request.body);
+    const bundle = body.bundle as Record<string, unknown>;
+    const sourceConversation = bundle.conversation as Record<string, unknown> | undefined;
+    const agentId =
+      body.agentId ??
+      (typeof sourceConversation?.agentId === "string" ? sourceConversation.agentId : DEFAULT_AGENT_ID);
+    const agent = requireAgent(store, response, agentId);
+    if (!agent) {
+      return;
+    }
+    const title =
+      body.title ??
+      `Imported: ${typeof sourceConversation?.title === "string" ? sourceConversation.title : DEFAULT_CONVERSATION_TITLE}`;
+    const conversation = store.saveConversation({
+      agentId: agent.id,
+      title,
+      providerKind: agent.providerKind,
+      model: agent.model,
+      reasoningLevel: agent.reasoningLevel,
+    });
+    const summary = bundle.summary as Partial<ReturnType<AppStore["getSessionSummary"]>> | null | undefined;
+    if (summary?.summary && typeof summary.summary === "string") {
+      store.saveSessionSummary({
+        conversationId: conversation.id,
+        summary: redactSensitiveText(summary.summary),
+        decisions: Array.isArray(summary.decisions) ? summary.decisions.filter((item): item is string => typeof item === "string") : [],
+        openQuestions: Array.isArray(summary.openQuestions)
+          ? summary.openQuestions.filter((item): item is string => typeof item === "string")
+          : [],
+        nextActions: Array.isArray(summary.nextActions) ? summary.nextActions.filter((item): item is string => typeof item === "string") : [],
+        metadata:
+          typeof summary.metadata === "object" && summary.metadata !== null
+            ? (redactUnknown(summary.metadata) as Record<string, unknown>)
+            : {},
+      });
+    }
+    const importedFlows: unknown[] = Array.isArray(bundle.flows) ? bundle.flows : [];
+    for (const item of importedFlows) {
+      const flowWrapper = item as { flow?: { title?: unknown }; steps?: unknown[] };
+      const flow = store.createTaskFlow({
+        agentId: agent.id,
+        conversationId: conversation.id,
+        title: typeof flowWrapper.flow?.title === "string" ? flowWrapper.flow.title : "Imported Flow",
+      });
+      for (const [index, step] of (flowWrapper.steps ?? []).entries()) {
+        const draft = step as Record<string, unknown>;
+        if (typeof draft.stepKey !== "string" || typeof draft.title !== "string" || typeof draft.prompt !== "string") {
+          continue;
+        }
+        store.createTaskFlowStep({
+          flowId: flow.id,
+          stepKey: draft.stepKey,
+          title: draft.title,
+          prompt: draft.prompt,
+          dependencyStepKey: typeof draft.dependencyStepKey === "string" ? draft.dependencyStepKey : null,
+          position: index,
+          stepKind:
+            draft.stepKind === "approval_gate" || draft.stepKind === "verification_gate" ? draft.stepKind : "task",
+        });
+      }
+    }
+    store.createMetadataArtifact({
+      agentId: agent.id,
+      conversationId: conversation.id,
+      kind: "report",
+      title: "Imported session bundle",
+      summary: "Redacted AetherOps session metadata imported locally. Workspace files and provider secrets were not imported.",
+      metadata: { source: "conversation-import", importedAt: Date.now() },
+    });
+    response.json({
+      conversation,
+      summary: store.getSessionSummary(conversation.id),
+      boundary:
+        "Imported redacted planning metadata only; AetherOps does not import provider secrets, workspace files, or historical execution state.",
+    });
   });
 
   app.delete("/api/conversations/:id", async (request, response) => {

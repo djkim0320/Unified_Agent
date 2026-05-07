@@ -85,6 +85,8 @@ function renderWorkflow(overrides: Partial<Parameters<typeof CockpitSectionView>
       onOpenArtifacts={vi.fn()}
       onOpenProviderSettings={vi.fn()}
       onOpenRun={vi.fn()}
+      onApproveTaskFlowStep={vi.fn()}
+      onDenyTaskFlowStep={vi.fn()}
       onRefreshPlatformMetadata={vi.fn()}
       onRefreshPreflight={vi.fn()}
       onResumeTaskFlow={vi.fn()}

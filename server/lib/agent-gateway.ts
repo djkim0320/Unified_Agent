@@ -200,12 +200,14 @@ export function createAgentGateway(params: {
       position?: number;
       title: string;
       prompt: string;
+      stepKind?: TaskFlowStepRecord["stepKind"];
     }) => TaskFlowStepRecord;
     getTaskFlowStep?: (stepId: string) => TaskFlowStepRecord | null;
     listTaskFlowSteps?: (flowId: string) => TaskFlowStepRecord[];
     transitionTaskFlowStep?: (input: {
       stepId: string;
       taskId?: string | null;
+      stepKind?: TaskFlowStepRecord["stepKind"] | null;
       status?: TaskFlowStepRecord["status"];
       completedAt?: number | null;
       clearTaskId?: boolean;
@@ -457,6 +459,7 @@ export function createAgentGateway(params: {
       title: string;
       prompt: string;
       dependencyStepKey?: string | null;
+      stepKind?: TaskFlowStepRecord["stepKind"];
     }>;
   }) {
     if (!params.store.createTaskFlow || !params.store.createTaskFlowStep) {
@@ -484,6 +487,7 @@ export function createAgentGateway(params: {
         position: index,
         title: step.title,
         prompt: step.prompt,
+        stepKind: step.stepKind ?? "task",
       }),
     );
     if (input.autoStart ?? true) {

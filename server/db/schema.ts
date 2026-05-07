@@ -34,11 +34,13 @@ const TASK_FLOW_STATUSES = ["queued", "running", "completed", "failed", "cancell
 const TASK_FLOW_STEP_STATUSES = [
   "queued",
   "running",
+  "waiting_approval",
   "completed",
   "failed",
   "cancelled",
   "skipped",
 ] as const;
+const TASK_FLOW_STEP_KINDS = ["task", "approval_gate", "verification_gate"] as const;
 const TASK_FLOW_TRIGGER_SOURCES = ["manual", "schedule", "event_hook"] as const;
 
 export function createWorkspaceRunsSql(tableName: string, options?: { ifNotExists?: boolean }) {
@@ -126,6 +128,8 @@ export function createArtifactVersionsSql(tableName: string) {
       encoding TEXT,
       binary INTEGER NOT NULL DEFAULT 0,
       truncated INTEGER NOT NULL DEFAULT 0,
+      unsupported_encoding INTEGER NOT NULL DEFAULT 0,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
       created_at INTEGER NOT NULL
     );
   `;
@@ -147,6 +151,7 @@ export function createSkillTemplatesSql(tableName: string) {
       heartbeat_instructions TEXT NOT NULL,
       suggested_prompt TEXT NOT NULL,
       tags_json TEXT NOT NULL DEFAULT '[]',
+      metadata_json TEXT NOT NULL DEFAULT '{}',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -232,6 +237,7 @@ export function createTaskFlowStepsSql(tableName: string) {
       position INTEGER NOT NULL,
       title TEXT NOT NULL,
       prompt TEXT NOT NULL,
+      step_kind TEXT NOT NULL DEFAULT 'task' CHECK(step_kind IN ('${TASK_FLOW_STEP_KINDS.join("', '")}')),
       status TEXT NOT NULL CHECK(status IN ('${TASK_FLOW_STEP_STATUSES.join("', '")}')),
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,

@@ -22,6 +22,7 @@ interface RunArtifactsPanelProps {
   onDebug: () => void;
   onDiff: (artifactId: string) => void;
   onPreview: (artifactId: string) => void;
+  onPreviewFull: (artifactId: string) => void;
 }
 
 function canPreview(artifact: ArtifactRecord) {
@@ -93,6 +94,9 @@ export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
                 </button>
                 <button className="cockpit-mini-button" onClick={() => props.onCopyReport(artifact.id)} type="button">
                   보고서 복사
+                </button>
+                <button className="cockpit-mini-button" onClick={() => props.onPreviewFull(artifact.id)} type="button">
+                  원문 보기
                 </button>
                 <button className="cockpit-mini-button" onClick={() => props.onCreateFollowUpTask(artifact.id)} type="button">
                   후속 Task

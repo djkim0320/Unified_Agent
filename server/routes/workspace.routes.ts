@@ -5,6 +5,12 @@ import type { createStore } from "../db.js";
 import type { createWorkspaceManager } from "../lib/workspace.js";
 import type { EngineRunRecord, ProviderKind, ReasoningLevel } from "../types.js";
 import { redactSensitiveText, redactUnknown } from "../lib/redaction.js";
+import { createUnifiedDiff } from "../lib/artifact-diff.js";
+import {
+  exportModeFromRequest,
+  requireFullExportAllowed,
+  type ExportMode,
+} from "../lib/full-export-guard.js";
 import { sendLegacyGone } from "./legacy-gone.js";
 
 type WorkspaceRouteStore = ReturnType<typeof createStore>;
@@ -133,42 +139,8 @@ function artifactReportContent(artifact: ReturnType<WorkspaceRouteStore["getArti
   return typeof content === "string" ? content : artifact.summary;
 }
 
-function safeExportMode(request: express.Request) {
-  return request.query.mode === "full" ? "full" : "redacted";
-}
-
-function redactedReportContent(content: string | null, mode: "full" | "redacted") {
+function redactedReportContent(content: string | null, mode: ExportMode) {
   return mode === "full" ? content : redactSensitiveText(content ?? "");
-}
-
-function unifiedDiff(pathLabel: string, before: string | null, after: string | null) {
-  const beforeLines = (before ?? "").split(/\r?\n/);
-  const afterLines = (after ?? "").split(/\r?\n/);
-  const lines = [`--- a/${pathLabel}`, `+++ b/${pathLabel}`];
-  if (before === null) {
-    lines.push("@@ new file @@");
-    lines.push(...afterLines.map((line) => `+${line}`));
-    return lines.join("\n");
-  }
-  lines.push("@@ -1 +1 @@");
-  const max = Math.max(beforeLines.length, afterLines.length);
-  for (let index = 0; index < max; index += 1) {
-    const left = beforeLines[index];
-    const right = afterLines[index];
-    if (left === right) {
-      if (left !== undefined) {
-        lines.push(` ${left}`);
-      }
-      continue;
-    }
-    if (left !== undefined) {
-      lines.push(`-${left}`);
-    }
-    if (right !== undefined) {
-      lines.push(`+${right}`);
-    }
-  }
-  return lines.join("\n");
 }
 
 function buildSafeReportDebugRecord(artifact: ReturnType<WorkspaceRouteStore["getArtifact"]>) {
@@ -193,6 +165,8 @@ export function registerWorkspaceRoutes(
     workspace: WorkspaceRouteManager;
     taskManager: WorkspaceRouteTaskManager;
     exposeWorkspaceDebugPaths: boolean;
+    localApiToken: string;
+    localApiAllowedPorts: number[];
   },
 ) {
   const { store, taskManager, workspace } = params;
@@ -332,7 +306,17 @@ export function registerWorkspaceRoutes(
       response.status(404).json({ error: "Artifact not found" });
       return;
     }
-    const mode = safeExportMode(request);
+    const mode = exportModeFromRequest(request);
+    if (
+      mode === "full" &&
+      !requireFullExportAllowed(response, {
+        request,
+        token: params.localApiToken,
+        allowedPorts: params.localApiAllowedPorts,
+      })
+    ) {
+      return;
+    }
     const reportContent = artifactReportContent(artifact);
     if (reportContent !== null) {
       response.json({
@@ -365,7 +349,7 @@ export function registerWorkspaceRoutes(
         preview: {
           content: snapshot.afterContent,
           binary: snapshot.binary,
-          unsupportedEncoding: snapshot.binary,
+          unsupportedEncoding: snapshot.unsupportedEncoding,
           truncated: snapshot.truncated,
           source: "snapshot",
         },
@@ -378,7 +362,7 @@ export function registerWorkspaceRoutes(
         preview: {
           content: "",
           binary: snapshot.binary,
-          unsupportedEncoding: snapshot.binary,
+          unsupportedEncoding: snapshot.unsupportedEncoding,
           truncated: snapshot.truncated,
           source: "snapshot",
         },
@@ -406,12 +390,21 @@ export function registerWorkspaceRoutes(
       fs.closeSync(fileHandle);
     }
     const binary = buffer.includes(0);
+    let content = "";
+    let unsupportedEncoding = binary;
+    if (!binary) {
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      } catch {
+        unsupportedEncoding = true;
+      }
+    }
     response.json({
       artifact,
       preview: {
-        content: binary ? "" : buffer.toString("utf8"),
+        content: unsupportedEncoding ? "" : content,
         binary,
-        unsupportedEncoding: binary,
+        unsupportedEncoding,
         truncated: stat.size > bytesToRead,
         source: "current-workspace",
       },
@@ -461,13 +454,27 @@ export function registerWorkspaceRoutes(
     }
     response.json({
       artifact,
-      diff: {
-        available: true,
-        reason: snapshot.beforeContent == null ? "new-file" : "snapshot",
-        content: unifiedDiff(artifact.path ?? snapshot.path, snapshot.beforeContent, snapshot.afterContent),
-        binary: false,
-        truncated: false,
-      },
+      diff: (() => {
+        const diff = createUnifiedDiff(artifact.path ?? snapshot.path, snapshot.beforeContent, snapshot.afterContent);
+        return diff.available
+          ? {
+              available: true,
+              reason: snapshot.beforeContent == null ? "new-file" : "snapshot",
+              content: diff.content,
+              binary: false,
+              truncated: false,
+              sizeBytes: diff.sizeBytes,
+              maxBytes: diff.maxBytes,
+            }
+          : {
+              available: false,
+              reason: diff.reason,
+              binary: false,
+              truncated: diff.truncated,
+              sizeBytes: diff.sizeBytes,
+              maxBytes: diff.maxBytes,
+            };
+      })(),
     });
   });
 

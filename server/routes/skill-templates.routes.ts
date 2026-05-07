@@ -32,10 +32,15 @@ const SkillTemplateSaveSchema = z.object({
   heartbeatInstructions: z.string().max(10_000).default(""),
   suggestedPrompt: z.string().max(20_000).default(""),
   tags: z.array(z.string().min(1).max(80)).max(20).default([]),
+  metadata: z.record(z.unknown()).optional().default({}),
 });
 
 const SKILL_TEMPLATE_BOUNDARY =
   "Skill templates are reusable prompt, flow, standing-order, verification, and heartbeat patterns. AetherOps does not execute skills directly; execution remains opencode-only.";
+
+const FromFlowSchema = z.object({
+  force: z.boolean().optional().default(false),
+});
 
 function normalizeFlowTemplate(flowTemplate: z.infer<typeof SkillTemplateSaveSchema>["flowTemplate"]) {
   return {
@@ -84,6 +89,62 @@ export function registerSkillTemplateRoutes(
     response.json({ template, boundary: SKILL_TEMPLATE_BOUNDARY });
   });
 
+  app.post("/api/agents/:agentId/skill-templates/from-flow/:flowId", (request, response) => {
+    const agent = requireAgent(store, response, request.params.agentId);
+    if (!agent) {
+      return;
+    }
+    const body = FromFlowSchema.parse(request.body ?? {});
+    const flow = store.getTaskFlow?.(request.params.flowId);
+    if (!flow || flow.agentId !== agent.id) {
+      response.status(404).json({ error: "Task flow not found." });
+      return;
+    }
+    const existing = (store.listCustomSkillTemplates?.(agent.id) ?? []).find(
+      (template) => template.metadata?.sourceFlowId === flow.id,
+    );
+    if (existing && !body.force) {
+      response.status(409).json({
+        error: "A skill template already exists for this flow.",
+        template: existing,
+      });
+      return;
+    }
+    const steps = store.listTaskFlowSteps?.(flow.id) ?? [];
+    const template = store.saveCustomSkillTemplate({
+      id: existing?.id,
+      agentId: agent.id,
+      scope: "agent",
+      name: flow.title,
+      category: "Custom",
+      summary: flow.resultSummary ?? `${flow.title} Flow에서 저장된 재사용 템플릿입니다.`,
+      description: "AetherOps Flow를 재사용 가능한 Skill 템플릿으로 저장했습니다. Skill은 실행 런타임이 아니라 prompt/flow 패턴입니다.",
+      standingOrderPatch: `When using the ${flow.title} pattern, follow the flow steps and verify outputs before continuing.`,
+      flowTemplate: {
+        title: flow.title,
+        steps: steps.map((step) => ({
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: step.prompt,
+          dependencyStepKey: step.dependencyStepKey,
+        })),
+      },
+      verificationChecklist: steps
+        .filter((step) => step.stepKind === "verification_gate")
+        .map((step) => step.title),
+      heartbeatInstructions: `Track progress for ${flow.title}; surface blocked steps, failed runs, and unresolved decisions.`,
+      suggestedPrompt: `${flow.title} 목표를 이 Skill flow에 맞춰 단계별로 실행 계획화해 주세요.`,
+      tags: ["from-flow", flow.status],
+      metadata: {
+        source: "flow",
+        sourceFlowId: flow.id,
+        sourceFlowStatus: flow.status,
+        savedAt: Date.now(),
+      },
+    });
+    response.json({ template, updatedExisting: Boolean(existing), boundary: SKILL_TEMPLATE_BOUNDARY });
+  });
+
   app.patch("/api/agents/:agentId/skill-templates/:templateId", (request, response) => {
     const agent = requireAgent(store, response, request.params.agentId);
     if (!agent) {
@@ -113,6 +174,7 @@ export function registerSkillTemplateRoutes(
       heartbeatInstructions: body.heartbeatInstructions ?? existing.heartbeatInstructions,
       suggestedPrompt: body.suggestedPrompt ?? existing.suggestedPrompt,
       tags: body.tags ?? existing.tags,
+      metadata: body.metadata ?? existing.metadata ?? {},
     });
     response.json({ template, boundary: SKILL_TEMPLATE_BOUNDARY });
   });

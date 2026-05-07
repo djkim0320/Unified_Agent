@@ -49,10 +49,12 @@ export type TaskFlowStatus = "queued" | "running" | "completed" | "failed" | "ca
 export type TaskFlowStepStatus =
   | "queued"
   | "running"
+  | "waiting_approval"
   | "completed"
   | "failed"
   | "cancelled"
   | "skipped";
+export type TaskFlowStepKind = "task" | "approval_gate" | "verification_gate";
 export type TaskFlowTriggerSource = "manual" | "schedule" | "event_hook";
 export type AgentEngineKind = "opencode";
 export type EngineRunStatus =
@@ -227,6 +229,8 @@ export interface ArtifactVersionRecord {
   encoding: string | null;
   binary: boolean;
   truncated: boolean;
+  unsupportedEncoding: boolean;
+  metadata: Record<string, unknown>;
   createdAt: number;
 }
 
@@ -257,6 +261,7 @@ export interface SkillTemplateRecord {
   heartbeatInstructions: string;
   suggestedPrompt: string;
   tags: string[];
+  metadata?: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;
 }
@@ -298,6 +303,10 @@ export interface EngineStatusRecord {
     confidence: "high" | "medium" | "low";
     message: string;
     lastSuccessfulRunAt?: number | null;
+    stale?: boolean;
+    evidenceAgeMs?: number | null;
+    providerKind?: ProviderKind | null;
+    model?: string | null;
   };
   models: string[];
   sessions: Array<Record<string, unknown>>;
@@ -503,6 +512,7 @@ export interface TaskFlowStepRecord {
   position: number;
   title: string;
   prompt: string;
+  stepKind?: TaskFlowStepKind;
   status: TaskFlowStepStatus;
   createdAt: number;
   updatedAt: number;

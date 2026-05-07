@@ -41,6 +41,9 @@ Current domain model:
   - run-scoped records for changed files, reports, summaries, and logs
 - `artifact_versions`
   - immutable small-text snapshots captured before/after a run for stable preview and real diff generation
+- safe search/export surfaces
+  - search AetherOps DB records only, with redacted snippets
+  - export/import session planning metadata without provider secrets or workspace files by default
 - `tasks`
   - detached background work
 - `task_events`
@@ -66,7 +69,9 @@ AetherOps is the local control plane: cockpit UI, scheduler, and log store. It o
 
 The opencode engine always runs inside the active conversation sandbox and uses an allowlisted process environment. It records command metadata, JSON event summaries, external session ids when available, changed files, and exit state into workspace run events.
 
-When a conversation has a saved session summary, `OpenCodeEngine` includes a concise "Persistent session summary" section in the run prompt. The summary is owned by AetherOps persistence, but it is refreshed deterministically from local data rather than by a hidden model call.
+When a conversation has a saved session summary, `OpenCodeEngine` includes a concise "Persistent session summary" section in the run prompt. The summary is owned by AetherOps persistence, but it is refreshed deterministically from local data rather than by a hidden model call. Optional summary suggestion tasks are ordinary opencode-backed detached tasks and must be reviewed/applied by the operator before they update memory.
+
+Engine status includes `authEvidence`, which combines auth-command output, configured provider credentials, Codex OAuth/account state, credential sync, and recent successful opencode runs. Recent same-provider/model success is stronger evidence; stale or mismatched success becomes a warning rather than masking real blockers.
 
 ## 2.1 Source Of Truth
 
@@ -157,11 +162,12 @@ The Skill tab now exposes a template library, not an execution runtime.
 
 - Catalog route: `GET /api/skill-templates`.
 - Custom template routes: `POST/PATCH/DELETE /api/agents/:agentId/skill-templates/:templateId?`.
+- Flow reuse route: `POST /api/agents/:agentId/skill-templates/from-flow/:flowId`.
 - Standing-order application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-standing-orders`.
 - Heartbeat application route: `POST /api/agents/:agentId/skill-templates/:templateId/apply-heartbeat`.
 - Deprecated execution route: `GET/POST /api/agents/:agentId/skills` still returns `410 Gone`.
 
-Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Built-ins are read-only; custom templates are stored in SQLite. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
+Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Built-ins are read-only; custom templates are stored in SQLite. A completed or useful Flow can be saved as a custom Skill template with `metadata.sourceFlowId`; duplicate source-flow templates require an explicit force/update path. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
 
 ### Memory
 
@@ -218,7 +224,7 @@ Task flows are ordered, observable long-running workflows on top of detached tas
 
 - storage: `task_flows` and `task_flow_steps`
 - runtime: [`server/lib/task-manager.ts`](../server/lib/task-manager.ts)
-- API: `POST /api/agents/:agentId/flows`, `POST /api/agents/:agentId/flows/draft`, `GET /api/flows/:flowId`, `POST /api/flows/:flowId/start`, `POST /api/flows/:flowId/resume`, `POST /api/flows/:flowId/steps/:stepId/retry`, `POST /api/flows/:flowId/steps/:stepId/skip`, `POST /api/flows/:flowId/cancel`
+- API: `POST /api/agents/:agentId/flows`, `POST /api/agents/:agentId/flows/draft`, `GET /api/flows/:flowId`, `POST /api/flows/:flowId/start`, `POST /api/flows/:flowId/resume`, `POST /api/flows/:flowId/steps/:stepId/retry`, `POST /api/flows/:flowId/steps/:stepId/skip`, `POST /api/flows/:flowId/steps/:stepId/approve`, `POST /api/flows/:flowId/steps/:stepId/deny`, `POST /api/flows/:flowId/cancel`
 - UI: [`src/components/CockpitSectionView.tsx`](../src/components/CockpitSectionView.tsx)
 
 Rules:
@@ -226,6 +232,7 @@ Rules:
 - only one runnable step is executed at a time
 - flow drafts are deterministic review objects and do not create DB flows until the operator saves them
 - a queued step runs only after its dependency is `completed` or `skipped`
+- `approval_gate` and `verification_gate` steps create no opencode task; they pause in `waiting_approval` until approved, skipped, or denied
 - failed steps fail the flow until the operator retries or resumes
 - retry resets the selected step and downstream dependency chain
 - skip counts as dependency-satisfied
@@ -235,17 +242,22 @@ Rules:
 
 These features improve observability without adding another execution runtime.
 
-- Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`, `POST /api/conversations/:id/summary/refresh-task`.
-- Artifact routes: `GET /api/runs/:runId/artifacts?conversationId=<id>`, `GET /api/artifacts/:artifactId/preview`, `GET /api/artifacts/:artifactId/diff`.
+- Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`, `POST /api/conversations/:id/summary/refresh-task`, `GET /api/conversations/:id/summary/suggestions`, `POST /api/conversations/:id/summary/apply-suggestion`.
+- Artifact routes: `GET /api/runs/:runId/artifacts?conversationId=<id>`, `GET /api/artifacts/:artifactId/preview?mode=redacted|full`, `GET /api/artifacts/:artifactId/diff`.
 - Debug route: `GET /api/runs/:runId/debug?conversationId=<id>`.
+- Search/export routes: `GET /api/search?q=...&agentId=...&conversationId=...`, `GET /api/conversations/:id/export?mode=redacted|full`, `POST /api/conversations/import`.
 
 Safety invariants:
 
 - artifact paths are stored and returned as relative paths
 - preview is read-only and tied to the artifact's run/conversation ownership
 - preview prefers `artifact_versions.after_content`, falling back to current workspace only with an explicit source flag
-- diff is only produced from real before/after snapshots; binary, truncated, or baseline-less cases return a structured unavailable reason
+- snapshot capture uses capped text storage and streaming hashing; invalid UTF-8 is reported as unsupported encoding instead of rendered as mojibake
+- diff is only produced from real before/after snapshots; binary, truncated, oversized, or baseline-less cases return a structured unavailable reason
 - debugger/report export defaults to redacted content and keeps prompt/result text presence as booleans
+- full report/artifact/session export requires a valid local API token header or explicit local-only full-export flag; never make full export the default UI path
+- search indexes AetherOps records only and returns redacted snippets; it does not crawl workspace files
+- session import restores safe planning, summary, report, and flow metadata into a new session; it does not import provider secrets, workspace files, or historical execution state
 
 ## 4. Frontend Architecture
 
@@ -335,6 +347,10 @@ High-value routes:
 - `GET/POST /api/conversations`
 - `GET /api/conversations/:id/messages`
 - `GET/PUT/POST /api/conversations/:id/summary`
+- `GET /api/conversations/:id/summary/suggestions`
+- `POST /api/conversations/:id/summary/apply-suggestion`
+- `GET /api/conversations/:id/export?mode=redacted|full`
+- `POST /api/conversations/import`
 - `POST /api/chat/stream`
 - Removed workspace file CRUD routes return `410 Gone`; use opencode runs for file work.
 - `GET /api/workspace/runs`
@@ -343,6 +359,7 @@ High-value routes:
 - `GET /api/runs/:runId/debug?conversationId=<id>`
 - `GET /api/artifacts/:artifactId/preview`
 - `GET /api/artifacts/:artifactId/diff`
+- `GET /api/search?q=...&agentId=...&conversationId=...`
 - `GET /api/plugins` returns empty local-plugin metadata for compatibility.
 - Removed internal tool/profile routes return `410 Gone`; use opencode MCP/tool configuration.
 - Removed memory and skill routes return `410 Gone`; use standing orders, workflow prompts, session history, and opencode artifacts.

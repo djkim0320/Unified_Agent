@@ -18,6 +18,7 @@ import type {
   TaskEventRecord,
   TaskFlowRecord,
   TaskFlowStatus,
+  TaskFlowStepKind,
   TaskFlowStepRecord,
   TaskFlowStepStatus,
   TaskFlowTriggerSource,
@@ -143,6 +144,8 @@ export type ArtifactVersionRow = {
   encoding: string | null;
   binary: number;
   truncated: number;
+  unsupported_encoding?: number;
+  metadata_json?: string;
   created_at: number;
 };
 
@@ -160,6 +163,7 @@ export type SkillTemplateRow = {
   heartbeat_instructions: string;
   suggested_prompt: string;
   tags_json: string;
+  metadata_json?: string;
   created_at: number;
   updated_at: number;
 };
@@ -214,6 +218,7 @@ export type TaskFlowStepRow = {
   position: number;
   title: string;
   prompt: string;
+  step_kind?: TaskFlowStepKind;
   status: TaskFlowStepStatus;
   created_at: number;
   updated_at: number;
@@ -406,6 +411,8 @@ export function mapArtifactVersion(row: ArtifactVersionRow): ArtifactVersionReco
     encoding: row.encoding,
     binary: row.binary === 1,
     truncated: row.truncated === 1,
+    unsupportedEncoding: row.unsupported_encoding === 1,
+    metadata: parseJsonObject(row.metadata_json ?? "{}"),
     createdAt: row.created_at,
   };
 }
@@ -426,6 +433,7 @@ export function mapSkillTemplate(row: SkillTemplateRow): SkillTemplateRecord {
     heartbeatInstructions: row.heartbeat_instructions,
     suggestedPrompt: row.suggested_prompt,
     tags: parseStringArray(row.tags_json),
+    metadata: parseJsonObject(row.metadata_json ?? "{}"),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -534,6 +542,7 @@ export function mapTaskFlowStep(row: TaskFlowStepRow): TaskFlowStepRecord {
     position: row.position,
     title: row.title,
     prompt: row.prompt,
+    stepKind: row.step_kind ?? "task",
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

@@ -18,6 +18,9 @@ The repository already supports:
 - persistent session summaries injected into opencode prompt context
 - run-scoped artifacts with stable text snapshots, safe preview, and small-file diff
 - structured run debugger summaries
+- protected full export for report/artifact/session bundles, with redacted defaults
+- safe search across AetherOps DB records without workspace crawling
+- human approval and verification gates inside task flows
 - MCP configuration assistant for opencode config snippets, dry-run validation, risk notes, and opencode-backed test tasks
 - skill template library for built-in and custom reusable prompts, flow templates, standing-order patches, verification checklists, and heartbeat recipes
 - opencode-backed execution through the embedded `opencode-ai` launcher
@@ -53,12 +56,13 @@ The current implementation is opencode-only for execution. The remaining work is
 - keep all workspace execution routed through opencode
 - fail loudly instead of fabricating provider/tool fallbacks
 - tighten cancellation and timeout semantics
+- keep engine readiness contextual with auth-command, provider credential, Codex OAuth, credential-sync, and recent successful-run evidence
 - reduce planner instability in live Codex workflows
 
 ### 2. Persistent context
 
 - implemented: session summaries can be saved, deterministically refreshed with report/artifact/task signals, structured as project memory, and injected into future opencode runs
-- implemented: opencode-backed summary suggestion tasks are normal detached tasks and do not mutate memory automatically
+- implemented: opencode-backed summary suggestion tasks are normal detached tasks and do not mutate memory automatically; operators review and apply suggestions explicitly
 - add better session-summary compaction
 - keep session history, opencode workspace artifacts, and agent control files visible
 
@@ -78,9 +82,9 @@ The current implementation is opencode-only for execution. The remaining work is
 ### 5. Frontend operations UX
 
 - better agent/session/task navigation
-- implemented: flow draft dependency editing, structured summary panel, snapshot-backed artifact preview/diff, redacted report copy, custom skills, and run debugger entry points in the cockpit
+- implemented: flow draft dependency editing, approval gates, structured summary panel, snapshot-backed artifact preview/diff, redacted report copy, safe search/export, custom skills, Flow-to-Skill reuse, and run debugger entry points in the cockpit
 - clearer run timeline presentation
-- stronger changed-file and run-log inspection workflows, including future baseline diffs
+- stronger changed-file and run-log inspection workflows
 - reduce state race conditions and stale refresh hazards
 
 ## Non-Goals

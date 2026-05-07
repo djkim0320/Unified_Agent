@@ -1986,6 +1986,73 @@ describe("createApp", () => {
     expect(store.getTaskFlow(runningFlow.id)).toEqual(expect.objectContaining({ status: "running" }));
   });
 
+  it("pauses task flows at human approval gates and resumes only after an operator decision", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Approval flow session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+
+    const createResponse = await request(app)
+      .post("/api/agents/default-agent/flows")
+      .send({
+        conversationId: conversation.id,
+        title: "Human checkpoint flow",
+        autoStart: false,
+        steps: [
+          {
+            stepKey: "operator-review",
+            title: "Operator review",
+            prompt: "Ask the operator to approve before continuing.",
+            stepKind: "approval_gate",
+          },
+        ],
+      })
+      .expect(200);
+    const flowId = createResponse.body.flow.id as string;
+    const stepId = createResponse.body.steps[0].id as string;
+
+    const started = await request(app).post(`/api/flows/${flowId}/start`).send({}).expect(200);
+    expect(started.body.flow.status).toBe("running");
+    expect(started.body.steps[0]).toEqual(
+      expect.objectContaining({
+        stepKind: "approval_gate",
+        status: "waiting_approval",
+        taskId: null,
+      }),
+    );
+
+    const approved = await request(app)
+      .post(`/api/flows/${flowId}/steps/${stepId}/approve`)
+      .send({})
+      .expect(200);
+    expect(approved.body.flow.status).toBe("completed");
+    expect(approved.body.steps[0].status).toBe("completed");
+
+    const denyFlow = store.createTaskFlow({
+      agentId: "default-agent",
+      conversationId: conversation.id,
+      title: "Denied checkpoint flow",
+    });
+    const denyStep = store.createTaskFlowStep({
+      flowId: denyFlow.id,
+      stepKey: "deny-review",
+      title: "Deny review",
+      prompt: "Wait for denial.",
+      stepKind: "approval_gate",
+    });
+    await request(app).post(`/api/flows/${denyFlow.id}/start`).send({}).expect(200);
+    const denied = await request(app)
+      .post(`/api/flows/${denyFlow.id}/steps/${denyStep.id}/deny`)
+      .send({ reason: "Operator rejected the checkpoint." })
+      .expect(200);
+    expect(denied.body.flow.status).toBe("failed");
+    expect(denied.body.steps[0].status).toBe("failed");
+  });
+
   it("returns run details, cancels task-backed runs, and resumes from checkpoints", async () => {
     const fetchMock = createOpenAiResponsesFetchMock();
     const { app, store } = createApp({
@@ -2312,6 +2379,120 @@ describe("createApp", () => {
     expect(read.body.summary.summary).toBe("사용자가 직접 정리한 세션 요약");
   });
 
+  it("reviews summary suggestions, exports/imports redacted bundles, searches records, and reuses flows as skills", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Operations memory session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    store.appendMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "Keep this private API_KEY=sk-secret-value while planning the verification flow.",
+    });
+    const suggestionTask = store.createTask({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Session summary suggestion",
+      prompt: "Suggest session summary",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+      taskKind: "detached",
+    });
+    store.transitionTask({
+      taskId: suggestionTask.id,
+      status: "completed",
+      eventType: "completed",
+      resultText: [
+        "Current goal:",
+        "- Build a safe verification workflow.",
+        "Completed work:",
+        "- Added report artifacts",
+        "Decisions:",
+        "- Keep opencode-only execution",
+        "Open questions:",
+        "- Which checks are required?",
+        "Next actions:",
+        "- Review the generated Flow",
+        "Important artifacts:",
+        "- Run Completion Report",
+      ].join("\n"),
+    });
+
+    const suggestions = await request(app)
+      .get(`/api/conversations/${conversation.id}/summary/suggestions`)
+      .expect(200);
+    expect(suggestions.body.suggestions[0].suggestion.parsed.metadata.currentGoal).toContain(
+      "safe verification workflow",
+    );
+
+    const applied = await request(app)
+      .post(`/api/conversations/${conversation.id}/summary/apply-suggestion`)
+      .send({
+        taskId: suggestionTask.id,
+        summary: suggestions.body.suggestions[0].suggestion.parsed.summary,
+        decisions: suggestions.body.suggestions[0].suggestion.parsed.decisions,
+        openQuestions: suggestions.body.suggestions[0].suggestion.parsed.openQuestions,
+        nextActions: suggestions.body.suggestions[0].suggestion.parsed.nextActions,
+        metadata: suggestions.body.suggestions[0].suggestion.parsed.metadata,
+      })
+      .expect(200);
+    expect(applied.body.summary.metadata.currentGoal).toContain("safe verification workflow");
+
+    const search = await request(app)
+      .get(`/api/search?q=${encodeURIComponent("verification")}&conversationId=${conversation.id}`)
+      .expect(200);
+    expect(search.body.results.length).toBeGreaterThan(0);
+    expect(JSON.stringify(search.body)).not.toContain("sk-secret-value");
+
+    const redactedExport = await request(app)
+      .get(`/api/conversations/${conversation.id}/export`)
+      .expect(200);
+    expect(JSON.stringify(redactedExport.body)).not.toContain("sk-secret-value");
+    await supertest(app).get(`/api/conversations/${conversation.id}/export?mode=full`).expect(403);
+    await supertest(app)
+      .get(`/api/conversations/${conversation.id}/export?mode=full`)
+      .set("X-Local-API-Token", app.locals.localApiToken as string)
+      .expect(200);
+
+    const imported = await request(app)
+      .post("/api/conversations/import")
+      .send({ bundle: redactedExport.body, title: "Imported safe bundle" })
+      .expect(200);
+    expect(imported.body.conversation.title).toBe("Imported safe bundle");
+    expect(imported.body.boundary).toContain("does not import provider secrets");
+
+    const flow = store.createTaskFlow({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Reusable verification flow",
+    });
+    store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "verify",
+      title: "Verify",
+      prompt: "Run verification through opencode.",
+    });
+    const fromFlow = await request(app)
+      .post(`/api/agents/${conversation.agentId}/skill-templates/from-flow/${flow.id}`)
+      .send({})
+      .expect(200);
+    expect(fromFlow.body.template.metadata.sourceFlowId).toBe(flow.id);
+    await request(app)
+      .post(`/api/agents/${conversation.agentId}/skill-templates/from-flow/${flow.id}`)
+      .send({})
+      .expect(409);
+    const forced = await request(app)
+      .post(`/api/agents/${conversation.agentId}/skill-templates/from-flow/${flow.id}`)
+      .send({ force: true })
+      .expect(200);
+    expect(forced.body.updatedExisting).toBe(true);
+  });
+
   it("indexes run-scoped artifacts, previews text safely, and returns run debug data", async () => {
     const { app, store, workspace } = createApp({ dataDir, projectRoot: dataDir });
     openStores.push(store);
@@ -2339,6 +2520,23 @@ describe("createApp", () => {
       conversationId: conversation.id,
       runId: run.id,
       changedFiles: ["notes/report.md"],
+      snapshots: [
+        {
+          path: "notes/report.md",
+          beforeContent: "# Report\n\nold artifact",
+          afterContent: "# Report\n\nhello artifact",
+          beforeHash: "before",
+          afterHash: "after",
+          sizeBytes: 24,
+          encoding: "utf8",
+        },
+      ],
+    });
+    workspace.writeFile({
+      conversationId: conversation.id,
+      scope: "sandbox",
+      relativePath: "notes/report.md",
+      content: "# Report\n\nnewer workspace content",
     });
     store.finalizeWorkspaceRun(run.id, "completed", "run_complete", {
       changedFiles: ["notes/report.md"],
@@ -2384,6 +2582,8 @@ describe("createApp", () => {
       .get(`/api/artifacts/${artifacts[0].id}/preview`)
       .expect(200);
     expect(previewResponse.body.preview.content).toContain("hello artifact");
+    expect(previewResponse.body.preview.content).not.toContain("newer workspace content");
+    expect(previewResponse.body.preview.source).toBe("snapshot");
     expect(JSON.stringify(previewResponse.body)).not.toContain(dataDir);
 
     const reportPreviewResponse = await request(app)
@@ -2391,11 +2591,19 @@ describe("createApp", () => {
       .expect(200);
     expect(reportPreviewResponse.body.preview.content).toContain("Run Completion Report");
     expect(reportPreviewResponse.body.preview.content).not.toContain(dataDir);
+    await supertest(app).get(`/api/artifacts/${reportArtifact.id}/preview?mode=full`).expect(403);
+    const fullReportPreview = await supertest(app)
+      .get(`/api/artifacts/${reportArtifact.id}/preview?mode=full`)
+      .set("X-Local-API-Token", app.locals.localApiToken as string)
+      .expect(200);
+    expect(fullReportPreview.body.preview.sensitiveFieldsHidden).toBe(false);
 
     const diffResponse = await request(app)
       .get(`/api/artifacts/${artifacts[0].id}/diff`)
       .expect(200);
-    expect(diffResponse.body.diff.available).toBe(false);
+    expect(diffResponse.body.diff.available).toBe(true);
+    expect(diffResponse.body.diff.content).toContain("-old artifact");
+    expect(diffResponse.body.diff.content).toContain("+hello artifact");
 
     const debugResponse = await request(app)
       .get(`/api/runs/${run.id}/debug?conversationId=${conversation.id}`)

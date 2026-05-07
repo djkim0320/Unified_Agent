@@ -151,6 +151,7 @@ export interface TaskFlowStepRecord {
   stepKey: string;
   title: string;
   prompt: string;
+  stepKind?: "task" | "approval_gate" | "verification_gate";
   dependencyStepKey: string | null;
   position: number;
   status: string | null;
@@ -204,6 +205,7 @@ export interface TaskFlowStepDraft {
   title: string;
   prompt: string;
   dependencyStepKey?: string | null;
+  stepKind?: "task" | "approval_gate" | "verification_gate";
 }
 
 export interface PluginSkillSummary {
@@ -291,6 +293,20 @@ export interface SessionSummaryRecord {
   updatedAt: number;
 }
 
+export interface SessionSummarySuggestionRecord {
+  task: Pick<TaskRecord, "id" | "title" | "status" | "completedAt" | "updatedAt">;
+  suggestion: {
+    raw: string;
+    parsed: {
+      summary: string;
+      decisions: string[];
+      openQuestions: string[];
+      nextActions: string[];
+      metadata?: SessionSummaryRecord["metadata"];
+    };
+  };
+}
+
 export type ArtifactKind = "file" | "diff" | "report" | "summary" | "log";
 
 export interface ArtifactRecord {
@@ -314,10 +330,12 @@ export interface ArtifactPreviewResponse {
     content: string;
     binary: boolean;
     truncated: boolean;
-    unsupportedEncoding?: boolean;
-    source?: "snapshot" | "current-workspace" | "report";
-    sensitiveFieldsHidden?: boolean;
-    fullContentAvailable?: boolean;
+  unsupportedEncoding?: boolean;
+  source?: "snapshot" | "current-workspace" | "report";
+  sensitiveFieldsHidden?: boolean;
+  fullContentAvailable?: boolean;
+  sizeBytes?: number;
+  maxBytes?: number;
   };
 }
 
@@ -329,6 +347,8 @@ export interface ArtifactDiffResponse {
     content?: string;
     binary?: boolean;
     truncated?: boolean;
+    sizeBytes?: number;
+    maxBytes?: number;
   };
 }
 
@@ -337,6 +357,7 @@ export interface FlowDraftStep {
   title: string;
   prompt: string;
   dependencyStepKey: string | null;
+  stepKind?: "task" | "approval_gate" | "verification_gate";
 }
 
 export interface FlowDraft {
@@ -359,6 +380,7 @@ export interface SkillTemplateRecord {
   heartbeatInstructions: string;
   suggestedPrompt: string;
   tags: string[];
+  metadata?: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;
 }
@@ -425,6 +447,10 @@ export interface EngineStatusRecord {
     confidence: "high" | "medium" | "low";
     message: string;
     lastSuccessfulRunAt?: number | null;
+    stale?: boolean;
+    evidenceAgeMs?: number | null;
+    providerKind?: ProviderKind | null;
+    model?: string | null;
   };
   models: string[];
   sessions: Array<Record<string, unknown>>;

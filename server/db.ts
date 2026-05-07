@@ -5,6 +5,16 @@ import path from "node:path";
 import { createSecretBox } from "./lib/crypto.js";
 import { buildFlowReportArtifact, buildRunReportArtifact } from "./lib/run-report.js";
 import {
+  migrateAutomationRuleColumns,
+  migrateConversationLineageColumns,
+  migrateConversationSessionColumns,
+  migrateOperationsPolishColumns,
+  migrateTaskFlowStepPositionColumn,
+  migrateTaskMetadataColumns,
+  migrateWorkspaceRunMetadataColumns,
+  migrateWorkspaceTables,
+} from "./db/migration-helpers.js";
+import {
   configureDatabaseConnection,
   ensureSchemaMigrationsTable,
   now,
@@ -83,6 +93,7 @@ import type {
   TaskKind,
   TaskFlowRecord,
   TaskFlowStatus,
+  TaskFlowStepKind,
   TaskFlowStepRecord,
   TaskFlowStepStatus,
   TaskFlowTriggerSource,
@@ -119,225 +130,6 @@ function normalizeArtifactPath(relativePath: string) {
   return normalized;
 }
 
-function migrateWorkspaceTables(db: Database.Database) {
-  const runsSql = tableSql(db, "workspace_runs");
-  const eventsSql = tableSql(db, "workspace_run_events");
-  const needsMigration =
-    (runsSql && !runsSql.includes("cancelled")) ||
-    (eventsSql && (!eventsSql.includes("run_failed") || !eventsSql.includes("run_cancelled")));
-
-  if (!needsMigration) {
-    return;
-  }
-
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.exec("BEGIN");
-    db.exec(createWorkspaceRunsSql("workspace_runs_next", { ifNotExists: false }));
-    db.exec(`
-      INSERT INTO workspace_runs_next (
-        id, conversation_id, task_id, parent_run_id, provider_kind, model, user_message, status, phase, checkpoint_json, resume_token, created_at, updated_at
-      )
-      SELECT id, conversation_id, NULL, NULL, provider_kind, model, user_message, status, 'accepted', NULL, NULL, created_at, updated_at
-      FROM workspace_runs;
-    `);
-
-    db.exec(createWorkspaceRunEventsSql("workspace_run_events_next", { ifNotExists: false }));
-    db.exec(`
-      INSERT INTO workspace_run_events_next (id, run_id, event_type, payload_json, created_at)
-      SELECT id, run_id, event_type, payload_json, created_at
-      FROM workspace_run_events;
-    `);
-
-    db.exec("DROP TABLE workspace_run_events");
-    db.exec("DROP TABLE workspace_runs");
-    db.exec("ALTER TABLE workspace_runs_next RENAME TO workspace_runs");
-    db.exec("ALTER TABLE workspace_run_events_next RENAME TO workspace_run_events");
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
-}
-
-function migrateTaskMetadataColumns(db: Database.Database) {
-  const tasksSql = tableSql(db, "tasks");
-  const requiresRebuild =
-    Boolean(tasksSql) &&
-    (!tasksSql.includes("'subagent'") ||
-      !tasksSql.includes("'flow_step'") ||
-      !tasksSql.includes("task_flow_id") ||
-      !tasksSql.includes("origin_run_id") ||
-      !tasksSql.includes("flow_step_key"));
-
-  if (requiresRebuild) {
-    db.pragma("foreign_keys = OFF");
-    try {
-      db.exec("BEGIN");
-      db.exec(createTasksSql("tasks_next"));
-      db.exec(`
-        INSERT INTO tasks_next (
-          id, agent_id, conversation_id, task_kind, task_flow_id, flow_step_key, origin_run_id,
-          automation_rule_id, parent_task_id, nesting_depth, title, prompt, provider_kind, model, reasoning_level,
-          status, run_id, result_text, created_at, started_at, updated_at, completed_at, scheduled_for
-        )
-        SELECT
-          id,
-          agent_id,
-          conversation_id,
-          COALESCE(task_kind, 'detached'),
-          NULL,
-          NULL,
-          NULL,
-          NULL,
-          parent_task_id,
-          COALESCE(nesting_depth, 0),
-          title,
-          prompt,
-          provider_kind,
-          model,
-          reasoning_level,
-          status,
-          run_id,
-          result_text,
-          created_at,
-          started_at,
-          updated_at,
-          completed_at,
-          scheduled_for
-        FROM tasks;
-      `);
-      db.exec("DROP TABLE tasks");
-      db.exec("ALTER TABLE tasks_next RENAME TO tasks");
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    } finally {
-      db.pragma("foreign_keys = ON");
-    }
-    return;
-  }
-
-  const columns = db.prepare(`PRAGMA table_info(tasks)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  const statements: string[] = [];
-
-  if (!columnNames.has("task_kind")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN task_kind TEXT NOT NULL DEFAULT 'detached'`);
-  }
-  if (!columnNames.has("parent_task_id")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN parent_task_id TEXT`);
-  }
-  if (!columnNames.has("nesting_depth")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN nesting_depth INTEGER NOT NULL DEFAULT 0`);
-  }
-  if (!columnNames.has("task_flow_id")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN task_flow_id TEXT`);
-  }
-  if (!columnNames.has("flow_step_key")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN flow_step_key TEXT`);
-  }
-  if (!columnNames.has("origin_run_id")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN origin_run_id TEXT`);
-  }
-  if (!columnNames.has("automation_rule_id")) {
-    statements.push(`ALTER TABLE tasks ADD COLUMN automation_rule_id TEXT`);
-  }
-
-  if (statements.length) {
-    db.pragma("foreign_keys = OFF");
-    try {
-      db.exec("BEGIN");
-      for (const statement of statements) {
-        db.exec(statement);
-      }
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    } finally {
-      db.pragma("foreign_keys = ON");
-    }
-  }
-}
-
-function migrateConversationLineageColumns(db: Database.Database) {
-  const columns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  const statements: string[] = [];
-
-  if (!columnNames.has("session_kind")) {
-    statements.push(`ALTER TABLE conversations ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'primary'`);
-  }
-  if (!columnNames.has("parent_conversation_id")) {
-    statements.push(`ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT`);
-  }
-  if (!columnNames.has("owner_run_id")) {
-    statements.push(`ALTER TABLE conversations ADD COLUMN owner_run_id TEXT`);
-  }
-
-  if (!statements.length) {
-    return;
-  }
-
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.exec("BEGIN");
-    for (const statement of statements) {
-      db.exec(statement);
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
-}
-
-function migrateWorkspaceRunMetadataColumns(db: Database.Database) {
-  const columns = db.prepare(`PRAGMA table_info(workspace_runs)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  const statements: string[] = [];
-
-  if (!columnNames.has("task_id")) {
-    statements.push(`ALTER TABLE workspace_runs ADD COLUMN task_id TEXT`);
-  }
-  if (!columnNames.has("parent_run_id")) {
-    statements.push(`ALTER TABLE workspace_runs ADD COLUMN parent_run_id TEXT`);
-  }
-  if (!columnNames.has("phase")) {
-    statements.push(`ALTER TABLE workspace_runs ADD COLUMN phase TEXT NOT NULL DEFAULT 'accepted'`);
-  }
-  if (!columnNames.has("checkpoint_json")) {
-    statements.push(`ALTER TABLE workspace_runs ADD COLUMN checkpoint_json TEXT`);
-  }
-  if (!columnNames.has("resume_token")) {
-    statements.push(`ALTER TABLE workspace_runs ADD COLUMN resume_token TEXT`);
-  }
-
-  if (!statements.length) {
-    return;
-  }
-
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.exec("BEGIN");
-    for (const statement of statements) {
-      db.exec(statement);
-    }
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
-}
-
 function ensureDefaultAgent(db: Database.Database) {
   const timestamp = now();
   db.prepare(`
@@ -355,100 +147,6 @@ function ensureDefaultAgent(db: Database.Database) {
     timestamp,
     timestamp,
   );
-}
-
-function migrateConversationSessionColumns(db: Database.Database) {
-  const conversationsSql = tableSql(db, "conversations");
-  if (!conversationsSql || (conversationsSql.includes("agent_id") && conversationsSql.includes("channel_kind"))) {
-    return;
-  }
-  const columns = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  const reasoningExpression = columnNames.has("reasoning_level")
-    ? "COALESCE(reasoning_level, 'medium')"
-    : "'medium'";
-
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.exec("BEGIN");
-    db.exec(createConversationsSql("conversations_next"));
-    db.exec(`
-      INSERT INTO conversations_next (
-        id, agent_id, channel_kind, session_kind, parent_conversation_id, owner_run_id, title, provider_kind, model, reasoning_level, created_at, updated_at
-      )
-      SELECT
-        id,
-        '${DEFAULT_AGENT_ID}',
-        'webchat',
-        'primary',
-        NULL,
-        NULL,
-        title,
-        provider_kind,
-        model,
-        ${reasoningExpression},
-        created_at,
-        updated_at
-      FROM conversations;
-    `);
-    db.exec("DROP TABLE conversations");
-    db.exec("ALTER TABLE conversations_next RENAME TO conversations");
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
-}
-
-function migrateAutomationRuleColumns(db: Database.Database) {
-  db.exec(createAutomationRulesSql("automation_rules"));
-  const columns = db.prepare(`PRAGMA table_info(automation_rules)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  const statements: string[] = [];
-  if (!columnNames.has("provider_kind")) {
-    statements.push(`ALTER TABLE automation_rules ADD COLUMN provider_kind TEXT NOT NULL DEFAULT 'openai'`);
-  }
-  if (!columnNames.has("model")) {
-    statements.push(`ALTER TABLE automation_rules ADD COLUMN model TEXT NOT NULL DEFAULT 'gpt-5.4'`);
-  }
-  if (!columnNames.has("reasoning_level")) {
-    statements.push(`ALTER TABLE automation_rules ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`);
-  }
-  for (const statement of statements) {
-    db.exec(statement);
-  }
-}
-
-function migrateTaskFlowStepPositionColumn(db: Database.Database) {
-  const columns = db.prepare(`PRAGMA table_info(task_flow_steps)`).all() as Array<{ name: string }>;
-  const columnNames = new Set(columns.map((column) => column.name));
-  if (!columnNames.has("position")) {
-    db.exec(`ALTER TABLE task_flow_steps ADD COLUMN position INTEGER NOT NULL DEFAULT 0`);
-  }
-
-  const rows = db
-    .prepare(
-      `SELECT id, flow_id
-       FROM task_flow_steps
-       ORDER BY flow_id ASC, created_at ASC, id ASC`,
-    )
-    .all() as Array<{ id: string; flow_id: string }>;
-  const updatePosition = db.prepare(`UPDATE task_flow_steps SET position = ? WHERE id = ?`);
-  const tx = db.transaction(() => {
-    let currentFlowId: string | null = null;
-    let position = 0;
-    for (const row of rows) {
-      if (row.flow_id !== currentFlowId) {
-        currentFlowId = row.flow_id;
-        position = 0;
-      }
-      updatePosition.run(position, row.id);
-      position += 1;
-    }
-  });
-  tx();
 }
 
 export function createStore(dataDir: string) {
@@ -582,6 +280,10 @@ export function createStore(dataDir: string) {
       ${createSkillTemplatesSql("skill_templates")}
     `);
   });
+  runSchemaMigration(db, 13, "operations_polish_columns", () => {
+    migrateOperationsPolishColumns(db);
+  });
+  migrateOperationsPolishColumns(db);
   const summaryColumns = db
     .prepare(`PRAGMA table_info(session_summaries)`)
     .all() as Array<{ name: string }>;
@@ -736,10 +438,10 @@ export function createStore(dataDir: string) {
   const insertArtifactVersionStmt = db.prepare(`
     INSERT INTO artifact_versions (
       id, artifact_id, run_id, path, before_content, after_content, before_hash, after_hash,
-      size_bytes, encoding, binary, truncated, created_at
+      size_bytes, encoding, binary, truncated, unsupported_encoding, metadata_json, created_at
     ) VALUES (
       @id, @artifact_id, @run_id, @path, @before_content, @after_content, @before_hash, @after_hash,
-      @size_bytes, @encoding, @binary, @truncated, @created_at
+      @size_bytes, @encoding, @binary, @truncated, @unsupported_encoding, @metadata_json, @created_at
     );
   `);
 
@@ -747,11 +449,11 @@ export function createStore(dataDir: string) {
     INSERT INTO skill_templates (
       id, agent_id, scope, name, category, summary, description, standing_order_patch,
       flow_template_json, verification_checklist_json, heartbeat_instructions, suggested_prompt,
-      tags_json, created_at, updated_at
+      tags_json, metadata_json, created_at, updated_at
     ) VALUES (
       @id, @agent_id, @scope, @name, @category, @summary, @description, @standing_order_patch,
       @flow_template_json, @verification_checklist_json, @heartbeat_instructions, @suggested_prompt,
-      @tags_json, @created_at, @updated_at
+      @tags_json, @metadata_json, @created_at, @updated_at
     )
     ON CONFLICT(id) DO UPDATE SET
       agent_id = excluded.agent_id,
@@ -766,6 +468,7 @@ export function createStore(dataDir: string) {
       heartbeat_instructions = excluded.heartbeat_instructions,
       suggested_prompt = excluded.suggested_prompt,
       tags_json = excluded.tags_json,
+      metadata_json = excluded.metadata_json,
       updated_at = excluded.updated_at;
   `);
 
@@ -837,9 +540,9 @@ export function createStore(dataDir: string) {
 
   const insertTaskFlowStepStmt = db.prepare(`
     INSERT INTO task_flow_steps (
-      id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, status, created_at, updated_at, completed_at
+      id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, step_kind, status, created_at, updated_at, completed_at
     ) VALUES (
-      @id, @flow_id, @task_id, @step_key, @dependency_step_key, @position, @title, @prompt, @status, @created_at, @updated_at, @completed_at
+      @id, @flow_id, @task_id, @step_key, @dependency_step_key, @position, @title, @prompt, @step_kind, @status, @created_at, @updated_at, @completed_at
     );
   `);
 
@@ -849,6 +552,7 @@ export function createStore(dataDir: string) {
           WHEN @clear_task_id = 1 THEN NULL
           ELSE COALESCE(@task_id, task_id)
         END,
+        step_kind = COALESCE(@step_kind, step_kind),
         status = COALESCE(@status, status),
         updated_at = @updated_at,
         completed_at = CASE
@@ -1624,6 +1328,8 @@ export function createStore(dataDir: string) {
         encoding?: string | null;
         binary?: boolean;
         truncated?: boolean;
+        unsupportedEncoding?: boolean;
+        metadata?: Record<string, unknown>;
       }>;
     }): ArtifactRecord[] {
       const run = store.getWorkspaceRunForConversation(input.conversationId, input.runId);
@@ -1657,7 +1363,9 @@ export function createStore(dataDir: string) {
                     available: true,
                     binary: Boolean(snapshot.binary),
                     truncated: Boolean(snapshot.truncated),
+                    unsupportedEncoding: Boolean(snapshot.unsupportedEncoding),
                     encoding: snapshot.encoding ?? null,
+                    metadata: snapshot.metadata ?? {},
                   }
                 : { available: false },
             }),
@@ -1678,6 +1386,8 @@ export function createStore(dataDir: string) {
               encoding: snapshot.encoding ?? null,
               binary: snapshot.binary ? 1 : 0,
               truncated: snapshot.truncated ? 1 : 0,
+              unsupported_encoding: snapshot.unsupportedEncoding ? 1 : 0,
+              metadata_json: JSON.stringify(snapshot.metadata ?? {}),
               created_at: timestamp,
             });
           }
@@ -1690,7 +1400,7 @@ export function createStore(dataDir: string) {
       const row = db
         .prepare(
           `SELECT id, artifact_id, run_id, path, before_content, after_content, before_hash, after_hash,
-                  size_bytes, encoding, binary, truncated, created_at
+                  size_bytes, encoding, binary, truncated, unsupported_encoding, metadata_json, created_at
            FROM artifact_versions
            WHERE artifact_id = ?
            ORDER BY created_at DESC
@@ -1721,6 +1431,39 @@ export function createStore(dataDir: string) {
         )
         .get(artifactId) as ArtifactRow | undefined;
       return row ? mapArtifact(row) : null;
+    },
+
+    createMetadataArtifact(input: {
+      agentId: string;
+      conversationId: string;
+      kind: Exclude<ArtifactKind, "file" | "diff">;
+      title: string;
+      summary?: string | null;
+      metadata?: Record<string, unknown>;
+      runId?: string | null;
+      taskId?: string | null;
+    }): ArtifactRecord {
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      insertArtifactStmt.run({
+        id,
+        agent_id: input.agentId,
+        conversation_id: input.conversationId,
+        run_id: input.runId ?? null,
+        task_id: input.taskId ?? null,
+        kind: input.kind,
+        title: input.title,
+        path: null,
+        summary: input.summary ?? null,
+        metadata_json: JSON.stringify(input.metadata ?? {}),
+        created_at: timestamp,
+        updated_at: timestamp,
+      });
+      const artifact = store.getArtifact(id);
+      if (!artifact) {
+        throw new Error("Failed to create artifact.");
+      }
+      return artifact;
     },
 
     countArtifactsForRun(conversationId: string, runId: string): number {
@@ -1764,7 +1507,7 @@ export function createStore(dataDir: string) {
         .all() as WorkspaceRunRow[];
       const runningSteps = db
         .prepare(
-          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, status, created_at, updated_at, completed_at
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, step_kind, status, created_at, updated_at, completed_at
            FROM task_flow_steps
            WHERE status = 'running'`,
         )
@@ -2563,6 +2306,7 @@ export function createStore(dataDir: string) {
       position?: number;
       title: string;
       prompt: string;
+      stepKind?: TaskFlowStepKind;
     }) {
       const id = crypto.randomUUID();
       const timestamp = now();
@@ -2580,6 +2324,7 @@ export function createStore(dataDir: string) {
         position,
         title: input.title,
         prompt: input.prompt,
+        step_kind: input.stepKind ?? "task",
         status: "queued",
         created_at: timestamp,
         updated_at: timestamp,
@@ -2591,7 +2336,7 @@ export function createStore(dataDir: string) {
     getTaskFlowStep(stepId: string): TaskFlowStepRecord | null {
       const row = db
         .prepare(
-          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, status, created_at, updated_at, completed_at
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, step_kind, status, created_at, updated_at, completed_at
            FROM task_flow_steps
            WHERE id = ?`,
         )
@@ -2602,7 +2347,7 @@ export function createStore(dataDir: string) {
     listTaskFlowSteps(flowId: string): TaskFlowStepRecord[] {
       const rows = db
         .prepare(
-          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, status, created_at, updated_at, completed_at
+          `SELECT id, flow_id, task_id, step_key, dependency_step_key, position, title, prompt, step_kind, status, created_at, updated_at, completed_at
            FROM task_flow_steps
            WHERE flow_id = ?
            ORDER BY position ASC, created_at ASC`,
@@ -2619,6 +2364,7 @@ export function createStore(dataDir: string) {
         position?: number;
         title: string;
         prompt: string;
+        stepKind?: TaskFlowStepKind;
       }>,
       title?: string,
     ): TaskFlowStepRecord[] {
@@ -2635,6 +2381,7 @@ export function createStore(dataDir: string) {
             position: step.position ?? index,
             title: step.title,
             prompt: step.prompt,
+            step_kind: step.stepKind ?? "task",
             status: "queued",
             created_at: timestamp + index,
             updated_at: timestamp + index,
@@ -2662,6 +2409,7 @@ export function createStore(dataDir: string) {
     transitionTaskFlowStep(input: {
       stepId: string;
       taskId?: string | null;
+      stepKind?: TaskFlowStepKind | null;
       status?: TaskFlowStepStatus;
       completedAt?: number | null;
       clearTaskId?: boolean;
@@ -2670,6 +2418,7 @@ export function createStore(dataDir: string) {
       updateTaskFlowStepStmt.run({
         id: input.stepId,
         task_id: input.taskId ?? null,
+        step_kind: input.stepKind ?? null,
         status: input.status ?? null,
         updated_at: now(),
         completed_at: input.completedAt ?? null,
@@ -2685,7 +2434,7 @@ export function createStore(dataDir: string) {
             .prepare(
               `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
                       flow_template_json, verification_checklist_json, heartbeat_instructions,
-                      suggested_prompt, tags_json, created_at, updated_at
+                      suggested_prompt, tags_json, metadata_json, created_at, updated_at
                FROM skill_templates
                WHERE scope = 'shared' OR agent_id = ?
                ORDER BY updated_at DESC, name ASC`,
@@ -2695,7 +2444,7 @@ export function createStore(dataDir: string) {
             .prepare(
               `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
                       flow_template_json, verification_checklist_json, heartbeat_instructions,
-                      suggested_prompt, tags_json, created_at, updated_at
+                      suggested_prompt, tags_json, metadata_json, created_at, updated_at
                FROM skill_templates
                ORDER BY updated_at DESC, name ASC`,
             )
@@ -2708,7 +2457,7 @@ export function createStore(dataDir: string) {
         .prepare(
           `SELECT id, agent_id, scope, name, category, summary, description, standing_order_patch,
                   flow_template_json, verification_checklist_json, heartbeat_instructions,
-                  suggested_prompt, tags_json, created_at, updated_at
+                  suggested_prompt, tags_json, metadata_json, created_at, updated_at
            FROM skill_templates
            WHERE id = ?
              AND (scope = 'shared' OR agent_id = ?)
@@ -2732,6 +2481,7 @@ export function createStore(dataDir: string) {
       heartbeatInstructions: string;
       suggestedPrompt: string;
       tags?: string[];
+      metadata?: Record<string, unknown>;
     }): SkillTemplateRecord {
       if (input.agentId && !store.getAgent(input.agentId)) {
         throw new Error("Agent not found.");
@@ -2753,6 +2503,7 @@ export function createStore(dataDir: string) {
         heartbeat_instructions: input.heartbeatInstructions,
         suggested_prompt: input.suggestedPrompt,
         tags_json: JSON.stringify(input.tags ?? []),
+        metadata_json: JSON.stringify(input.metadata ?? existing?.metadata ?? {}),
         created_at: existing?.createdAt ?? timestamp,
         updated_at: timestamp,
       });

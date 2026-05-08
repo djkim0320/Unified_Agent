@@ -64,6 +64,24 @@ export type EngineRunStatus =
   | "failed"
   | "cancelled"
   | "timed_out";
+export type ResearchProjectStatus = "active" | "paused" | "completed" | "archived";
+export type ResearchQuestionStatus = "open" | "investigating" | "answered" | "blocked";
+export type ResearchHypothesisStatus = "proposed" | "supported" | "contradicted" | "unresolved";
+export type ResearchEvidenceSourceType =
+  | "artifact"
+  | "report"
+  | "run"
+  | "task"
+  | "message"
+  | "human_note"
+  | "external";
+export type ResearchLoopStatus =
+  | "queued"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface AgentRecord {
   id: string;
@@ -552,10 +570,96 @@ export interface TaskFlowStepDetail extends TaskFlowStepRecord {
   output: TaskFlowStepOutputSummary;
 }
 
-export interface TaskFlowDetailResponse {
-  flow: TaskFlowRecord;
-  steps: TaskFlowStepDetail[];
-  report: ArtifactRecord | null;
+export interface ResearchAutonomyBudget {
+  maxLoopsPerDay: number;
+  maxConsecutiveLoops: number;
+  maxRuntimeMinutes: number;
+  maxTasksPerLoop: number;
+  requireApprovalForExternal: boolean;
+  requireApprovalForFileWrites: boolean;
+  requireApprovalForCommandExecution: boolean;
+  allowMcpCategories: string[];
+  stopWhenConfidenceAbove: number;
+  stopWhenNoOpenQuestions: boolean;
+  [key: string]: unknown;
+}
+
+export interface ResearchSafetyPolicy {
+  allowedDomains: string[];
+  blockedActions: string[];
+  approvalRequiredActions: string[];
+  notes: string;
+  [key: string]: unknown;
+}
+
+export interface ResearchProjectRecord {
+  id: string;
+  agentId: string;
+  conversationId: string | null;
+  title: string;
+  objective: string;
+  domain: string | null;
+  status: ResearchProjectStatus;
+  autonomyEnabled: boolean;
+  autonomyBudget: ResearchAutonomyBudget;
+  safetyPolicy: ResearchSafetyPolicy;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface ResearchQuestionRecord {
+  id: string;
+  projectId: string;
+  question: string;
+  status: ResearchQuestionStatus;
+  priority: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchHypothesisRecord {
+  id: string;
+  projectId: string;
+  questionId: string | null;
+  hypothesis: string;
+  status: ResearchHypothesisStatus;
+  confidence: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchEvidenceRecord {
+  id: string;
+  projectId: string;
+  questionId: string | null;
+  hypothesisId: string | null;
+  sourceType: ResearchEvidenceSourceType;
+  sourceRef: string | null;
+  claim: string;
+  summary: string;
+  confidence: number;
+  uncertainty: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchLoopRecord {
+  id: string;
+  projectId: string;
+  status: ResearchLoopStatus;
+  iteration: number;
+  goal: string;
+  selectedQuestionId: string | null;
+  proposedFlowId: string | null;
+  taskId: string | null;
+  runId: string | null;
+  resultSummary: string | null;
+  errorText: string | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
 }
 
 export interface ProviderSecretMap {

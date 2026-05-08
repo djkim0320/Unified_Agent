@@ -119,10 +119,6 @@ const catalog: Record<ProviderKind, ModelOption[]> = {
   ],
 };
 
-export function getModelCatalog(providerKind: ProviderKind) {
-  return catalog[providerKind];
-}
-
 export function getModelOption(providerKind: ProviderKind, model: string): ModelOption {
   return (
     catalog[providerKind].find((option) => option.id === model) ?? {

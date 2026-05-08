@@ -33,6 +33,7 @@ The product boundary is intentionally narrow:
 - Run-scoped artifacts with immutable small-text snapshots, safe previews, real unified diffs, and structured run debugger summaries.
 - Safe record search across sessions, summaries, reports, artifacts, tasks, and flows without crawling workspace files.
 - Redacted session export/import bundles for backup and handoff without provider secrets or workspace file import.
+- Research projects with questions, hypotheses, evidence ledgers, bounded autonomy budgets, human approval gates, deterministic loop proposals, and final research reports.
 - Embedded `opencode-ai` Workspace Engine integration; chat, tasks, flows, heartbeat, and sub-agents all use the same opencode engine path.
 
 ## Run on Windows PowerShell
@@ -126,6 +127,30 @@ AetherOps adds operator-facing memory and inspection surfaces around opencode ru
 - `POST /api/conversations/import` imports planning/memory/report metadata into a new session without provider secrets, workspace files, or fake historical execution state.
 
 Full report/artifact/session export is a local power-user action. `mode=full` requires a valid `X-Local-API-Token` header, or `AETHEROPS_ENABLE_FULL_REPORT_EXPORT=true` from a loopback/local host request. Normal preview/copy/export paths stay redacted by default.
+
+## Research Autonomy Layer
+
+The Research tab adds a bounded research layer above normal sessions and flows. It is an operator control surface, not a hidden runtime.
+
+- A Research Project stores an objective, optional domain, linked session, autonomy budget, and safety policy.
+- Questions, hypotheses, and evidence form a local evidence ledger with confidence and uncertainty fields.
+- `POST /api/research/projects/:projectId/loops/propose` creates a reviewable queued TaskFlow with deterministic steps: research plan, evidence gathering, hypothesis update, approval gate, synthesis, verification, and next actions.
+- `autoStart=true` is allowed only when project autonomy is enabled and preflight/budget checks pass.
+- Approval and verification gates pause flows for human decisions and do not create opencode tasks.
+- When a linked research Flow finishes, AetherOps conservatively extracts local evidence from flow summaries, task results, reports, and artifact summaries. It does not fabricate citations or claim external sources unless they exist in local records.
+- `POST /api/research/projects/:projectId/report` creates a deterministic redacted research report artifact from the objective, questions, hypotheses, evidence, uncertainties, and linked artifacts/runs.
+- Optional report-task, summary-task, and subagent role actions create ordinary opencode-backed tasks for review. They do not mutate project memory or evidence without an explicit operator action.
+
+Default autonomy budget:
+
+- `maxLoopsPerDay=3`
+- `maxConsecutiveLoops=1`
+- `maxRuntimeMinutes=60`
+- `maxTasksPerLoop=7`
+- approval required for external work, file writes, and command execution
+- no MCP categories are allowed by default
+
+Research search is scoped to AetherOps records and returns redacted snippets. It does not crawl arbitrary workspace files.
 
 ## MCP Configuration Assistant
 

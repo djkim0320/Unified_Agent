@@ -21,6 +21,7 @@ The repository already supports:
 - protected full export for report/artifact/session bundles, with redacted defaults
 - safe search across AetherOps DB records without workspace crawling
 - human approval and verification gates inside task flows
+- research projects with questions, hypotheses, evidence ledgers, autonomy budgets, deterministic loop proposals, linked Flow execution, and redacted final reports
 - MCP configuration assistant for opencode config snippets, dry-run validation, risk notes, and opencode-backed test tasks
 - skill template library for built-in and custom reusable prompts, flow templates, standing-order patches, verification checklists, and heartbeat recipes
 - opencode-backed execution through the embedded `opencode-ai` launcher
@@ -46,8 +47,9 @@ The current implementation is opencode-only for execution. The remaining work is
 2. Agent/session/task coherence
 3. opencode run reliability and observability
 4. Better visible context through standing orders, summaries, and artifacts
-5. Multi-agent UX polish
-6. More channel and external-tool metadata polish
+5. Research autonomy with explicit budgets, evidence tracking, and human checkpoints
+6. Multi-agent UX polish
+7. More channel and external-tool metadata polish
 
 ## Roadmap Themes
 
@@ -86,6 +88,15 @@ The current implementation is opencode-only for execution. The remaining work is
 - clearer run timeline presentation
 - stronger changed-file and run-log inspection workflows
 - reduce state race conditions and stale refresh hazards
+
+### 6. Research autonomy
+
+- implemented: Research tab for project dashboards, questions, hypotheses, evidence, loop proposals, reports, role-specific subagent tasks, and research search
+- implemented: deterministic research loop proposal that creates normal TaskFlows with approval/verification gates rather than direct hidden execution
+- implemented: conservative evidence extraction from local flow summaries, task results, report artifacts, and artifact summaries
+- keep autonomy disabled by default and bounded by loop/day/runtime/task budgets
+- keep external/MCP/browser-style work behind explicit approval gates and opencode configuration
+- next: improve evidence review UX, source provenance scoring, and final report editing workflows
 
 ## Non-Goals
 

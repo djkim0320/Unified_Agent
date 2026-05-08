@@ -455,10 +455,6 @@ export const BUILT_IN_SKILL_TEMPLATES: SkillTemplateRecord[] = [
   }),
 ];
 
-export function listBuiltInSkillTemplates() {
-  return BUILT_IN_SKILL_TEMPLATES;
-}
-
 export function listSkillTemplates(customTemplates: SkillTemplateRecord[] = []) {
   return [...BUILT_IN_SKILL_TEMPLATES, ...customTemplates];
 }

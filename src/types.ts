@@ -109,6 +109,119 @@ export interface PreflightResponse {
   checks: PreflightCheckRecord[];
 }
 
+export interface ResearchAutonomyBudget {
+  maxLoopsPerDay: number;
+  maxConsecutiveLoops: number;
+  maxRuntimeMinutes: number;
+  maxTasksPerLoop: number;
+  requireApprovalForExternal: boolean;
+  requireApprovalForFileWrites: boolean;
+  requireApprovalForCommandExecution: boolean;
+  allowMcpCategories: string[];
+  stopWhenConfidenceAbove: number;
+  stopWhenNoOpenQuestions: boolean;
+}
+
+export interface ResearchSafetyPolicy {
+  allowedDomains: string[];
+  blockedActions: string[];
+  approvalRequiredActions: string[];
+  notes?: string | null;
+}
+
+export interface ResearchProjectRecord {
+  id: string;
+  agentId: string;
+  conversationId: string | null;
+  title: string;
+  objective: string;
+  domain: string | null;
+  status: "active" | "paused" | "completed" | "archived";
+  autonomyEnabled: boolean;
+  autonomyBudget: ResearchAutonomyBudget;
+  safetyPolicy: ResearchSafetyPolicy;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface ResearchQuestionRecord {
+  id: string;
+  projectId: string;
+  question: string;
+  status: "open" | "investigating" | "answered" | "blocked";
+  priority: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchHypothesisRecord {
+  id: string;
+  projectId: string;
+  questionId: string | null;
+  hypothesis: string;
+  status: "proposed" | "supported" | "contradicted" | "unresolved";
+  confidence: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchEvidenceRecord {
+  id: string;
+  projectId: string;
+  questionId: string | null;
+  hypothesisId: string | null;
+  sourceType: "artifact" | "report" | "run" | "task" | "message" | "human_note" | "external";
+  sourceRef: string | null;
+  claim: string;
+  summary: string;
+  confidence: number;
+  uncertainty: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ResearchLoopRecord {
+  id: string;
+  projectId: string;
+  status: "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
+  iteration: number;
+  goal: string;
+  selectedQuestionId: string | null;
+  proposedFlowId: string | null;
+  taskId: string | null;
+  runId: string | null;
+  resultSummary: string | null;
+  errorText: string | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt: number | null;
+}
+
+export interface ResearchPreflightResponse {
+  ok: boolean;
+  checks: PreflightCheckRecord[];
+  budget: ResearchAutonomyBudget;
+  safetyPolicy: ResearchSafetyPolicy;
+}
+
+export interface ResearchSearchResult {
+  kind: string;
+  title: string;
+  snippet: string;
+  projectId?: string;
+  conversationId?: string | null;
+  questionId?: string;
+  hypothesisId?: string;
+  evidenceId?: string;
+  flowId?: string;
+  runId?: string;
+  artifactId?: string;
+  sourceType?: string;
+  sourceRef?: string | null;
+}
+
 export interface ToolDescriptor {
   name: string;
   description: string;

@@ -3,7 +3,7 @@ import { displayConversationTitle } from "../appStateUtils";
 import { type AgentRecord, type ConversationRecord, providerLabels } from "../types";
 import { CustomSelect } from "./ui/CustomSelect";
 
-export type CockpitNavTarget = "chat" | "workflow" | "mcp" | "skills" | "settings";
+export type CockpitNavTarget = "chat" | "workflow" | "research" | "mcp" | "skills" | "settings";
 
 interface ConversationListProps {
   activeAgentId: string | null;
@@ -23,6 +23,7 @@ interface ConversationListProps {
 const navItems: Array<{ target: CockpitNavTarget; label: string }> = [
   { target: "chat", label: "채팅" },
   { target: "workflow", label: "워크플로우" },
+  { target: "research", label: "연구" },
   { target: "mcp", label: "MCP" },
   { target: "skills", label: "스킬" },
 ];

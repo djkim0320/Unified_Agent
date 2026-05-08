@@ -20,21 +20,6 @@ const WINDOWS_SAFE_ENV_KEYS = [
   "HOME",
 ];
 
-const BLOCKED_SHELL_PROGRAMS = new Set([
-  "powershell",
-  "powershell.exe",
-  "pwsh",
-  "pwsh.exe",
-  "cmd",
-  "cmd.exe",
-  "bash",
-  "bash.exe",
-  "sh",
-  "sh.exe",
-  "zsh",
-  "zsh.exe",
-]);
-
 export function createAbortError(message = "Operation cancelled.") {
   const error = new Error(message);
   error.name = "AbortError";
@@ -48,10 +33,6 @@ export function isAbortError(error: unknown) {
       error instanceof DOMException &&
       error.name === "AbortError")
   );
-}
-
-export function isShellProgram(program: string) {
-  return BLOCKED_SHELL_PROGRAMS.has(program.trim().split(/[\\/]/).pop()?.toLowerCase() ?? "");
 }
 
 export function createSanitizedEnvironment(overrides?: NodeJS.ProcessEnv) {

@@ -48,7 +48,7 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ version: number; name: string }>;
 
     expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
     );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
@@ -775,6 +775,107 @@ describe("workspace run persistence consistency", () => {
         expect.objectContaining({
           eventType: "run_cancelled",
           payload: expect.objectContaining({ reason: "server_restart_recovery" }),
+        }),
+      ]),
+    );
+  });
+
+  it("persists research projects, evidence ledgers, and flow-linked loop extraction", () => {
+    const conversation = createConversation("research autonomy");
+    const project = store.createResearchProject({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Aircraft research automation",
+      objective: "Investigate bounded aircraft research loops.",
+      domain: "aerospace",
+      autonomyBudget: { maxLoopsPerDay: 2 },
+      safetyPolicy: { notes: "External work requires approval." },
+    });
+    const question = store.createResearchQuestion({
+      projectId: project.id,
+      question: "Which evidence is required before CFD automation?",
+      priority: 5,
+    });
+    const hypothesis = store.createResearchHypothesis({
+      projectId: project.id,
+      questionId: question.id,
+      hypothesis: "Approval gates reduce unsafe autonomous actions.",
+      confidence: 0.4,
+    });
+    const manualEvidence = store.createResearchEvidence({
+      projectId: project.id,
+      questionId: question.id,
+      hypothesisId: hypothesis.id,
+      sourceType: "human_note",
+      claim: "Manual approval is required before external research.",
+      summary: "The default research safety policy requires approval for external work.",
+      confidence: 0.75,
+      uncertainty: "Policy still needs live workflow validation.",
+    });
+    const flow = store.createTaskFlow({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Research loop flow",
+      triggerSource: "manual",
+    });
+    store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "research-plan",
+      title: "Research plan",
+      prompt: "Prepare a bounded research plan.",
+    });
+    const loop = store.createResearchLoop({
+      projectId: project.id,
+      selectedQuestionId: question.id,
+      proposedFlowId: flow.id,
+      goal: "Clarify CFD prerequisites.",
+      status: "running",
+    });
+
+    expect(store.listResearchProjects(conversation.agentId)).toEqual([
+      expect.objectContaining({
+        id: project.id,
+        autonomyBudget: expect.objectContaining({ maxLoopsPerDay: 2 }),
+        safetyPolicy: expect.objectContaining({ notes: "External work requires approval." }),
+      }),
+    ]);
+    expect(store.listResearchQuestions(project.id)).toEqual([
+      expect.objectContaining({ id: question.id, priority: 5 }),
+    ]);
+    expect(store.listResearchHypotheses(project.id)).toEqual([
+      expect.objectContaining({ id: hypothesis.id, questionId: question.id }),
+    ]);
+    expect(store.listResearchEvidence(project.id)).toEqual([
+      expect.objectContaining({ id: manualEvidence.id, sourceType: "human_note" }),
+    ]);
+    expect(store.listResearchLoops(project.id)).toEqual([
+      expect.objectContaining({ id: loop.id, proposedFlowId: flow.id, status: "running" }),
+    ]);
+
+    store.transitionTaskFlow({
+      flowId: flow.id,
+      status: "completed",
+      resultSummary:
+        "Claims\nApproval gates reduce unsafe autonomous actions.\n\nEvidence\nFlow completed with human checkpoint guidance.\n\nUncertainty\nExternal MCP validation still needs review.",
+      completedAt: Date.now(),
+    });
+
+    expect(store.getResearchLoop(loop.id)).toEqual(
+      expect.objectContaining({
+        status: "completed",
+        resultSummary: expect.stringContaining("Claims"),
+      }),
+    );
+    expect(store.getResearchQuestion(question.id)).toEqual(
+      expect.objectContaining({ status: "answered" }),
+    );
+    expect(store.listResearchEvidence(project.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sourceType: "report",
+          sourceRef: flow.id,
+          confidence: 0.65,
+          metadata: expect.objectContaining({ researchLoopId: loop.id }),
         }),
       ]),
     );

@@ -86,6 +86,7 @@ import {
   type CustomSkillTemplateUpdatePayload,
   useSkillTemplates,
 } from "../hooks/useSkillTemplates";
+import { useResearchProjects } from "../hooks/useResearchProjects";
 import {
   defaultModels,
   defaultReasoningLevels,
@@ -142,7 +143,7 @@ import {
   pickConversationProvider,
 } from "../appStateUtils";
 
-type AppSection = "chat" | "workflow" | "mcp" | "skills" | "settings";
+type AppSection = "chat" | "workflow" | "research" | "mcp" | "skills" | "settings";
 
 export function useAetherOpsController() {
   const [activeSection, setActiveSection] = useState<AppSection>("chat");
@@ -241,6 +242,47 @@ export function useAetherOpsController() {
     skillTemplatesLoading,
     updateTemplate: updateCustomSkillTemplateFromHook,
   } = useSkillTemplates({ onNotice: setAppNotice });
+  const {
+    abortResearchRequests,
+    activeResearchProject,
+    activeResearchProjectId,
+    addEvidence: addResearchEvidence,
+    addHypothesis: addResearchHypothesis,
+    addQuestion: addResearchQuestion,
+    cancelLoop: cancelResearchLoopFromHook,
+    createProject: createResearchProjectFromHook,
+    createReport: createResearchReportFromHook,
+    createReportTask: createResearchReportTaskFromHook,
+    createSubagent: createResearchSubagentFromHook,
+    patchProject: patchResearchProjectFromHook,
+    proposeLoop: proposeResearchLoopFromHook,
+    refreshResearchProjectDetail,
+    refreshResearchProjects,
+    researchEvidence,
+    researchHypotheses,
+    researchLastReport,
+    researchLoading,
+    researchLoops,
+    researchPreflight,
+    researchProjects,
+    researchQuestions,
+    researchSearchResults,
+    searchResearchRecords,
+    setActiveResearchProjectId,
+    startLoop: startResearchLoopFromHook,
+  } = useResearchProjects({
+    onNotice: setAppNotice,
+    onFlowCreated(flowId) {
+      setSelectedTaskFlowId(flowId);
+      setActiveNavTarget("workflow");
+      setActiveSection("workflow");
+      const agentId = activeAgentIdRef.current;
+      if (agentId) {
+        void refreshTaskFlowDetail(agentId, flowId);
+        void refreshTaskFlows(agentId);
+      }
+    },
+  });
 
   const activeConversationIdRef = useRef<string | null>(null);
   const activeAgentIdRef = useRef<string | null>(null);
@@ -399,6 +441,7 @@ export function useAetherOpsController() {
     abortRef(taskFlowsControllerRef);
     abortRef(taskFlowDetailControllerRef);
     abortPreflightRequests();
+    abortResearchRequests();
   }
 
   function abortAllPendingRequests() {
@@ -406,6 +449,7 @@ export function useAetherOpsController() {
     abortRef(platformMetadataControllerRef);
     abortMcpMetadataRequests();
     abortPreflightRequests();
+    abortResearchRequests();
     abortSkillTemplateRequests();
   }
 
@@ -1186,6 +1230,7 @@ export function useAetherOpsController() {
       void refreshAutomationRules(activeAgentId);
       void refreshStandingOrders(activeAgentId);
       void refreshTaskFlows(activeAgentId);
+      void refreshResearchProjects(activeAgentId);
       const loadedConversations = await refreshConversationList(null, activeAgentId);
       void refreshAgentTasks(activeAgentId);
       if (loadedConversations.length === 0) {
@@ -1207,6 +1252,16 @@ export function useAetherOpsController() {
     }
     void refreshSkillTemplates();
   }, [activeSection]);
+
+  useEffect(() => {
+    if (activeSection !== "research" || !activeAgentId) {
+      return;
+    }
+    void refreshResearchProjects(activeAgentId);
+    if (activeResearchProjectId) {
+      void refreshResearchProjectDetail(activeResearchProjectId);
+    }
+  }, [activeSection, activeAgentId, activeResearchProjectId]);
 
   useEffect(() => {
     const conversationChanged = lastConversationIdRef.current !== activeConversationId;
@@ -2860,6 +2915,18 @@ export function useAetherOpsController() {
     mcpStatus,
     skillTemplates,
     skillTemplatesLoading,
+    activeResearchProject,
+    activeResearchProjectId,
+    researchEvidence,
+    researchHypotheses,
+    researchLastReport,
+    researchLoading,
+    researchLoops,
+    researchPreflight,
+    researchProjects,
+    researchQuestions,
+    researchSearchResults,
+    setActiveResearchProjectId,
     preflightLoading,
     preflightStatus,
     providersByKind,
@@ -2942,6 +3009,20 @@ export function useAetherOpsController() {
     handleUpdateAutomationRule,
     handleUpdateCustomSkillTemplate,
     handleValidateMcpSnippet,
+    addResearchEvidence,
+    addResearchHypothesis,
+    addResearchQuestion,
+    cancelResearchLoop: cancelResearchLoopFromHook,
+    createResearchProject: createResearchProjectFromHook,
+    createResearchReport: createResearchReportFromHook,
+    createResearchReportTask: createResearchReportTaskFromHook,
+    createResearchSubagent: createResearchSubagentFromHook,
+    patchResearchProject: patchResearchProjectFromHook,
+    proposeResearchLoop: proposeResearchLoopFromHook,
+    refreshResearchProjectDetail,
+    refreshResearchProjects,
+    searchResearchRecords,
+    startResearchLoop: startResearchLoopFromHook,
     requestDeleteAgent,
   };
 }

@@ -8,6 +8,7 @@ import { ConversationList } from "../components/ConversationList";
 import { ExtensionsSectionView } from "../components/ExtensionsSectionView";
 import { FlowDraftPanel } from "../components/FlowDraftPanel";
 import { ProviderSettingsDialog } from "../components/ProviderSettingsDialog";
+import { ResearchSectionView } from "../components/ResearchSectionView";
 import { RunArtifactsPanel } from "../components/RunArtifactsPanel";
 import { SessionSummaryPanel } from "../components/SessionSummaryPanel";
 import { SettingsSectionView } from "../components/SettingsSectionView";
@@ -35,7 +36,9 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
     flowDraftPrompt, setFlowDraftPrompt, flowDraft, setFlowDraft, flowDraftEditing, setFlowDraftEditing, flowDraftLoading,
     flowDraftError, setFlowDraftError, runArtifacts, artifactPreview, setArtifactPreview, artifactDiff, setArtifactDiff,
     runDebug, runDetailLoading, mcpCatalog, mcpLoading, mcpSnippetValidation, mcpStatus, skillTemplates, skillTemplatesLoading,
-    preflightLoading, preflightStatus, providersByKind, activeProvider, activeModelOption, activeModelCount, activeModelsLoading,
+    activeResearchProject, activeResearchProjectId, researchEvidence, researchHypotheses, researchLastReport,
+    researchLoading, researchLoops, researchPreflight, researchProjects, researchQuestions, researchSearchResults,
+    setActiveResearchProjectId, preflightLoading, preflightStatus, providersByKind, activeProvider, activeModelOption, activeModelCount, activeModelsLoading,
     activeModelsError, activeProviderLabel, activeReasoningLabel, selectedRun, manualRunSelectionRef, activeConversationIdRef,
     activeAgentIdRef, updateConversation, createConversationThread, refreshAgentTasks, refreshEngineStatus, refreshMcpMetadata,
     refreshPlatformMetadata, refreshPreflight, refreshRunArtifacts, refreshSkillTemplates, refreshSubagentSessions, refreshTaskEvents,
@@ -50,7 +53,10 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
     handleSaveFlowDraft, handleSaveProvider, handleSaveStandingOrders, handleSaveSummary, handleSaveTaskFlowAsSkill,
     handleSaveTaskFlowSteps, handleSelectAgent, handleSelectTaskFlow, handleSendMessage, handleTaskFlowControl,
     handleTaskFlowStepControl, handleTestProvider, handleTriggerAutomationRule, handleTriggerHeartbeat, handleUpdateAutomationRule,
-    handleUpdateCustomSkillTemplate, handleValidateMcpSnippet, requestDeleteAgent, agentSoulDraft,
+    handleUpdateCustomSkillTemplate, handleValidateMcpSnippet, addResearchEvidence, addResearchHypothesis,
+    addResearchQuestion, cancelResearchLoop, createResearchProject, createResearchReport, createResearchReportTask,
+    createResearchSubagent, patchResearchProject, proposeResearchLoop, refreshResearchProjectDetail,
+    refreshResearchProjects, searchResearchRecords, startResearchLoop, requestDeleteAgent, agentSoulDraft,
   } = controller;
 
   const composerControl = activeConversation ? (
@@ -154,11 +160,13 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
                 ? "대화"
                 : activeSection === "settings"
                   ? "설정"
-                  : activeSection === "mcp"
-                    ? "MCP"
-                    : activeSection === "skills"
-                      ? "스킬"
-                      : "워크플로우"}
+                   : activeSection === "mcp"
+                     ? "MCP"
+                     : activeSection === "skills"
+                       ? "스킬"
+                       : activeSection === "research"
+                         ? "연구"
+                       : "워크플로우"}
             </p>
             <h1>{displayConversationTitle(activeConversation?.title)}</h1>
             <p className="chat-panel__intro-copy">
@@ -170,6 +178,8 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
                     ? "opencode가 사용할 MCP 서버 설정과 안전 경계를 확인합니다."
                     : activeSection === "skills"
                       ? "상시 지침, 스킬 카드, Heartbeat 기반 행동 정책을 관리합니다."
+                      : activeSection === "research"
+                        ? "질문, 가설, 증거, 연구 Loop를 묶어 장기 연구를 관제합니다."
                       : "긴 작업 Flow, 단계 편집, 실행 로그를 한 화면에서 관제합니다."}
             </p>
             {activeConversation ? (
@@ -473,6 +483,69 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
               onRefreshPreflight={() => {
                 void refreshPreflight();
               }}
+            />
+          ) : activeSection === "research" ? (
+            <ResearchSectionView
+              activeAgent={activeAgent}
+              activeConversation={activeConversation}
+              activeProject={activeResearchProject}
+              evidence={researchEvidence}
+              hypotheses={researchHypotheses}
+              loading={researchLoading}
+              loops={researchLoops}
+              onAddEvidence={(projectId, payload) => {
+                void addResearchEvidence(projectId, payload);
+              }}
+              onAddHypothesis={(projectId, hypothesis, questionId) => {
+                void addResearchHypothesis(projectId, hypothesis, questionId);
+              }}
+              onAddQuestion={(projectId, question) => {
+                void addResearchQuestion(projectId, question);
+              }}
+              onCancelLoop={(loopId) => {
+                void cancelResearchLoop(loopId);
+              }}
+              onCreateProject={(payload) => {
+                void createResearchProject(payload);
+              }}
+              onCreateReport={(projectId) => {
+                void createResearchReport(projectId);
+              }}
+              onCreateReportTask={(projectId) => {
+                void createResearchReportTask(projectId);
+              }}
+              onCreateSubagent={(projectId, role, questionId) => {
+                void createResearchSubagent(projectId, role, questionId);
+              }}
+              onOpenFlow={(flowId) => {
+                setActiveNavTarget("workflow");
+                setActiveSection("workflow");
+                handleSelectTaskFlow(flowId);
+              }}
+              onProposeLoop={(projectId, payload) => {
+                void proposeResearchLoop(projectId, payload);
+              }}
+              onRefresh={(projectId) => {
+                if (projectId) {
+                  void refreshResearchProjectDetail(projectId);
+                } else if (activeAgentId) {
+                  void refreshResearchProjects(activeAgentId);
+                }
+              }}
+              onSearch={(query) => {
+                void searchResearchRecords(activeAgentId ?? undefined, query, activeConversationId ?? undefined);
+              }}
+              onSelectProject={(projectId) => {
+                setActiveResearchProjectId(projectId);
+                void refreshResearchProjectDetail(projectId);
+              }}
+              onStartLoop={(loopId) => {
+                void startResearchLoop(loopId);
+              }}
+              preflight={researchPreflight}
+              projects={researchProjects}
+              questions={researchQuestions}
+              searchResults={researchSearchResults}
             />
           ) : activeSection === "mcp" || activeSection === "skills" ? (
             <ExtensionsSectionView

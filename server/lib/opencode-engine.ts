@@ -47,11 +47,7 @@ import { EngineRunError } from "./agent-engine.js";
 import type { ProviderKind } from "../types.js";
 
 export { buildOpenCodeEnvironment } from "./opencode/environment.js";
-export type {
-  OpenCodeCommandResult,
-  OpenCodeCommandRunner,
-  OpenCodeRunnerOptions,
-} from "./opencode/runner.js";
+export type { OpenCodeCommandRunner } from "./opencode/runner.js";
 
 const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_STATUS_TIMEOUT_MS = 15_000;

@@ -11,6 +11,18 @@ import type {
   ProviderAccountRecord,
   ProviderKind,
   ReasoningLevel,
+  ResearchAutonomyBudget,
+  ResearchEvidenceRecord,
+  ResearchEvidenceSourceType,
+  ResearchHypothesisRecord,
+  ResearchHypothesisStatus,
+  ResearchLoopRecord,
+  ResearchLoopStatus,
+  ResearchProjectRecord,
+  ResearchProjectStatus,
+  ResearchQuestionRecord,
+  ResearchQuestionStatus,
+  ResearchSafetyPolicy,
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
@@ -166,6 +178,76 @@ export type SkillTemplateRow = {
   metadata_json?: string;
   created_at: number;
   updated_at: number;
+};
+
+export type ResearchProjectRow = {
+  id: string;
+  agent_id: string;
+  conversation_id: string | null;
+  title: string;
+  objective: string;
+  domain: string | null;
+  status: ResearchProjectStatus;
+  autonomy_enabled: number;
+  autonomy_budget_json: string;
+  safety_policy_json: string;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+};
+
+export type ResearchQuestionRow = {
+  id: string;
+  project_id: string;
+  question: string;
+  status: ResearchQuestionStatus;
+  priority: number;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ResearchHypothesisRow = {
+  id: string;
+  project_id: string;
+  question_id: string | null;
+  hypothesis: string;
+  status: ResearchHypothesisStatus;
+  confidence: number;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ResearchEvidenceRow = {
+  id: string;
+  project_id: string;
+  question_id: string | null;
+  hypothesis_id: string | null;
+  source_type: ResearchEvidenceSourceType;
+  source_ref: string | null;
+  claim: string;
+  summary: string;
+  confidence: number;
+  uncertainty: string | null;
+  metadata_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ResearchLoopRow = {
+  id: string;
+  project_id: string;
+  status: ResearchLoopStatus;
+  iteration: number;
+  goal: string;
+  selected_question_id: string | null;
+  proposed_flow_id: string | null;
+  task_id: string | null;
+  run_id: string | null;
+  result_summary: string | null;
+  error_text: string | null;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 };
 
 export type TaskRow = {
@@ -436,6 +518,86 @@ export function mapSkillTemplate(row: SkillTemplateRow): SkillTemplateRecord {
     metadata: parseJsonObject(row.metadata_json ?? "{}"),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+export function mapResearchProject(row: ResearchProjectRow): ResearchProjectRecord {
+  return {
+    id: row.id,
+    agentId: row.agent_id,
+    conversationId: row.conversation_id,
+    title: row.title,
+    objective: row.objective,
+    domain: row.domain,
+    status: row.status,
+    autonomyEnabled: row.autonomy_enabled === 1,
+    autonomyBudget: parseJsonObject(row.autonomy_budget_json) as ResearchAutonomyBudget,
+    safetyPolicy: parseJsonObject(row.safety_policy_json) as ResearchSafetyPolicy,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at,
+  };
+}
+
+export function mapResearchQuestion(row: ResearchQuestionRow): ResearchQuestionRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    question: row.question,
+    status: row.status,
+    priority: row.priority,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapResearchHypothesis(row: ResearchHypothesisRow): ResearchHypothesisRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    questionId: row.question_id,
+    hypothesis: row.hypothesis,
+    status: row.status,
+    confidence: row.confidence,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapResearchEvidence(row: ResearchEvidenceRow): ResearchEvidenceRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    questionId: row.question_id,
+    hypothesisId: row.hypothesis_id,
+    sourceType: row.source_type,
+    sourceRef: row.source_ref,
+    claim: row.claim,
+    summary: row.summary,
+    confidence: row.confidence,
+    uncertainty: row.uncertainty,
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapResearchLoop(row: ResearchLoopRow): ResearchLoopRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    status: row.status,
+    iteration: row.iteration,
+    goal: row.goal,
+    selectedQuestionId: row.selected_question_id,
+    proposedFlowId: row.proposed_flow_id,
+    taskId: row.task_id,
+    runId: row.run_id,
+    resultSummary: row.result_summary,
+    errorText: row.error_text,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at,
   };
 }
 

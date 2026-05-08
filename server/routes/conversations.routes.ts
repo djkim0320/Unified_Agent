@@ -403,6 +403,36 @@ export function registerConversationsRoutes(
           flow,
           steps: store.listTaskFlowSteps?.(flow.id) ?? [],
         })) ?? [];
+    const summary = store.getSessionSummary(conversation.id);
+    const exportedSummary =
+      summary && mode !== "full"
+        ? {
+            ...summary,
+            summary: redactSensitiveText(summary.summary),
+            decisions: summary.decisions.map((item) => redactSensitiveText(item)),
+            openQuestions: summary.openQuestions.map((item) => redactSensitiveText(item)),
+            nextActions: summary.nextActions.map((item) => redactSensitiveText(item)),
+            metadata: redactUnknown(summary.metadata ?? {}),
+          }
+        : summary;
+    const exportedFlows =
+      mode === "full"
+        ? flows
+        : flows.map((item) => ({
+            flow: {
+              ...item.flow,
+              title: redactSensitiveText(item.flow.title),
+              resultSummary: item.flow.resultSummary ? redactSensitiveText(item.flow.resultSummary) : null,
+              errorText: item.flow.errorText ? redactSensitiveText(item.flow.errorText) : null,
+            },
+            steps: item.steps.map((step) => ({
+              ...step,
+              stepKey: redactSensitiveText(step.stepKey),
+              title: redactSensitiveText(step.title),
+              prompt: "[hidden]",
+              dependencyStepKey: step.dependencyStepKey ? redactSensitiveText(step.dependencyStepKey) : null,
+            })),
+          }));
     response.json({
       schemaVersion: 1,
       exportMode: mode,
@@ -411,10 +441,10 @@ export function registerConversationsRoutes(
       conversation: { ...conversation, title: redactMaybe(conversation.title) },
       messages: store.listMessages(conversation.id).map((message) => ({
         ...message,
-        content: redactMaybe(message.content),
+          content: redactMaybe(message.content),
       })),
-      summary: store.getSessionSummary(conversation.id),
-      flows,
+      summary: exportedSummary,
+      flows: exportedFlows,
       tasks: (store.listTasksForConversation?.(conversation.id) ?? []).map((task) => ({
         ...task,
         prompt: mode === "full" ? task.prompt : "[hidden]",

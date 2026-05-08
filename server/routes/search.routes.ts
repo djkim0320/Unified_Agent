@@ -110,6 +110,58 @@ export function registerSearchRoutes(app: express.Express, params: { store: AppS
       }
     }
 
+    const researchProjects = (store.listResearchProjects?.(query.agentId) ?? []).filter(
+      (project) => !query.conversationId || project.conversationId === query.conversationId,
+    );
+    for (const project of researchProjects) {
+      if (includesText(`${project.title}\n${project.objective}\n${project.domain ?? ""}`, query.q)) {
+        push({
+          kind: "research_project",
+          projectId: project.id,
+          conversationId: project.conversationId,
+          agentId: project.agentId,
+          title: project.title,
+          snippet: snippet(`${project.title}\n${project.objective}`, query.q),
+        });
+      }
+      for (const question of store.listResearchQuestions?.(project.id) ?? []) {
+        if (includesText(question.question, query.q)) {
+          push({
+            kind: "question",
+            projectId: project.id,
+            questionId: question.id,
+            title: question.question.slice(0, 120),
+            snippet: snippet(question.question, query.q),
+          });
+        }
+      }
+      for (const hypothesis of store.listResearchHypotheses?.(project.id) ?? []) {
+        if (includesText(hypothesis.hypothesis, query.q)) {
+          push({
+            kind: "hypothesis",
+            projectId: project.id,
+            hypothesisId: hypothesis.id,
+            title: hypothesis.hypothesis.slice(0, 120),
+            snippet: snippet(hypothesis.hypothesis, query.q),
+          });
+        }
+      }
+      for (const evidence of store.listResearchEvidence?.(project.id) ?? []) {
+        const haystack = `${evidence.claim}\n${evidence.summary}\n${evidence.uncertainty ?? ""}`;
+        if (includesText(haystack, query.q)) {
+          push({
+            kind: "evidence",
+            projectId: project.id,
+            evidenceId: evidence.id,
+            title: evidence.claim.slice(0, 120),
+            snippet: snippet(haystack, query.q),
+            sourceType: evidence.sourceType,
+            sourceRef: evidence.sourceRef,
+          });
+        }
+      }
+    }
+
     response.json({
       query: query.q,
       results,

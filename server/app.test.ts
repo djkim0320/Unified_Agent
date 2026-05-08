@@ -2711,4 +2711,133 @@ describe("createApp", () => {
       }
     }
   });
+
+  it("redacts session summaries and flow prompts from redacted session export", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "export secret session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+    store.saveSessionSummary({
+      conversationId: conversation.id,
+      summary: "Current goal uses sk-testsecretvalue123456789",
+      decisions: ["Keep Authorization: Bearer abcdefghijklmnop hidden"],
+      openQuestions: ["Does TOKEN_VALUE=supersecret123 leak?"],
+      nextActions: ["Review C:\\Users\\local\\secret.txt"],
+      metadata: {
+        nested: "github_pat_1234567890abcdefghijklmnop",
+      },
+    });
+    const flow = store.createTaskFlow({
+      agentId: conversation.agentId,
+      conversationId: conversation.id,
+      title: "Flow sk-testsecretvalue123456789",
+    });
+    store.createTaskFlowStep({
+      flowId: flow.id,
+      stepKey: "secret-step",
+      title: "Step Authorization: Bearer abcdefghijklmnop",
+      prompt: "Do not export API_KEY=supersecret123456789",
+    });
+
+    const redacted = await request(app)
+      .get(`/api/conversations/${conversation.id}/export`)
+      .expect(200);
+    const payloadText = JSON.stringify(redacted.body);
+    expect(payloadText).not.toContain("sk-testsecretvalue123456789");
+    expect(payloadText).not.toContain("supersecret123456789");
+    expect(payloadText).not.toContain("abcdefghijklmnop");
+    expect(payloadText).toContain("[hidden]");
+
+    await supertest(app)
+      .get(`/api/conversations/${conversation.id}/export?mode=full`)
+      .expect(403);
+  });
+
+  it("manages research projects and proposes opencode-backed task flows without hidden execution", async () => {
+    const { app, store } = createApp({ dataDir, projectRoot: dataDir });
+    openStores.push(store);
+    const conversation = store.saveConversation({
+      title: "Research session",
+      providerKind: "openai",
+      model: "gpt-5.4",
+      reasoningLevel: "medium",
+    });
+
+    const projectResponse = await request(app)
+      .post("/api/research/projects")
+      .send({
+        agentId: "default-agent",
+        conversationId: conversation.id,
+        title: "Aircraft autonomy research",
+        objective: "Investigate safe bounded aircraft research automation.",
+      })
+      .expect(200);
+    const projectId = projectResponse.body.project.id as string;
+
+    const questionResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/questions`)
+      .send({
+        question: "What evidence is needed before starting CFD automation?",
+        priority: 20,
+      })
+      .expect(200);
+    const questionId = questionResponse.body.question.id as string;
+
+    await request(app)
+      .post(`/api/research/projects/${projectId}/hypotheses`)
+      .send({
+        questionId,
+        hypothesis: "A requirements-first flow reduces unsafe automation.",
+        confidence: 0.4,
+      })
+      .expect(200);
+
+    await request(app)
+      .post(`/api/research/projects/${projectId}/evidence`)
+      .send({
+        questionId,
+        claim: "Approval gates are required before external work.",
+        summary: "The product policy requires human approval for external/high-risk actions.",
+      })
+      .expect(200);
+
+    const loopResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/loops/propose`)
+      .send({ questionId, autoStart: false })
+      .expect(200);
+    expect(loopResponse.body.loop).toEqual(
+      expect.objectContaining({
+        status: "queued",
+        selectedQuestionId: questionId,
+      }),
+    );
+    expect(loopResponse.body.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stepKind: "approval_gate",
+          stepKey: "operator-approval",
+        }),
+      ]),
+    );
+    expect(store.listTaskFlows("default-agent").some((flow) => flow.id === loopResponse.body.flow.id)).toBe(true);
+
+    const reportResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/report`)
+      .expect(200);
+    expect(reportResponse.body.artifact).toEqual(
+      expect.objectContaining({
+        kind: "report",
+      }),
+    );
+
+    const searchResponse = await request(app)
+      .get(`/api/research/search?q=${encodeURIComponent("approval")}&agentId=default-agent`)
+      .expect(200);
+    expect(searchResponse.body.results.length).toBeGreaterThan(0);
+    expect(JSON.stringify(searchResponse.body)).not.toContain("API_KEY=");
+  });
 });

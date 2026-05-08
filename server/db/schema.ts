@@ -42,6 +42,26 @@ const TASK_FLOW_STEP_STATUSES = [
 ] as const;
 const TASK_FLOW_STEP_KINDS = ["task", "approval_gate", "verification_gate"] as const;
 const TASK_FLOW_TRIGGER_SOURCES = ["manual", "schedule", "event_hook"] as const;
+const RESEARCH_PROJECT_STATUSES = ["active", "paused", "completed", "archived"] as const;
+const RESEARCH_QUESTION_STATUSES = ["open", "investigating", "answered", "blocked"] as const;
+const RESEARCH_HYPOTHESIS_STATUSES = ["proposed", "supported", "contradicted", "unresolved"] as const;
+const RESEARCH_EVIDENCE_SOURCE_TYPES = [
+  "artifact",
+  "report",
+  "run",
+  "task",
+  "message",
+  "human_note",
+  "external",
+] as const;
+const RESEARCH_LOOP_STATUSES = [
+  "queued",
+  "running",
+  "waiting_approval",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
 
 export function createWorkspaceRunsSql(tableName: string, options?: { ifNotExists?: boolean }) {
   const createClause = options?.ifNotExists === false ? "CREATE TABLE" : "CREATE TABLE IF NOT EXISTS";
@@ -154,6 +174,96 @@ export function createSkillTemplatesSql(tableName: string) {
       metadata_json TEXT NOT NULL DEFAULT '{}',
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createResearchProjectsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+      title TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      domain TEXT,
+      status TEXT NOT NULL CHECK(status IN ('${RESEARCH_PROJECT_STATUSES.join("', '")}')) DEFAULT 'active',
+      autonomy_enabled INTEGER NOT NULL DEFAULT 0,
+      autonomy_budget_json TEXT NOT NULL DEFAULT '{}',
+      safety_policy_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER
+    );
+  `;
+}
+
+export function createResearchQuestionsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      question TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('${RESEARCH_QUESTION_STATUSES.join("', '")}')) DEFAULT 'open',
+      priority INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createResearchHypothesesSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      question_id TEXT REFERENCES research_questions(id) ON DELETE SET NULL,
+      hypothesis TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('${RESEARCH_HYPOTHESIS_STATUSES.join("', '")}')) DEFAULT 'proposed',
+      confidence REAL NOT NULL DEFAULT 0.0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createResearchEvidenceSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      question_id TEXT REFERENCES research_questions(id) ON DELETE SET NULL,
+      hypothesis_id TEXT REFERENCES research_hypotheses(id) ON DELETE SET NULL,
+      source_type TEXT NOT NULL CHECK(source_type IN ('${RESEARCH_EVIDENCE_SOURCE_TYPES.join("', '")}')),
+      source_ref TEXT,
+      claim TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      uncertainty TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
+export function createResearchLoopsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      status TEXT NOT NULL CHECK(status IN ('${RESEARCH_LOOP_STATUSES.join("', '")}')) DEFAULT 'queued',
+      iteration INTEGER NOT NULL DEFAULT 0,
+      goal TEXT NOT NULL,
+      selected_question_id TEXT REFERENCES research_questions(id) ON DELETE SET NULL,
+      proposed_flow_id TEXT REFERENCES task_flows(id) ON DELETE SET NULL,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      run_id TEXT REFERENCES workspace_runs(id) ON DELETE SET NULL,
+      result_summary TEXT,
+      error_text TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      completed_at INTEGER
     );
   `;
 }

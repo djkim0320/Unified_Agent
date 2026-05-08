@@ -9,21 +9,6 @@ function zodDetails(error: ZodError) {
   }));
 }
 
-export function asyncRoute<
-  TRequest extends express.Request,
-  TResponse extends express.Response,
->(
-  handler: (
-    request: TRequest,
-    response: TResponse,
-    next: express.NextFunction,
-  ) => Promise<unknown>,
-): express.RequestHandler {
-  return (request, response, next) => {
-    void handler(request as TRequest, response as TResponse, next).catch(next);
-  };
-}
-
 export const notFound: express.RequestHandler = (_request, response) => {
   response.status(404).json({ error: "Not found" });
 };

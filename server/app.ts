@@ -22,6 +22,7 @@ import { requireConversation } from "./routes/context.js";
 import { registerMcpRoutes } from "./routes/mcp.routes.js";
 import { registerPlatformRoutes } from "./routes/platform.routes.js";
 import { registerProvidersRoutes } from "./routes/providers.routes.js";
+import { registerResearchRoutes } from "./routes/research.routes.js";
 import { registerSkillTemplateRoutes } from "./routes/skill-templates.routes.js";
 import { registerSearchRoutes } from "./routes/search.routes.js";
 import { registerTaskFlowRoutes } from "./routes/task-flows.routes.js";
@@ -280,6 +281,7 @@ export function createApp(options?: {
     localApiAllowedPorts,
   });
   registerSearchRoutes(app, { store });
+  registerResearchRoutes(app, { store, gateway });
   registerMcpRoutes(app, { store, gateway, exposeWorkspaceDebugPaths });
   registerSkillTemplateRoutes(app, { store, workspace });
   app.use("/api/computer-use", (_request, response) => {

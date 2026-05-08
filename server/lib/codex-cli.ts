@@ -10,8 +10,6 @@ import {
   terminateProcessTree,
 } from "./process-control.js";
 
-type CodexJsonEvent = Record<string, unknown>;
-
 function resolveCodexCliScript() {
   if (process.env.CODEX_CLI_JS?.trim()) {
     return process.env.CODEX_CLI_JS.trim();
@@ -55,9 +53,7 @@ function createSpawnConfig(args: string[]) {
 async function runCodexCommand(params: {
   args: string[];
   cwd: string;
-  stdinText?: string;
   timeoutMs?: number;
-  onStdoutLine?: (line: string) => void;
   signal?: AbortSignal;
 }) {
   const spawnConfig = createSpawnConfig(params.args);
@@ -146,7 +142,6 @@ async function runCodexCommand(params: {
         128 * 1024,
         "stdout",
       );
-      params.onStdoutLine?.(line);
     });
 
     child.stderr.on("data", (chunk) => {
@@ -169,9 +164,6 @@ async function runCodexCommand(params: {
       );
     });
 
-    if (params.stdinText) {
-      child.stdin.write(params.stdinText);
-    }
     child.stdin.end();
   });
 }
@@ -210,73 +202,4 @@ export async function runCodexLogin(cwd: string) {
   }
 
   return result;
-}
-
-export async function runCodexExec(params: {
-  cwd: string;
-  model: string;
-  reasoningEffort?: string;
-  prompt: string;
-  onAgentMessage?: (text: string) => void;
-  signal?: AbortSignal;
-}) {
-  let finalAgentMessage = "";
-
-  const result = await runCodexCommand({
-    cwd: params.cwd,
-    timeoutMs: 5 * 60_000,
-    stdinText: params.prompt,
-    args: [
-      "-a",
-      "never",
-      "exec",
-      "--skip-git-repo-check",
-      "--sandbox",
-      "read-only",
-      "--json",
-      "--ephemeral",
-      "-m",
-      params.model,
-      ...(params.reasoningEffort
-        ? ["-c", `model_reasoning_effort=${params.reasoningEffort}`]
-        : []),
-      "-",
-    ],
-    onStdoutLine: (line) => {
-      let event: CodexJsonEvent;
-      try {
-        event = JSON.parse(line) as CodexJsonEvent;
-      } catch {
-        return;
-      }
-
-      const item =
-        typeof event.item === "object" && event.item !== null
-          ? (event.item as Record<string, unknown>)
-          : null;
-
-      if (
-        event.type === "item.completed" &&
-        item?.type === "agent_message" &&
-        typeof item.text === "string"
-      ) {
-        finalAgentMessage = item.text;
-        params.onAgentMessage?.(item.text);
-      }
-    },
-    signal: params.signal,
-  });
-
-  if (result.exitCode !== 0) {
-    throw new Error(trimTrailingNoise(result.stderr || result.stdout) || "Codex exec failed");
-  }
-
-  if (!finalAgentMessage.trim()) {
-    throw new Error("Codex did not produce an assistant response");
-  }
-
-  return {
-    ...result,
-    finalAgentMessage,
-  };
 }

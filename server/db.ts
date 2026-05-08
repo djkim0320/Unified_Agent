@@ -28,6 +28,11 @@ import {
   createAutomationRulesSql,
   createConversationsSql,
   createHeartbeatLogsSql,
+  createResearchEvidenceSql,
+  createResearchHypothesesSql,
+  createResearchLoopsSql,
+  createResearchProjectsSql,
+  createResearchQuestionsSql,
   createSessionSummariesSql,
   createTaskEventsSql,
   createTaskFlowsSql,
@@ -46,6 +51,11 @@ import {
   mapConversation,
   mapHeartbeatLog,
   mapMessage,
+  mapResearchEvidence,
+  mapResearchHypothesis,
+  mapResearchLoop,
+  mapResearchProject,
+  mapResearchQuestion,
   mapSessionSummary,
   mapSkillTemplate,
   mapTask,
@@ -62,6 +72,11 @@ import {
   type ConversationRow,
   type HeartbeatLogRow,
   type MessageRow,
+  type ResearchEvidenceRow,
+  type ResearchHypothesisRow,
+  type ResearchLoopRow,
+  type ResearchProjectRow,
+  type ResearchQuestionRow,
   type SecretRow,
   type SessionSummaryRow,
   type SkillTemplateRow,
@@ -86,6 +101,18 @@ import type {
   ProviderKind,
   ProviderSecret,
   ReasoningLevel,
+  ResearchAutonomyBudget,
+  ResearchEvidenceRecord,
+  ResearchEvidenceSourceType,
+  ResearchHypothesisRecord,
+  ResearchHypothesisStatus,
+  ResearchLoopRecord,
+  ResearchLoopStatus,
+  ResearchProjectRecord,
+  ResearchProjectStatus,
+  ResearchQuestionRecord,
+  ResearchQuestionStatus,
+  ResearchSafetyPolicy,
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
@@ -109,6 +136,26 @@ import type {
 export const DEFAULT_AGENT_ID = "default-agent";
 export const DEFAULT_CONVERSATION_TITLE = "\uC0C8 \uCC44\uD305";
 
+export const DEFAULT_RESEARCH_AUTONOMY_BUDGET: ResearchAutonomyBudget = {
+  maxLoopsPerDay: 3,
+  maxConsecutiveLoops: 1,
+  maxRuntimeMinutes: 60,
+  maxTasksPerLoop: 7,
+  requireApprovalForExternal: true,
+  requireApprovalForFileWrites: true,
+  requireApprovalForCommandExecution: true,
+  allowMcpCategories: [],
+  stopWhenConfidenceAbove: 0.85,
+  stopWhenNoOpenQuestions: true,
+};
+
+export const DEFAULT_RESEARCH_SAFETY_POLICY: ResearchSafetyPolicy = {
+  allowedDomains: [],
+  blockedActions: ["purchase", "submit", "delete", "publish", "transfer"],
+  approvalRequiredActions: ["external", "file_write", "command_execution", "mcp", "browser"],
+  notes: "External, MCP, browser, file write, and command execution work requires an operator checkpoint by default.",
+};
+
 function tableSql(db: Database.Database, tableName: string) {
   const row = db
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
@@ -128,6 +175,61 @@ function normalizeArtifactPath(relativePath: string) {
     throw new Error("Artifact path must be relative to the session workspace.");
   }
   return normalized;
+}
+
+function mergeResearchBudget(value?: Partial<ResearchAutonomyBudget> | null): ResearchAutonomyBudget {
+  return {
+    ...DEFAULT_RESEARCH_AUTONOMY_BUDGET,
+    ...(value ?? {}),
+    allowMcpCategories: Array.isArray(value?.allowMcpCategories)
+      ? value.allowMcpCategories.filter((item): item is string => typeof item === "string")
+      : DEFAULT_RESEARCH_AUTONOMY_BUDGET.allowMcpCategories,
+  };
+}
+
+function mergeResearchPolicy(value?: Partial<ResearchSafetyPolicy> | null): ResearchSafetyPolicy {
+  return {
+    ...DEFAULT_RESEARCH_SAFETY_POLICY,
+    ...(value ?? {}),
+    allowedDomains: Array.isArray(value?.allowedDomains)
+      ? value.allowedDomains.filter((item): item is string => typeof item === "string")
+      : DEFAULT_RESEARCH_SAFETY_POLICY.allowedDomains,
+    blockedActions: Array.isArray(value?.blockedActions)
+      ? value.blockedActions.filter((item): item is string => typeof item === "string")
+      : DEFAULT_RESEARCH_SAFETY_POLICY.blockedActions,
+    approvalRequiredActions: Array.isArray(value?.approvalRequiredActions)
+      ? value.approvalRequiredActions.filter((item): item is string => typeof item === "string")
+      : DEFAULT_RESEARCH_SAFETY_POLICY.approvalRequiredActions,
+  };
+}
+
+function extractResearchSections(text: string) {
+  const sections: Record<string, string[]> = {};
+  let current: string | null = null;
+  const aliases: Array<[RegExp, string]> = [
+    [/^claims?\s*:?\s*$/i, "claims"],
+    [/^evidence\s*:?\s*$/i, "evidence"],
+    [/^uncertainty|uncertainties\s*:?\s*$/i, "uncertainty"],
+    [/^next questions?\s*:?\s*$/i, "nextQuestions"],
+  ];
+  for (const line of text.split(/\r?\n/)) {
+    const normalized = line.replace(/^#+\s*/, "").trim();
+    const match = aliases.find(([pattern]) => pattern.test(normalized));
+    if (match) {
+      current = match[1];
+      sections[current] ??= [];
+      continue;
+    }
+    if (current && normalized) {
+      sections[current].push(normalized.replace(/^[-*\d.)\s]+/, "").trim());
+    }
+  }
+  return {
+    claims: sections.claims ?? [],
+    evidence: sections.evidence ?? [],
+    uncertainty: sections.uncertainty?.join("\n") || null,
+    nextQuestions: sections.nextQuestions ?? [],
+  };
 }
 
 function ensureDefaultAgent(db: Database.Database) {
@@ -220,6 +322,16 @@ export function createStore(dataDir: string) {
 
     ${createSkillTemplatesSql("skill_templates")}
 
+    ${createResearchProjectsSql("research_projects")}
+
+    ${createResearchQuestionsSql("research_questions")}
+
+    ${createResearchHypothesesSql("research_hypotheses")}
+
+    ${createResearchEvidenceSql("research_evidence")}
+
+    ${createResearchLoopsSql("research_loops")}
+
     ${createHeartbeatLogsSql("heartbeat_logs")}
 
     ${createAutomationRulesSql("automation_rules")}
@@ -284,6 +396,15 @@ export function createStore(dataDir: string) {
     migrateOperationsPolishColumns(db);
   });
   migrateOperationsPolishColumns(db);
+  runSchemaMigration(db, 14, "research_autonomy_tables", () => {
+    db.exec(`
+      ${createResearchProjectsSql("research_projects")}
+      ${createResearchQuestionsSql("research_questions")}
+      ${createResearchHypothesesSql("research_hypotheses")}
+      ${createResearchEvidenceSql("research_evidence")}
+      ${createResearchLoopsSql("research_loops")}
+    `);
+  });
   const summaryColumns = db
     .prepare(`PRAGMA table_info(session_summaries)`)
     .all() as Array<{ name: string }>;
@@ -304,6 +425,16 @@ export function createStore(dataDir: string) {
       ON artifact_versions(artifact_id, created_at);
     CREATE INDEX IF NOT EXISTS skill_templates_agent_scope_idx
       ON skill_templates(agent_id, scope, updated_at);
+    CREATE INDEX IF NOT EXISTS research_projects_agent_status_idx
+      ON research_projects(agent_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS research_questions_project_status_idx
+      ON research_questions(project_id, status, priority);
+    CREATE INDEX IF NOT EXISTS research_hypotheses_project_status_idx
+      ON research_hypotheses(project_id, status, confidence);
+    CREATE INDEX IF NOT EXISTS research_evidence_project_idx
+      ON research_evidence(project_id, created_at);
+    CREATE INDEX IF NOT EXISTS research_loops_project_status_idx
+      ON research_loops(project_id, status, updated_at);
   `);
 
   const upsertProviderAccount = db.prepare(`
@@ -1477,6 +1608,551 @@ export function createStore(dataDir: string) {
       return row.count;
     },
 
+    createResearchProject(input: {
+      agentId: string;
+      conversationId?: string | null;
+      title: string;
+      objective: string;
+      domain?: string | null;
+      status?: ResearchProjectStatus;
+      autonomyEnabled?: boolean;
+      autonomyBudget?: Partial<ResearchAutonomyBudget>;
+      safetyPolicy?: Partial<ResearchSafetyPolicy>;
+    }): ResearchProjectRecord {
+      if (!store.getAgent(input.agentId)) {
+        throw new Error("Agent not found.");
+      }
+      if (input.conversationId) {
+        const conversation = store.getConversation(input.conversationId);
+        if (!conversation || conversation.agentId !== input.agentId) {
+          throw new Error("Conversation not found for research project.");
+        }
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_projects (
+          id, agent_id, conversation_id, title, objective, domain, status, autonomy_enabled,
+          autonomy_budget_json, safety_policy_json, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.agentId,
+        input.conversationId ?? null,
+        input.title,
+        input.objective,
+        input.domain ?? null,
+        input.status ?? "active",
+        input.autonomyEnabled ? 1 : 0,
+        JSON.stringify(mergeResearchBudget(input.autonomyBudget)),
+        JSON.stringify(mergeResearchPolicy(input.safetyPolicy)),
+        timestamp,
+        timestamp,
+        input.status === "completed" ? timestamp : null,
+      );
+      return store.getResearchProject(id)!;
+    },
+
+    updateResearchProject(input: {
+      projectId: string;
+      title?: string;
+      objective?: string;
+      domain?: string | null;
+      status?: ResearchProjectStatus;
+      autonomyEnabled?: boolean;
+      autonomyBudget?: Partial<ResearchAutonomyBudget>;
+      safetyPolicy?: Partial<ResearchSafetyPolicy>;
+    }): ResearchProjectRecord | null {
+      const existing = store.getResearchProject(input.projectId);
+      if (!existing) {
+        return null;
+      }
+      const timestamp = now();
+      const status = input.status ?? existing.status;
+      db.prepare(
+        `UPDATE research_projects
+         SET title = ?, objective = ?, domain = ?, status = ?, autonomy_enabled = ?,
+             autonomy_budget_json = ?, safety_policy_json = ?, updated_at = ?,
+             completed_at = CASE
+               WHEN ? = 'completed' THEN COALESCE(completed_at, ?)
+               WHEN ? != 'completed' THEN NULL
+               ELSE completed_at
+             END
+         WHERE id = ?`,
+      ).run(
+        input.title ?? existing.title,
+        input.objective ?? existing.objective,
+        input.domain === undefined ? existing.domain : input.domain,
+        status,
+        input.autonomyEnabled === undefined ? (existing.autonomyEnabled ? 1 : 0) : input.autonomyEnabled ? 1 : 0,
+        JSON.stringify(mergeResearchBudget(input.autonomyBudget ?? existing.autonomyBudget)),
+        JSON.stringify(mergeResearchPolicy(input.safetyPolicy ?? existing.safetyPolicy)),
+        timestamp,
+        status,
+        timestamp,
+        status,
+        input.projectId,
+      );
+      return store.getResearchProject(input.projectId);
+    },
+
+    getResearchProject(projectId: string): ResearchProjectRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, agent_id, conversation_id, title, objective, domain, status, autonomy_enabled,
+                  autonomy_budget_json, safety_policy_json, created_at, updated_at, completed_at
+           FROM research_projects
+           WHERE id = ?`,
+        )
+        .get(projectId) as ResearchProjectRow | undefined;
+      return row ? mapResearchProject(row) : null;
+    },
+
+    listResearchProjects(agentId?: string): ResearchProjectRecord[] {
+      const rows = agentId
+        ? (db
+            .prepare(
+              `SELECT id, agent_id, conversation_id, title, objective, domain, status, autonomy_enabled,
+                      autonomy_budget_json, safety_policy_json, created_at, updated_at, completed_at
+               FROM research_projects
+               WHERE agent_id = ?
+               ORDER BY updated_at DESC`,
+            )
+            .all(agentId) as ResearchProjectRow[])
+        : (db
+            .prepare(
+              `SELECT id, agent_id, conversation_id, title, objective, domain, status, autonomy_enabled,
+                      autonomy_budget_json, safety_policy_json, created_at, updated_at, completed_at
+               FROM research_projects
+               ORDER BY updated_at DESC`,
+            )
+            .all() as ResearchProjectRow[]);
+      return rows.map(mapResearchProject);
+    },
+
+    createResearchQuestion(input: {
+      projectId: string;
+      question: string;
+      status?: ResearchQuestionStatus;
+      priority?: number;
+    }): ResearchQuestionRecord {
+      if (!store.getResearchProject(input.projectId)) {
+        throw new Error("Research project not found.");
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_questions (id, project_id, question, status, priority, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(id, input.projectId, input.question, input.status ?? "open", input.priority ?? 0, timestamp, timestamp);
+      return store.getResearchQuestion(id)!;
+    },
+
+    updateResearchQuestion(input: {
+      questionId: string;
+      question?: string;
+      status?: ResearchQuestionStatus;
+      priority?: number;
+    }): ResearchQuestionRecord | null {
+      const existing = store.getResearchQuestion(input.questionId);
+      if (!existing) {
+        return null;
+      }
+      db.prepare(
+        `UPDATE research_questions
+         SET question = ?, status = ?, priority = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        input.question ?? existing.question,
+        input.status ?? existing.status,
+        input.priority ?? existing.priority,
+        now(),
+        input.questionId,
+      );
+      return store.getResearchQuestion(input.questionId);
+    },
+
+    getResearchQuestion(questionId: string): ResearchQuestionRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, project_id, question, status, priority, created_at, updated_at
+           FROM research_questions
+           WHERE id = ?`,
+        )
+        .get(questionId) as ResearchQuestionRow | undefined;
+      return row ? mapResearchQuestion(row) : null;
+    },
+
+    listResearchQuestions(projectId: string): ResearchQuestionRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, question, status, priority, created_at, updated_at
+           FROM research_questions
+           WHERE project_id = ?
+           ORDER BY status ASC, priority DESC, updated_at DESC`,
+        )
+        .all(projectId) as ResearchQuestionRow[];
+      return rows.map(mapResearchQuestion);
+    },
+
+    createResearchHypothesis(input: {
+      projectId: string;
+      questionId?: string | null;
+      hypothesis: string;
+      status?: ResearchHypothesisStatus;
+      confidence?: number;
+    }): ResearchHypothesisRecord {
+      if (!store.getResearchProject(input.projectId)) {
+        throw new Error("Research project not found.");
+      }
+      if (input.questionId) {
+        const question = store.getResearchQuestion(input.questionId);
+        if (!question || question.projectId !== input.projectId) {
+          throw new Error("Research question not found for project.");
+        }
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_hypotheses (
+          id, project_id, question_id, hypothesis, status, confidence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.projectId,
+        input.questionId ?? null,
+        input.hypothesis,
+        input.status ?? "proposed",
+        input.confidence ?? 0,
+        timestamp,
+        timestamp,
+      );
+      return store.getResearchHypothesis(id)!;
+    },
+
+    updateResearchHypothesis(input: {
+      hypothesisId: string;
+      questionId?: string | null;
+      hypothesis?: string;
+      status?: ResearchHypothesisStatus;
+      confidence?: number;
+    }): ResearchHypothesisRecord | null {
+      const existing = store.getResearchHypothesis(input.hypothesisId);
+      if (!existing) {
+        return null;
+      }
+      if (input.questionId) {
+        const question = store.getResearchQuestion(input.questionId);
+        if (!question || question.projectId !== existing.projectId) {
+          throw new Error("Research question not found for project.");
+        }
+      }
+      db.prepare(
+        `UPDATE research_hypotheses
+         SET question_id = ?, hypothesis = ?, status = ?, confidence = ?, updated_at = ?
+         WHERE id = ?`,
+      ).run(
+        input.questionId === undefined ? existing.questionId : input.questionId,
+        input.hypothesis ?? existing.hypothesis,
+        input.status ?? existing.status,
+        input.confidence ?? existing.confidence,
+        now(),
+        input.hypothesisId,
+      );
+      return store.getResearchHypothesis(input.hypothesisId);
+    },
+
+    getResearchHypothesis(hypothesisId: string): ResearchHypothesisRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, project_id, question_id, hypothesis, status, confidence, created_at, updated_at
+           FROM research_hypotheses
+           WHERE id = ?`,
+        )
+        .get(hypothesisId) as ResearchHypothesisRow | undefined;
+      return row ? mapResearchHypothesis(row) : null;
+    },
+
+    listResearchHypotheses(projectId: string): ResearchHypothesisRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, question_id, hypothesis, status, confidence, created_at, updated_at
+           FROM research_hypotheses
+           WHERE project_id = ?
+           ORDER BY confidence DESC, updated_at DESC`,
+        )
+        .all(projectId) as ResearchHypothesisRow[];
+      return rows.map(mapResearchHypothesis);
+    },
+
+    createResearchEvidence(input: {
+      projectId: string;
+      questionId?: string | null;
+      hypothesisId?: string | null;
+      sourceType: ResearchEvidenceSourceType;
+      sourceRef?: string | null;
+      claim: string;
+      summary: string;
+      confidence?: number;
+      uncertainty?: string | null;
+      metadata?: Record<string, unknown>;
+    }): ResearchEvidenceRecord {
+      if (!store.getResearchProject(input.projectId)) {
+        throw new Error("Research project not found.");
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_evidence (
+          id, project_id, question_id, hypothesis_id, source_type, source_ref, claim, summary,
+          confidence, uncertainty, metadata_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.projectId,
+        input.questionId ?? null,
+        input.hypothesisId ?? null,
+        input.sourceType,
+        input.sourceRef ?? null,
+        input.claim,
+        input.summary,
+        input.confidence ?? 0.5,
+        input.uncertainty ?? null,
+        JSON.stringify(input.metadata ?? {}),
+        timestamp,
+        timestamp,
+      );
+      const evidence = db
+        .prepare(
+          `SELECT id, project_id, question_id, hypothesis_id, source_type, source_ref, claim, summary,
+                  confidence, uncertainty, metadata_json, created_at, updated_at
+           FROM research_evidence
+           WHERE id = ?`,
+        )
+        .get(id) as ResearchEvidenceRow | undefined;
+      if (!evidence) {
+        throw new Error("Failed to create research evidence.");
+      }
+      return mapResearchEvidence(evidence);
+    },
+
+    listResearchEvidence(projectId: string): ResearchEvidenceRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, question_id, hypothesis_id, source_type, source_ref, claim, summary,
+                  confidence, uncertainty, metadata_json, created_at, updated_at
+           FROM research_evidence
+           WHERE project_id = ?
+           ORDER BY created_at DESC`,
+        )
+        .all(projectId) as ResearchEvidenceRow[];
+      return rows.map(mapResearchEvidence);
+    },
+
+    createResearchLoop(input: {
+      projectId: string;
+      goal: string;
+      selectedQuestionId?: string | null;
+      proposedFlowId?: string | null;
+      taskId?: string | null;
+      runId?: string | null;
+      status?: ResearchLoopStatus;
+    }): ResearchLoopRecord {
+      if (!store.getResearchProject(input.projectId)) {
+        throw new Error("Research project not found.");
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_loops (
+          id, project_id, status, iteration, goal, selected_question_id, proposed_flow_id,
+          task_id, run_id, result_summary, error_text, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.projectId,
+        input.status ?? "queued",
+        0,
+        input.goal,
+        input.selectedQuestionId ?? null,
+        input.proposedFlowId ?? null,
+        input.taskId ?? null,
+        input.runId ?? null,
+        null,
+        null,
+        timestamp,
+        timestamp,
+        null,
+      );
+      return store.getResearchLoop(id)!;
+    },
+
+    transitionResearchLoop(input: {
+      loopId: string;
+      status?: ResearchLoopStatus;
+      iteration?: number;
+      goal?: string;
+      selectedQuestionId?: string | null;
+      proposedFlowId?: string | null;
+      taskId?: string | null;
+      runId?: string | null;
+      resultSummary?: string | null;
+      errorText?: string | null;
+      completedAt?: number | null;
+      clearErrorText?: boolean;
+      clearCompletedAt?: boolean;
+    }): ResearchLoopRecord | null {
+      const existing = store.getResearchLoop(input.loopId);
+      if (!existing) {
+        return null;
+      }
+      const status = input.status ?? existing.status;
+      const timestamp = now();
+      db.prepare(
+        `UPDATE research_loops
+         SET status = ?, iteration = ?, goal = ?, selected_question_id = ?, proposed_flow_id = ?,
+             task_id = ?, run_id = ?, result_summary = ?, error_text = ?, updated_at = ?,
+             completed_at = ?
+         WHERE id = ?`,
+      ).run(
+        status,
+        input.iteration ?? existing.iteration,
+        input.goal ?? existing.goal,
+        input.selectedQuestionId === undefined ? existing.selectedQuestionId : input.selectedQuestionId,
+        input.proposedFlowId === undefined ? existing.proposedFlowId : input.proposedFlowId,
+        input.taskId === undefined ? existing.taskId : input.taskId,
+        input.runId === undefined ? existing.runId : input.runId,
+        input.resultSummary === undefined ? existing.resultSummary : input.resultSummary,
+        input.clearErrorText ? null : input.errorText === undefined ? existing.errorText : input.errorText,
+        timestamp,
+        input.clearCompletedAt
+          ? null
+          : input.completedAt === undefined
+            ? existing.completedAt
+            : input.completedAt,
+        input.loopId,
+      );
+      return store.getResearchLoop(input.loopId);
+    },
+
+    getResearchLoop(loopId: string): ResearchLoopRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, project_id, status, iteration, goal, selected_question_id, proposed_flow_id,
+                  task_id, run_id, result_summary, error_text, created_at, updated_at, completed_at
+           FROM research_loops
+           WHERE id = ?`,
+        )
+        .get(loopId) as ResearchLoopRow | undefined;
+      return row ? mapResearchLoop(row) : null;
+    },
+
+    listResearchLoops(projectId: string): ResearchLoopRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, status, iteration, goal, selected_question_id, proposed_flow_id,
+                  task_id, run_id, result_summary, error_text, created_at, updated_at, completed_at
+           FROM research_loops
+           WHERE project_id = ?
+           ORDER BY created_at DESC`,
+        )
+        .all(projectId) as ResearchLoopRow[];
+      return rows.map(mapResearchLoop);
+    },
+
+    syncResearchLoopsForFlow(flowId: string): ResearchLoopRecord[] {
+      const flow = store.getTaskFlow(flowId);
+      if (!flow || !["completed", "failed", "cancelled"].includes(flow.status)) {
+        return [];
+      }
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, status, iteration, goal, selected_question_id, proposed_flow_id,
+                  task_id, run_id, result_summary, error_text, created_at, updated_at, completed_at
+           FROM research_loops
+           WHERE proposed_flow_id = ?`,
+        )
+        .all(flowId) as ResearchLoopRow[];
+      const loops = rows.map(mapResearchLoop);
+      for (const loop of loops) {
+        const completedAt = now();
+        if (flow.status === "completed") {
+          const existingEvidence = store
+            .listResearchEvidence(loop.projectId)
+            .some((item) => item.metadata?.researchLoopId === loop.id && item.sourceRef === flow.id);
+          const steps = store.listTaskFlowSteps(flow.id);
+          const taskTexts = steps
+            .map((step) => (step.taskId ? store.getTask(step.taskId)?.resultText ?? "" : ""))
+            .filter(Boolean);
+          const report = store.getLatestFlowReportArtifact(flow.id);
+          const artifactSummaries = steps.flatMap((step) => {
+            const task = step.taskId ? store.getTask(step.taskId) : null;
+            const run = task?.runId ? store.getWorkspaceRun(task.runId) : null;
+            return run ? store.listArtifactsForRun(run.conversationId, run.id).map((artifact) => artifact.summary ?? artifact.title) : [];
+          });
+          const combined = [
+            flow.resultSummary ?? "",
+            report?.summary ?? "",
+            typeof report?.metadata.markdown === "string" ? report.metadata.markdown : "",
+            ...taskTexts,
+            ...artifactSummaries,
+          ]
+            .filter(Boolean)
+            .join("\n\n")
+            .trim();
+          if (!existingEvidence && combined) {
+            const sections = extractResearchSections(combined);
+            const claim = sections.claims[0] ?? flow.resultSummary ?? report?.summary ?? "Research loop produced evidence.";
+            const summary = sections.evidence[0] ?? combined.slice(0, 1200);
+            store.createResearchEvidence({
+              projectId: loop.projectId,
+              questionId: loop.selectedQuestionId,
+              sourceType: "report",
+              sourceRef: flow.id,
+              claim,
+              summary,
+              uncertainty: sections.uncertainty,
+              confidence: sections.claims.length || sections.evidence.length ? 0.65 : 0.5,
+              metadata: {
+                researchLoopId: loop.id,
+                flowId: flow.id,
+                reportArtifactId: report?.id ?? null,
+                nextQuestions: sections.nextQuestions,
+              },
+            });
+          }
+          if (loop.selectedQuestionId) {
+            store.updateResearchQuestion({
+              questionId: loop.selectedQuestionId,
+              status: existingEvidence || combined ? "answered" : "investigating",
+            });
+          }
+          store.transitionResearchLoop({
+            loopId: loop.id,
+            status: "completed",
+            resultSummary: flow.resultSummary ?? report?.summary ?? "Research loop completed.",
+            errorText: null,
+            completedAt,
+          });
+        } else {
+          if (loop.selectedQuestionId) {
+            store.updateResearchQuestion({
+              questionId: loop.selectedQuestionId,
+              status: "blocked",
+            });
+          }
+          store.transitionResearchLoop({
+            loopId: loop.id,
+            status: flow.status === "cancelled" ? "cancelled" : "failed",
+            resultSummary: flow.resultSummary ?? null,
+            errorText: flow.errorText ?? `Linked flow ended with status ${flow.status}.`,
+            completedAt,
+          });
+        }
+      }
+      return loops.map((loop) => store.getResearchLoop(loop.id)).filter((loop): loop is ResearchLoopRecord => Boolean(loop));
+    },
+
     recoverStaleRunningWork() {
       const timestamp = now();
       const reason = "server_restart_recovery";
@@ -2293,6 +2969,16 @@ export function createStore(dataDir: string) {
           console.warn(
             "[aetherops] flow_report_generation_failed",
             error instanceof Error ? error.message : "Flow report generation failed.",
+          );
+        }
+      }
+      if (input.status && ["completed", "failed", "cancelled"].includes(input.status)) {
+        try {
+          store.syncResearchLoopsForFlow(input.flowId);
+        } catch (error) {
+          console.warn(
+            "[aetherops] research_loop_sync_failed",
+            error instanceof Error ? error.message : "Research loop sync failed.",
           );
         }
       }

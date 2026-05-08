@@ -65,33 +65,3 @@ export function normalizeReasoningLevel(
   }
   return options[0];
 }
-
-export function getAnthropicAdaptiveEffort(level: ReasoningLevel) {
-  if (level === "xhigh") {
-    return "max";
-  }
-  if (level === "high") {
-    return "high";
-  }
-  if (level === "low") {
-    return "low";
-  }
-  return "medium";
-}
-
-export function getAnthropicThinkingBudget(level: ReasoningLevel) {
-  if (level === "high" || level === "xhigh") {
-    return 4096;
-  }
-  if (level === "medium") {
-    return 2048;
-  }
-  return 1024;
-}
-
-export function getGeminiThinkingLevel(level: ReasoningLevel): ReasoningLevel {
-  if (level === "xhigh") {
-    return "high";
-  }
-  return level;
-}

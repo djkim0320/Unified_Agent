@@ -6,6 +6,7 @@ export * from "./api/flows";
 export * from "./api/mcp";
 export * from "./api/platform";
 export * from "./api/providers";
+export * from "./api/research";
 export * from "./api/runs";
 export * from "./api/skills";
 export * from "./api/tasks";

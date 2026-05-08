@@ -52,10 +52,22 @@ Current domain model:
   - agent-scoped periodic prompts
   - materialized into `scheduled` tasks by the scheduler
   - historical task/run records are retained when rules are deleted
+- `research_projects`
+  - operator-owned research missions linked to an agent and optionally a session
+  - store autonomy budget, safety policy, objective, domain, and lifecycle status
+- `research_questions`, `research_hypotheses`, `research_evidence`
+  - local evidence ledger for claims, uncertainty, confidence, and source links
+- `research_loops`
+  - bounded autonomy attempts that propose and optionally start normal TaskFlows
+  - linked Flow completion is summarized back into conservative evidence records
 
 The stable mental model is:
 
 `agent -> session(conversation) -> run -> task`
+
+Research work adds a higher-level loop:
+
+`research project -> question/hypothesis -> proposed flow -> run/task artifacts -> evidence`
 
 ## 2.2 Workspace Engine
 
@@ -168,6 +180,35 @@ The Skill tab now exposes a template library, not an execution runtime.
 - Deprecated execution route: `GET/POST /api/agents/:agentId/skills` still returns `410 Gone`.
 
 Skill templates contain descriptions, standing-order patches, flow templates, verification checklists, heartbeat recipes, and suggested opencode prompts. Built-ins are read-only; custom templates are stored in SQLite. A completed or useful Flow can be saved as a custom Skill template with `metadata.sourceFlowId`; duplicate source-flow templates require an explicit force/update path. Applying a template only edits agent instruction files or creates a normal queued TaskFlow; it never starts a hidden AetherOps tool/plugin runtime.
+
+### Research autonomy
+
+The Research tab is the bounded autonomy layer. AetherOps plans, tracks, redacts, gates, and stores evidence. opencode still performs all actual workspace execution through normal tasks and task flows.
+
+Research routes:
+
+- `GET/POST /api/research/projects`
+- `GET/PATCH /api/research/projects/:projectId`
+- `GET/POST /api/research/projects/:projectId/questions`
+- `PATCH /api/research/questions/:questionId`
+- `GET/POST /api/research/projects/:projectId/hypotheses`
+- `PATCH /api/research/hypotheses/:hypothesisId`
+- `GET/POST /api/research/projects/:projectId/evidence`
+- `GET /api/research/projects/:projectId/loops`
+- `POST /api/research/projects/:projectId/loops/propose`
+- `POST /api/research/loops/:loopId/start`
+- `POST /api/research/loops/:loopId/cancel`
+- `GET /api/research/projects/:projectId/preflight`
+- `GET /api/research/search`
+- `POST /api/research/projects/:projectId/report`
+- `POST /api/research/projects/:projectId/report-task`
+- `POST /api/research/projects/:projectId/subagents`
+
+Loop proposal is deterministic in this layer. It reads the project objective, open questions, hypotheses, evidence, summaries, and recent local reports, then creates a queued TaskFlow with an approval gate before synthesis/verification work. `autoStart=true` is accepted only when the project explicitly enables autonomy and preflight/budget checks pass.
+
+Evidence extraction is conservative. Completed linked flows can create evidence from local flow summaries, task result text, report artifacts, and artifact summaries. If structured sections such as `Claims`, `Evidence`, `Uncertainty`, and `Next questions` exist, they are parsed; otherwise AetherOps creates a single low-confidence evidence note. It never invents citations.
+
+Autonomy defaults are intentionally restrictive: one consecutive loop, three loops per day, explicit approval for external work, file writes, command execution, and no allowed MCP categories unless the operator changes policy.
 
 ### Memory
 

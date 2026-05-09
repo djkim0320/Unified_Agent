@@ -1,9 +1,21 @@
 const DEFAULT_MAX_DIFF_BYTES = 128 * 1024;
+const DEFAULT_MAX_DIFF_LINES = 4_000;
+const DEFAULT_MAX_DIFF_MATRIX_CELLS = 2_000_000;
 const CONTEXT_LINES = 3;
 
 function maxDiffBytes() {
   const parsed = Number(process.env.AETHEROPS_MAX_ARTIFACT_DIFF_BYTES);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_DIFF_BYTES;
+}
+
+function maxDiffLines() {
+  const parsed = Number(process.env.AETHEROPS_MAX_DIFF_LINES);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_DIFF_LINES;
+}
+
+function maxDiffMatrixCells() {
+  const parsed = Number(process.env.AETHEROPS_MAX_DIFF_MATRIX_CELLS);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_MAX_DIFF_MATRIX_CELLS;
 }
 
 type DiffOp = { type: "context" | "add" | "remove"; line: string; oldLine: number | null; newLine: number | null };
@@ -92,6 +104,25 @@ function byteLength(value: string) {
 export function createUnifiedDiff(pathLabel: string, before: string | null, after: string) {
   const beforeLines = before === null ? [] : linesOf(before);
   const afterLines = linesOf(after);
+  const lineCountBefore = beforeLines.length;
+  const lineCountAfter = afterLines.length;
+  const maxLines = maxDiffLines();
+  const maxMatrixCells = maxDiffMatrixCells();
+  const matrixCells = Math.max(1, beforeLines.length + 1) * Math.max(1, afterLines.length + 1);
+  if (before !== null && (lineCountBefore > maxLines || lineCountAfter > maxLines || matrixCells > maxMatrixCells)) {
+    return {
+      available: false as const,
+      reason: "Diff exceeds configured complexity limit",
+      truncated: true,
+      lineCountBefore,
+      lineCountAfter,
+      maxLines,
+      maxMatrixCells,
+      matrixCells,
+      sizeBytes: byteLength(before) + byteLength(after),
+      maxBytes: maxDiffBytes(),
+    };
+  }
   const ops = before === null
     ? afterLines.map((line, index): DiffOp => ({ type: "add", line, oldLine: null, newLine: index + 1 }))
     : lcsOperations(beforeLines, afterLines);
@@ -112,6 +143,11 @@ export function createUnifiedDiff(pathLabel: string, before: string | null, afte
       truncated: true,
       sizeBytes: byteLength(content),
       maxBytes,
+      lineCountBefore,
+      lineCountAfter,
+      maxLines,
+      maxMatrixCells,
+      matrixCells,
     };
   }
   return {
@@ -120,5 +156,10 @@ export function createUnifiedDiff(pathLabel: string, before: string | null, afte
     truncated: false,
     sizeBytes: byteLength(content),
     maxBytes,
+    lineCountBefore,
+    lineCountAfter,
+    maxLines,
+    maxMatrixCells,
+    matrixCells,
   };
 }

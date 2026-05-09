@@ -40,4 +40,34 @@ describe("artifact diff", () => {
     expect(diff.truncated).toBe(true);
     expect(diff.reason).toContain("exceeds");
   });
+
+  it("rejects diffs that exceed LCS complexity limits before allocating the matrix", () => {
+    const previousLines = process.env.AETHEROPS_MAX_DIFF_LINES;
+    const previousCells = process.env.AETHEROPS_MAX_DIFF_MATRIX_CELLS;
+    process.env.AETHEROPS_MAX_DIFF_LINES = "10000";
+    process.env.AETHEROPS_MAX_DIFF_MATRIX_CELLS = "100";
+    const before = Array.from({ length: 20 }, (_, index) => `old-${index}`).join("\n");
+    const after = Array.from({ length: 20 }, (_, index) => `new-${index}`).join("\n");
+    const diff = createUnifiedDiff("huge-matrix.txt", before, after);
+    if (previousLines === undefined) {
+      delete process.env.AETHEROPS_MAX_DIFF_LINES;
+    } else {
+      process.env.AETHEROPS_MAX_DIFF_LINES = previousLines;
+    }
+    if (previousCells === undefined) {
+      delete process.env.AETHEROPS_MAX_DIFF_MATRIX_CELLS;
+    } else {
+      process.env.AETHEROPS_MAX_DIFF_MATRIX_CELLS = previousCells;
+    }
+
+    expect(diff.available).toBe(false);
+    expect(diff.reason).toContain("complexity");
+    expect(diff).toEqual(
+      expect.objectContaining({
+        lineCountBefore: 20,
+        lineCountAfter: 20,
+        maxMatrixCells: 100,
+      }),
+    );
+  });
 });

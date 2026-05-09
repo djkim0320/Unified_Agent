@@ -94,6 +94,9 @@ The current implementation is opencode-only for execution. The remaining work is
 - implemented: Research tab for project dashboards, questions, hypotheses, evidence, loop proposals, reports, role-specific subagent tasks, and research search
 - implemented: deterministic research loop proposal that creates normal TaskFlows with approval/verification gates rather than direct hidden execution
 - implemented: conservative evidence extraction from local flow summaries, task results, report artifacts, and artifact summaries
+- implemented: research budget enforcement is shared by preflight, loop proposal, and loop start; evidence extraction is idempotent with deterministic source keys
+- implemented: workspace snapshots now use metadata-first scans with degraded-mode events for oversized workspaces, and diffs guard line/matrix complexity before LCS allocation
+- implemented: search has a SQLite FTS5-backed index when available, plus a safe LIKE fallback and explicit rebuild endpoint
 - keep autonomy disabled by default and bounded by loop/day/runtime/task budgets
 - keep external/MCP/browser-style work behind explicit approval gates and opencode configuration
 - next: improve evidence review UX, source provenance scoring, and final report editing workflows

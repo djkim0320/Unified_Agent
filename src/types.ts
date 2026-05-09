@@ -457,13 +457,19 @@ export interface ArtifactDiffResponse {
   diff: {
     available: boolean;
     reason: string;
-    content?: string;
-    binary?: boolean;
-    truncated?: boolean;
-    sizeBytes?: number;
-    maxBytes?: number;
-  };
-}
+      content?: string;
+      binary?: boolean;
+      truncated?: boolean;
+      unsupportedEncoding?: boolean;
+      sizeBytes?: number;
+      maxBytes?: number;
+      lineCountBefore?: number;
+      lineCountAfter?: number;
+      maxLines?: number;
+      maxMatrixCells?: number;
+      matrixCells?: number;
+    };
+  }
 
 export interface FlowDraftStep {
   stepKey: string;

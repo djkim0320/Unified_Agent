@@ -45,6 +45,18 @@ function previewSourceLabel(source?: string) {
   return "미리보기";
 }
 
+function diffDetailLabel(diff: ArtifactDiffResponse["diff"]) {
+  const lineText =
+    typeof diff.lineCountBefore === "number" || typeof diff.lineCountAfter === "number"
+      ? `라인 ${diff.lineCountBefore ?? 0} -> ${diff.lineCountAfter ?? 0}`
+      : null;
+  const matrixText =
+    typeof diff.matrixCells === "number" && typeof diff.maxMatrixCells === "number"
+      ? `LCS 셀 ${diff.matrixCells.toLocaleString()} / ${diff.maxMatrixCells.toLocaleString()}`
+      : null;
+  return [lineText, matrixText].filter(Boolean).join(" · ");
+}
+
 export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
   const reportArtifacts = props.artifacts.filter((artifact) => artifact.kind === "report");
 
@@ -76,7 +88,7 @@ export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
           </div>
         </div>
       ) : (
-        <p className="cockpit-empty">아직 선택한 Run이 없습니다.</p>
+        <p className="cockpit-empty">아직 선택된 Run이 없습니다.</p>
       )}
 
       {reportArtifacts.length ? (
@@ -108,7 +120,7 @@ export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
             </article>
           ))}
           <p className="cockpit-muted">
-            보고서 복사는 기본적으로 redacted mode를 사용합니다. 원문에는 사용자가 입력한 요청이 포함될 수 있습니다.
+            보고서 복사는 기본적으로 redacted mode를 사용합니다. 원문에는 사용자가 입력한 요청 내용이 포함될 수 있습니다.
           </p>
         </div>
       ) : (
@@ -170,9 +182,9 @@ export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
             </p>
           ) : null}
           {props.preview.preview.sensitiveFieldsHidden ? (
-            <p className="cockpit-muted">민감할 수 있는 값은 복사/미리보기 기본값에서 숨겨집니다.</p>
+            <p className="cockpit-muted">민감한 값은 복사/미리보기 기본값에서 숨겨집니다.</p>
           ) : null}
-          {props.preview.preview.binary ? (
+          {props.preview.preview.binary || props.preview.preview.unsupportedEncoding ? (
             <p className="cockpit-empty">바이너리 또는 지원하지 않는 인코딩은 미리보기를 표시할 수 없습니다.</p>
           ) : (
             <pre>{props.preview.preview.content}</pre>
@@ -190,12 +202,17 @@ export function RunArtifactsPanel(props: RunArtifactsPanelProps) {
             </button>
           </div>
           {props.diff.diff.available ? (
-            <pre>{props.diff.diff.content}</pre>
+            <>
+              {diffDetailLabel(props.diff.diff) ? <p className="cockpit-muted">{diffDetailLabel(props.diff.diff)}</p> : null}
+              <pre>{props.diff.diff.content}</pre>
+            </>
           ) : (
-            <p className="cockpit-empty">
-              {props.diff.diff.reason ??
-                "변경 전 기준이 없어 diff를 만들 수 없습니다. 현재 파일 미리보기만 제공됩니다."}
-            </p>
+            <>
+              <p className="cockpit-empty">
+                {props.diff.diff.reason ?? "변경 전 기준이 없어 diff를 만들 수 없습니다. 현재 파일 미리보기만 제공됩니다."}
+              </p>
+              {diffDetailLabel(props.diff.diff) ? <p className="cockpit-muted">{diffDetailLabel(props.diff.diff)}</p> : null}
+            </>
           )}
         </div>
       ) : null}

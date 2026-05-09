@@ -10,6 +10,7 @@ import {
 import {
   artifactSnapshotsForChangedFiles,
   changedFilesBetween,
+  cleanupWorkspaceSnapshot,
   snapshotWorkspace,
 } from "./opencode/snapshots.js";
 import {
@@ -234,7 +235,7 @@ export function createOpenCodeEngine(params: {
       resumeToken: null,
     });
     const startedAt = Date.now();
-    const beforeSnapshot = snapshotWorkspace(workspaceDirectory);
+    const beforeSnapshot = snapshotWorkspace(workspaceDirectory, { createBaseline: true });
     const prompt = buildPrompt({
       input,
       workspacePath: resolvedWorkspace.relativePath,
@@ -404,9 +405,36 @@ export function createOpenCodeEngine(params: {
         handleStdoutLine(stdoutLineBuffer);
       }
 
+      const snapshotTimingStartedAt = Date.now();
       const afterSnapshot = snapshotWorkspace(workspaceDirectory);
       const changedFiles = changedFilesBetween(beforeSnapshot, afterSnapshot);
-      const artifactSnapshots = artifactSnapshotsForChangedFiles(beforeSnapshot, afterSnapshot, changedFiles);
+      const artifactSnapshots = artifactSnapshotsForChangedFiles(workspaceDirectory, beforeSnapshot, afterSnapshot, changedFiles);
+      const snapshotDurationMs = Date.now() - snapshotTimingStartedAt + beforeSnapshot.durationMs;
+      if (beforeSnapshot.degraded || afterSnapshot.degraded) {
+        emit("status", {
+          phase: "snapshot_degraded",
+          engineKind: "opencode",
+          changedFiles,
+          before: {
+            fileCount: beforeSnapshot.fileCount,
+            totalBytes: beforeSnapshot.totalBytes,
+            reasons: beforeSnapshot.degradationReasons,
+          },
+          after: {
+            fileCount: afterSnapshot.fileCount,
+            totalBytes: afterSnapshot.totalBytes,
+            reasons: afterSnapshot.degradationReasons,
+          },
+        });
+      }
+      emit("status", {
+        phase: "snapshot_timing",
+        engineKind: "opencode",
+        durationMs: snapshotDurationMs,
+        changedFiles: changedFiles.length,
+        degraded: beforeSnapshot.degraded || afterSnapshot.degraded,
+      });
+      cleanupWorkspaceSnapshot(beforeSnapshot);
       if (changedFiles.length && params.store.createArtifactsForRun) {
         try {
           const artifacts = params.store.createArtifactsForRun({
@@ -597,6 +625,7 @@ export function createOpenCodeEngine(params: {
         engineRun,
       };
     } catch (error) {
+      cleanupWorkspaceSnapshot(beforeSnapshot);
       if (error instanceof EngineRunError) {
         throw error;
       }

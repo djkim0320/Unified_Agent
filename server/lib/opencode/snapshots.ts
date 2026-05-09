@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 function parsePositiveIntegerEnv(name: string, fallback: number) {
@@ -10,6 +11,9 @@ function parsePositiveIntegerEnv(name: string, fallback: number) {
 }
 
 const MAX_ARTIFACT_SNAPSHOT_BYTES = parsePositiveIntegerEnv("AETHEROPS_MAX_ARTIFACT_SNAPSHOT_BYTES", 64 * 1024);
+const MAX_SNAPSHOT_FILES = parsePositiveIntegerEnv("AETHEROPS_MAX_SNAPSHOT_FILES", 10_000);
+const MAX_SNAPSHOT_TOTAL_BYTES = parsePositiveIntegerEnv("AETHEROPS_MAX_SNAPSHOT_TOTAL_BYTES", 256 * 1024 * 1024);
+
 const SNAPSHOT_SKIP_DIRS = new Set([
   ".git",
   ".hg",
@@ -33,6 +37,35 @@ export type SnapshotEntry = {
   unsupportedEncoding: boolean;
   metadata: Record<string, unknown>;
 };
+
+export type WorkspaceSnapshot = {
+  files: Map<string, SnapshotEntry>;
+  degraded: boolean;
+  degradationReasons: string[];
+  fileCount: number;
+  totalBytes: number;
+  maxFiles: number;
+  maxTotalBytes: number;
+  baselineDir: string | null;
+  durationMs: number;
+};
+
+function metadataOnlyEntry(stat: fs.Stats): SnapshotEntry {
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    hash: null,
+    textContent: null,
+    binary: false,
+    truncated: false,
+    encoding: null,
+    unsupportedEncoding: false,
+    metadata: {
+      snapshotMode: "metadata-only",
+      snapshotLimitBytes: MAX_ARTIFACT_SNAPSHOT_BYTES,
+    },
+  };
+}
 
 function hashFileStreaming(absolutePath: string) {
   const hash = crypto.createHash("sha256");
@@ -75,6 +108,7 @@ function captureSnapshotEntry(absolutePath: string, size: number): Omit<Snapshot
   const metadata = {
     snapshotLimitBytes: MAX_ARTIFACT_SNAPSHOT_BYTES,
     hashStrategy: "streaming-sha256",
+    snapshotMode: "changed-file-capture",
   };
   if (binary || truncated) {
     return {
@@ -111,8 +145,36 @@ function captureSnapshotEntry(absolutePath: string, size: number): Omit<Snapshot
   }
 }
 
-export function snapshotWorkspace(root: string) {
-  const snapshot = new Map<string, SnapshotEntry>();
+function copyBaselineFile(sourcePath: string, baselineDir: string, relativePath: string, size: number) {
+  if (size > MAX_ARTIFACT_SNAPSHOT_BYTES) {
+    return;
+  }
+  const targetPath = path.join(baselineDir, ...relativePath.split("/"));
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.copyFileSync(sourcePath, targetPath);
+}
+
+export function snapshotWorkspace(root: string, options: { createBaseline?: boolean } = {}): WorkspaceSnapshot {
+  const startedAt = Date.now();
+  const snapshot: WorkspaceSnapshot = {
+    files: new Map<string, SnapshotEntry>(),
+    degraded: false,
+    degradationReasons: [],
+    fileCount: 0,
+    totalBytes: 0,
+    maxFiles: MAX_SNAPSHOT_FILES,
+    maxTotalBytes: MAX_SNAPSHOT_TOTAL_BYTES,
+    baselineDir: options.createBaseline ? fs.mkdtempSync(path.join(os.tmpdir(), "aetherops-snapshot-")) : null,
+    durationMs: 0,
+  };
+
+  const markDegraded = (reason: string) => {
+    snapshot.degraded = true;
+    if (!snapshot.degradationReasons.includes(reason)) {
+      snapshot.degradationReasons.push(reason);
+    }
+  };
+
   const visit = (directory: string, relativeBase: string) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       if (SNAPSHOT_SKIP_DIRS.has(entry.name)) {
@@ -128,58 +190,105 @@ export function snapshotWorkspace(root: string) {
         visit(absolutePath, relativePath);
         continue;
       }
-      if (stat.isFile()) {
-        const captured = captureSnapshotEntry(absolutePath, stat.size);
-        snapshot.set(relativePath, {
-          size: stat.size,
-          mtimeMs: stat.mtimeMs,
-          ...captured,
-        });
+      if (!stat.isFile()) {
+        continue;
+      }
+
+      snapshot.fileCount += 1;
+      snapshot.totalBytes += stat.size;
+      if (snapshot.fileCount > MAX_SNAPSHOT_FILES) {
+        markDegraded(`file count exceeded ${MAX_SNAPSHOT_FILES}`);
+        continue;
+      }
+      if (snapshot.totalBytes > MAX_SNAPSHOT_TOTAL_BYTES) {
+        markDegraded(`total bytes exceeded ${MAX_SNAPSHOT_TOTAL_BYTES}`);
+        continue;
+      }
+
+      snapshot.files.set(relativePath, metadataOnlyEntry(stat));
+      if (snapshot.baselineDir) {
+        copyBaselineFile(absolutePath, snapshot.baselineDir, relativePath, stat.size);
       }
     }
   };
+
   if (fs.existsSync(root)) {
     visit(root, "");
   }
+  snapshot.durationMs = Date.now() - startedAt;
   return snapshot;
 }
 
-export function changedFilesBetween(before: Map<string, SnapshotEntry>, after: Map<string, SnapshotEntry>) {
+export function cleanupWorkspaceSnapshot(snapshot: WorkspaceSnapshot) {
+  if (snapshot.baselineDir) {
+    fs.rmSync(snapshot.baselineDir, { recursive: true, force: true });
+    snapshot.baselineDir = null;
+  }
+}
+
+export function changedFilesBetween(before: WorkspaceSnapshot, after: WorkspaceSnapshot) {
   const changed = new Set<string>();
-  for (const [relativePath, entry] of after) {
-    const previous = before.get(relativePath);
+  for (const [relativePath, entry] of after.files) {
+    const previous = before.files.get(relativePath);
     if (!previous || previous.size !== entry.size || previous.mtimeMs !== entry.mtimeMs) {
       changed.add(relativePath);
     }
   }
-  for (const relativePath of before.keys()) {
-    if (!after.has(relativePath)) {
+  for (const relativePath of before.files.keys()) {
+    if (!after.files.has(relativePath)) {
       changed.add(relativePath);
     }
   }
   return [...changed].sort();
 }
 
+function captureChangedEntry(root: string, relativePath: string, metadataEntry: SnapshotEntry | null) {
+  if (!metadataEntry) {
+    return null;
+  }
+  const absolutePath = path.join(root, ...relativePath.split("/"));
+  const stat = fs.lstatSync(absolutePath, { throwIfNoEntry: false });
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) {
+    return null;
+  }
+  const captured = captureSnapshotEntry(absolutePath, stat.size);
+  return {
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ...captured,
+  } satisfies SnapshotEntry;
+}
+
 export function artifactSnapshotsForChangedFiles(
-  before: Map<string, SnapshotEntry>,
-  after: Map<string, SnapshotEntry>,
+  workspaceRoot: string,
+  before: WorkspaceSnapshot,
+  after: WorkspaceSnapshot,
   changedFiles: string[],
 ) {
+  const degraded = before.degraded || after.degraded;
   return changedFiles.map((relativePath) => {
-    const beforeEntry = before.get(relativePath) ?? null;
-    const afterEntry = after.get(relativePath) ?? null;
+    const beforeEntry = before.baselineDir
+      ? captureChangedEntry(before.baselineDir, relativePath, before.files.get(relativePath) ?? null)
+      : null;
+    const afterEntry = captureChangedEntry(workspaceRoot, relativePath, after.files.get(relativePath) ?? null);
+    const metadata = {
+      ...(afterEntry?.metadata ?? beforeEntry?.metadata ?? {}),
+      snapshotDegraded: degraded,
+      degradationReasons: [...before.degradationReasons, ...after.degradationReasons],
+      beforeMetadataOnly: !beforeEntry && before.files.has(relativePath),
+    };
     return {
       path: relativePath,
       beforeContent: beforeEntry?.textContent ?? null,
       afterContent: afterEntry?.textContent ?? null,
       beforeHash: beforeEntry?.hash ?? null,
       afterHash: afterEntry?.hash ?? null,
-      sizeBytes: afterEntry?.size ?? beforeEntry?.size ?? null,
+      sizeBytes: afterEntry?.size ?? beforeEntry?.size ?? before.files.get(relativePath)?.size ?? null,
       encoding: afterEntry?.encoding ?? beforeEntry?.encoding ?? null,
       binary: Boolean(afterEntry?.binary ?? beforeEntry?.binary ?? false),
       truncated: Boolean(afterEntry?.truncated ?? beforeEntry?.truncated ?? false),
       unsupportedEncoding: Boolean(afterEntry?.unsupportedEncoding ?? beforeEntry?.unsupportedEncoding ?? false),
-      metadata: afterEntry?.metadata ?? beforeEntry?.metadata ?? {},
+      metadata,
     };
   });
 }

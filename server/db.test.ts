@@ -48,7 +48,7 @@ describe("workspace run persistence consistency", () => {
       .all() as Array<{ version: number; name: string }>;
 
     expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
+      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
     );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");

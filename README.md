@@ -122,7 +122,8 @@ AetherOps adds operator-facing memory and inspection surfaces around opencode ru
 - `GET /api/artifacts/:artifactId/preview?mode=redacted|full` prefers the saved run snapshot and only falls back to current workspace content when no snapshot exists. It does not expose arbitrary workspace browsing.
 - `GET /api/artifacts/:artifactId/diff` returns a real unified text diff when before/after snapshots are available, and a clear unavailable reason for binary, truncated, oversized, or baseline-less files.
 - `GET /api/runs/:runId/debug?conversationId=<id>` returns a redacted debug summary with status, duration, model, changed files, last events, artifact count, prompt-presence booleans, and task linkage.
-- `GET /api/search?q=...&agentId=...&conversationId=...` searches AetherOps DB records only and returns redacted snippets.
+- `GET /api/search?q=...&agentId=...&conversationId=...&projectId=...` searches AetherOps DB records only and returns redacted snippets. A SQLite FTS5 index is used when available, with a LIKE fallback.
+- `POST /api/search/rebuild` rebuilds the local search index from AetherOps records. It does not crawl workspace files.
 - `GET /api/conversations/:conversationId/export?mode=redacted|full` exports a safe session bundle.
 - `POST /api/conversations/import` imports planning/memory/report metadata into a new session without provider secrets, workspace files, or fake historical execution state.
 
@@ -137,7 +138,7 @@ The Research tab adds a bounded research layer above normal sessions and flows. 
 - `POST /api/research/projects/:projectId/loops/propose` creates a reviewable queued TaskFlow with deterministic steps: research plan, evidence gathering, hypothesis update, approval gate, synthesis, verification, and next actions.
 - `autoStart=true` is allowed only when project autonomy is enabled and preflight/budget checks pass.
 - Approval and verification gates pause flows for human decisions and do not create opencode tasks.
-- When a linked research Flow finishes, AetherOps conservatively extracts local evidence from flow summaries, task results, reports, and artifact summaries. It does not fabricate citations or claim external sources unless they exist in local records.
+- When a linked research Flow finishes, AetherOps conservatively extracts local evidence from flow summaries, task results, reports, and artifact summaries. Extraction is idempotent with deterministic source keys, and it does not fabricate citations or claim external sources unless they exist in local records.
 - `POST /api/research/projects/:projectId/report` creates a deterministic redacted research report artifact from the objective, questions, hypotheses, evidence, uncertainties, and linked artifacts/runs.
 - Optional report-task, summary-task, and subagent role actions create ordinary opencode-backed tasks for review. They do not mutate project memory or evidence without an explicit operator action.
 
@@ -216,6 +217,8 @@ Useful environment variables:
 - `AETHEROPS_OPENCODE_PREFIX_PROVIDER=true` if your opencode config expects `provider/model` strings instead of plain model aliases
 - `AETHEROPS_MAX_ARTIFACT_SNAPSHOT_BYTES=65536` caps text captured into artifact snapshots
 - `AETHEROPS_MAX_ARTIFACT_DIFF_BYTES=131072` caps unified diff output
+- `AETHEROPS_MAX_SNAPSHOT_FILES=10000` and `AETHEROPS_MAX_SNAPSHOT_TOTAL_BYTES=268435456` cap workspace snapshot metadata scans. Exceeding either cap degrades snapshot detail but does not fail the run.
+- `AETHEROPS_MAX_DIFF_LINES=4000` and `AETHEROPS_MAX_DIFF_MATRIX_CELLS=2000000` guard LCS diff generation before large matrix allocation.
 - `AETHEROPS_ENABLE_FULL_REPORT_EXPORT=true` allows full export only for loopback/local-host requests when no local API token header is provided
 
 Native engine endpoints:

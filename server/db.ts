@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createSecretBox } from "./lib/crypto.js";
+import { redactSensitiveText } from "./lib/redaction.js";
 import { buildFlowReportArtifact, buildRunReportArtifact } from "./lib/run-report.js";
 import {
   migrateAutomationRuleColumns,
@@ -161,6 +162,70 @@ function tableSql(db: Database.Database, tableName: string) {
     .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(tableName) as { sql: string } | undefined;
   return row?.sql ?? "";
+}
+
+function searchFtsAvailable(db: Database.Database) {
+  return Boolean(tableSql(db, "aetherops_search_index"));
+}
+
+function ensureSearchTables(db: Database.Database) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS search_documents (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      agent_id TEXT,
+      conversation_id TEXT,
+      project_id TEXT,
+      record_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      redacted_body TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(kind, record_id)
+    );
+    CREATE INDEX IF NOT EXISTS search_documents_scope_idx
+      ON search_documents(agent_id, conversation_id, project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS search_documents_kind_idx
+      ON search_documents(kind, updated_at);
+  `);
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS aetherops_search_index USING fts5(
+        kind UNINDEXED,
+        agent_id UNINDEXED,
+        conversation_id UNINDEXED,
+        project_id UNINDEXED,
+        record_id UNINDEXED,
+        title,
+        body,
+        redacted_body,
+        updated_at UNINDEXED
+      );
+    `);
+  } catch {
+    // Some SQLite builds do not include FTS5. The LIKE-backed search_documents table remains available.
+  }
+}
+
+function safeSearchId(kind: string, recordId: string) {
+  return `${kind}:${recordId}`;
+}
+
+function buildFtsQuery(query: string) {
+  const tokens = query.match(/[\p{L}\p{N}_-]+/gu)?.slice(0, 8) ?? [];
+  return tokens.map((token) => `"${token.replace(/"/g, '""')}"`).join(" ");
+}
+
+function searchSnippet(text: string, query: string) {
+  const redacted = redactSensitiveText(text);
+  const lower = redacted.toLowerCase();
+  const index = lower.indexOf(query.toLowerCase());
+  if (index < 0) {
+    return redacted.slice(0, 240);
+  }
+  const start = Math.max(0, index - 80);
+  const end = Math.min(redacted.length, index + query.length + 160);
+  return `${start > 0 ? "..." : ""}${redacted.slice(start, end)}${end < redacted.length ? "..." : ""}`;
 }
 
 function normalizeArtifactPath(relativePath: string) {
@@ -436,6 +501,10 @@ export function createStore(dataDir: string) {
     CREATE INDEX IF NOT EXISTS research_loops_project_status_idx
       ON research_loops(project_id, status, updated_at);
   `);
+  runSchemaMigration(db, 15, "search_documents_index", () => {
+    ensureSearchTables(db);
+  });
+  ensureSearchTables(db);
 
   const upsertProviderAccount = db.prepare(`
     INSERT INTO provider_accounts (
@@ -1594,6 +1663,15 @@ export function createStore(dataDir: string) {
       if (!artifact) {
         throw new Error("Failed to create artifact.");
       }
+      store.upsertSearchDocument({
+        kind: artifact.kind === "report" ? "report" : "artifact",
+        agentId: artifact.agentId,
+        conversationId: artifact.conversationId,
+        recordId: artifact.id,
+        title: artifact.title,
+        body: `${artifact.title}\n${artifact.summary ?? ""}\n${typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : ""}`,
+        updatedAt: artifact.updatedAt,
+      });
       return artifact;
     },
 
@@ -1650,7 +1728,18 @@ export function createStore(dataDir: string) {
         timestamp,
         input.status === "completed" ? timestamp : null,
       );
-      return store.getResearchProject(id)!;
+      const project = store.getResearchProject(id)!;
+      store.upsertSearchDocument({
+        kind: "research_project",
+        agentId: project.agentId,
+        conversationId: project.conversationId,
+        projectId: project.id,
+        recordId: project.id,
+        title: project.title,
+        body: `${project.title}\n${project.objective}\n${project.domain ?? ""}`,
+        updatedAt: project.updatedAt,
+      });
+      return project;
     },
 
     updateResearchProject(input: {
@@ -1745,7 +1834,21 @@ export function createStore(dataDir: string) {
         `INSERT INTO research_questions (id, project_id, question, status, priority, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       ).run(id, input.projectId, input.question, input.status ?? "open", input.priority ?? 0, timestamp, timestamp);
-      return store.getResearchQuestion(id)!;
+      const question = store.getResearchQuestion(id)!;
+      const project = store.getResearchProject(question.projectId);
+      if (project) {
+        store.upsertSearchDocument({
+          kind: "question",
+          agentId: project.agentId,
+          conversationId: project.conversationId,
+          projectId: project.id,
+          recordId: question.id,
+          title: question.question.slice(0, 120),
+          body: question.question,
+          updatedAt: question.updatedAt,
+        });
+      }
+      return question;
     },
 
     updateResearchQuestion(input: {
@@ -1827,7 +1930,21 @@ export function createStore(dataDir: string) {
         timestamp,
         timestamp,
       );
-      return store.getResearchHypothesis(id)!;
+      const hypothesis = store.getResearchHypothesis(id)!;
+      const project = store.getResearchProject(hypothesis.projectId);
+      if (project) {
+        store.upsertSearchDocument({
+          kind: "hypothesis",
+          agentId: project.agentId,
+          conversationId: project.conversationId,
+          projectId: project.id,
+          recordId: hypothesis.id,
+          title: hypothesis.hypothesis.slice(0, 120),
+          body: hypothesis.hypothesis,
+          updatedAt: hypothesis.updatedAt,
+        });
+      }
+      return hypothesis;
     },
 
     updateResearchHypothesis(input: {
@@ -1933,7 +2050,21 @@ export function createStore(dataDir: string) {
       if (!evidence) {
         throw new Error("Failed to create research evidence.");
       }
-      return mapResearchEvidence(evidence);
+      const record = mapResearchEvidence(evidence);
+      const project = store.getResearchProject(record.projectId);
+      if (project) {
+        store.upsertSearchDocument({
+          kind: "evidence",
+          agentId: project.agentId,
+          conversationId: project.conversationId,
+          projectId: project.id,
+          recordId: record.id,
+          title: record.claim.slice(0, 120),
+          body: `${record.claim}\n${record.summary}\n${record.uncertainty ?? ""}`,
+          updatedAt: record.updatedAt,
+        });
+      }
+      return record;
     },
 
     listResearchEvidence(projectId: string): ResearchEvidenceRecord[] {
@@ -2077,7 +2208,7 @@ export function createStore(dataDir: string) {
       for (const loop of loops) {
         const completedAt = now();
         if (flow.status === "completed") {
-          const existingEvidence = store
+          const existingEvidenceForFlow = store
             .listResearchEvidence(loop.projectId)
             .some((item) => item.metadata?.researchLoopId === loop.id && item.sourceRef === flow.id);
           const steps = store.listTaskFlowSteps(flow.id);
@@ -2100,31 +2231,43 @@ export function createStore(dataDir: string) {
             .filter(Boolean)
             .join("\n\n")
             .trim();
-          if (!existingEvidence && combined) {
+          if (!existingEvidenceForFlow && combined) {
             const sections = extractResearchSections(combined);
             const claim = sections.claims[0] ?? flow.resultSummary ?? report?.summary ?? "Research loop produced evidence.";
             const summary = sections.evidence[0] ?? combined.slice(0, 1200);
-            store.createResearchEvidence({
-              projectId: loop.projectId,
-              questionId: loop.selectedQuestionId,
-              sourceType: "report",
-              sourceRef: flow.id,
-              claim,
-              summary,
-              uncertainty: sections.uncertainty,
-              confidence: sections.claims.length || sections.evidence.length ? 0.65 : 0.5,
-              metadata: {
-                researchLoopId: loop.id,
-                flowId: flow.id,
-                reportArtifactId: report?.id ?? null,
-                nextQuestions: sections.nextQuestions,
-              },
-            });
+            const claimHash = crypto.createHash("sha256").update(claim).digest("hex");
+            const extractionKey = `${loop.id}:report:${flow.id}:${claimHash}`;
+            const existingExtraction = store
+              .listResearchEvidence(loop.projectId)
+              .some((item) => item.metadata?.extractionKey === extractionKey);
+            if (!existingExtraction) {
+              const hasContradiction = /\b(contradict|contradicted|contradiction|반박|모순)\b/i.test(`${claim}\n${summary}`);
+              store.createResearchEvidence({
+                projectId: loop.projectId,
+                questionId: loop.selectedQuestionId,
+                sourceType: "report",
+                sourceRef: flow.id,
+                claim,
+                summary,
+                uncertainty: sections.uncertainty,
+                confidence: hasContradiction ? 0.45 : sections.claims.length || sections.evidence.length ? 0.65 : 0.5,
+                metadata: {
+                  extractionKey,
+                  researchLoopId: loop.id,
+                  flowId: flow.id,
+                  reportArtifactId: report?.id ?? null,
+                  nextQuestions: sections.nextQuestions,
+                  structured: Boolean(sections.claims.length || sections.evidence.length),
+                },
+              });
+            }
           }
           if (loop.selectedQuestionId) {
             store.updateResearchQuestion({
               questionId: loop.selectedQuestionId,
-              status: existingEvidence || combined ? "answered" : "investigating",
+              status: existingEvidenceForFlow || (combined && !/\b(contradict|contradicted|contradiction|반박|모순)\b/i.test(combined))
+                ? "answered"
+                : "investigating",
             });
           }
           store.transitionResearchLoop({
@@ -2151,6 +2294,313 @@ export function createStore(dataDir: string) {
         }
       }
       return loops.map((loop) => store.getResearchLoop(loop.id)).filter((loop): loop is ResearchLoopRecord => Boolean(loop));
+    },
+
+    upsertSearchDocument(input: {
+      kind: string;
+      agentId?: string | null;
+      conversationId?: string | null;
+      projectId?: string | null;
+      recordId: string;
+      title: string;
+      body: string;
+      updatedAt?: number;
+    }) {
+      const timestamp = input.updatedAt ?? now();
+      const redactedBody = redactSensitiveText(input.body);
+      const id = safeSearchId(input.kind, input.recordId);
+      db.prepare(
+        `INSERT INTO search_documents (
+          id, kind, agent_id, conversation_id, project_id, record_id, title, body, redacted_body, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(kind, record_id) DO UPDATE SET
+          agent_id = excluded.agent_id,
+          conversation_id = excluded.conversation_id,
+          project_id = excluded.project_id,
+          title = excluded.title,
+          body = excluded.body,
+          redacted_body = excluded.redacted_body,
+          updated_at = excluded.updated_at`,
+      ).run(
+        id,
+        input.kind,
+        input.agentId ?? null,
+        input.conversationId ?? null,
+        input.projectId ?? null,
+        input.recordId,
+        redactSensitiveText(input.title),
+        input.body,
+        redactedBody,
+        timestamp,
+      );
+      if (searchFtsAvailable(db)) {
+        db.prepare(`DELETE FROM aetherops_search_index WHERE kind = ? AND record_id = ?`).run(input.kind, input.recordId);
+        db.prepare(
+          `INSERT INTO aetherops_search_index (
+            kind, agent_id, conversation_id, project_id, record_id, title, body, redacted_body, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          input.kind,
+          input.agentId ?? null,
+          input.conversationId ?? null,
+          input.projectId ?? null,
+          input.recordId,
+          redactSensitiveText(input.title),
+          input.body,
+          redactedBody,
+          timestamp,
+        );
+      }
+    },
+
+    deleteSearchDocument(kind: string, recordId: string) {
+      db.prepare(`DELETE FROM search_documents WHERE kind = ? AND record_id = ?`).run(kind, recordId);
+      if (searchFtsAvailable(db)) {
+        db.prepare(`DELETE FROM aetherops_search_index WHERE kind = ? AND record_id = ?`).run(kind, recordId);
+      }
+    },
+
+    rebuildSearchIndex() {
+      const startedAt = Date.now();
+      db.prepare(`DELETE FROM search_documents`).run();
+      if (searchFtsAvailable(db)) {
+        db.prepare(`DELETE FROM aetherops_search_index`).run();
+      }
+      let indexed = 0;
+      const add = (input: Parameters<typeof store.upsertSearchDocument>[0]) => {
+        store.upsertSearchDocument(input);
+        indexed += 1;
+      };
+
+      for (const agent of store.listAgents()) {
+        for (const conversation of store.listConversations(agent.id)) {
+          add({
+            kind: "session",
+            agentId: agent.id,
+            conversationId: conversation.id,
+            recordId: conversation.id,
+            title: conversation.title,
+            body: conversation.title,
+            updatedAt: conversation.updatedAt,
+          });
+          const summary = store.getSessionSummary(conversation.id);
+          if (summary) {
+            add({
+              kind: "summary",
+              agentId: agent.id,
+              conversationId: conversation.id,
+              recordId: summary.conversationId,
+              title: "Session summary",
+              body: [
+                summary.summary,
+                ...summary.decisions,
+                ...summary.openQuestions,
+                ...summary.nextActions,
+                JSON.stringify(summary.metadata ?? {}),
+              ].join("\n"),
+              updatedAt: summary.updatedAt,
+            });
+          }
+          for (const flow of store.listTaskFlows(agent.id).filter((item) => item.conversationId === conversation.id)) {
+            add({
+              kind: "flow",
+              agentId: agent.id,
+              conversationId: conversation.id,
+              recordId: flow.id,
+              title: flow.title,
+              body: `${flow.title}\n${flow.resultSummary ?? ""}\n${flow.errorText ?? ""}`,
+              updatedAt: flow.updatedAt,
+            });
+          }
+          for (const task of store.listTasksForConversation(conversation.id)) {
+            add({
+              kind: "task",
+              agentId: agent.id,
+              conversationId: conversation.id,
+              recordId: task.id,
+              title: task.title,
+              body: `${task.title}\n${task.resultText ?? ""}`,
+              updatedAt: task.updatedAt,
+            });
+          }
+          const artifactRows = db
+            .prepare(
+              `SELECT id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+               FROM artifacts
+               WHERE conversation_id = ?
+               ORDER BY updated_at DESC`,
+            )
+            .all(conversation.id) as ArtifactRow[];
+          for (const artifact of artifactRows.map(mapArtifact)) {
+            const markdown = typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : "";
+            add({
+              kind: artifact.kind === "report" ? "report" : "artifact",
+              agentId: agent.id,
+              conversationId: conversation.id,
+              recordId: artifact.id,
+              title: artifact.title,
+              body: `${artifact.title}\n${artifact.summary ?? ""}\n${markdown}`,
+              updatedAt: artifact.updatedAt,
+            });
+          }
+        }
+      }
+
+      for (const project of store.listResearchProjects()) {
+        add({
+          kind: "research_project",
+          agentId: project.agentId,
+          conversationId: project.conversationId,
+          projectId: project.id,
+          recordId: project.id,
+          title: project.title,
+          body: `${project.title}\n${project.objective}\n${project.domain ?? ""}`,
+          updatedAt: project.updatedAt,
+        });
+        for (const question of store.listResearchQuestions(project.id)) {
+          add({
+            kind: "question",
+            agentId: project.agentId,
+            conversationId: project.conversationId,
+            projectId: project.id,
+            recordId: question.id,
+            title: question.question.slice(0, 120),
+            body: question.question,
+            updatedAt: question.updatedAt,
+          });
+        }
+        for (const hypothesis of store.listResearchHypotheses(project.id)) {
+          add({
+            kind: "hypothesis",
+            agentId: project.agentId,
+            conversationId: project.conversationId,
+            projectId: project.id,
+            recordId: hypothesis.id,
+            title: hypothesis.hypothesis.slice(0, 120),
+            body: hypothesis.hypothesis,
+            updatedAt: hypothesis.updatedAt,
+          });
+        }
+        for (const evidence of store.listResearchEvidence(project.id)) {
+          add({
+            kind: "evidence",
+            agentId: project.agentId,
+            conversationId: project.conversationId,
+            projectId: project.id,
+            recordId: evidence.id,
+            title: evidence.claim.slice(0, 120),
+            body: `${evidence.claim}\n${evidence.summary}\n${evidence.uncertainty ?? ""}`,
+            updatedAt: evidence.updatedAt,
+          });
+        }
+      }
+
+      return {
+        indexed,
+        indexMode: searchFtsAvailable(db) ? "fts5" : "like",
+        durationMs: Date.now() - startedAt,
+      };
+    },
+
+    searchDocuments(input: {
+      q: string;
+      agentId?: string | null;
+      conversationId?: string | null;
+      projectId?: string | null;
+      limit?: number;
+      offset?: number;
+    }) {
+      const limit = Math.min(Math.max(input.limit ?? 20, 1), 100);
+      const offset = Math.max(input.offset ?? 0, 0);
+      const filters: string[] = [];
+      const params: unknown[] = [];
+      if (input.agentId) {
+        filters.push("agent_id = ?");
+        params.push(input.agentId);
+      }
+      if (input.conversationId) {
+        filters.push("conversation_id = ?");
+        params.push(input.conversationId);
+      }
+      if (input.projectId) {
+        filters.push("project_id = ?");
+        params.push(input.projectId);
+      }
+
+      const ftsQuery = buildFtsQuery(input.q);
+      if (searchFtsAvailable(db) && ftsQuery) {
+        try {
+          const where = ["aetherops_search_index MATCH ?", ...filters].join(" AND ");
+          const rows = db
+            .prepare(
+              `SELECT kind, agent_id, conversation_id, project_id, record_id, title, redacted_body, updated_at
+               FROM aetherops_search_index
+               WHERE ${where}
+               ORDER BY rank
+               LIMIT ? OFFSET ?`,
+            )
+            .all(ftsQuery, ...params, limit, offset) as Array<{
+              kind: string;
+              agent_id: string | null;
+              conversation_id: string | null;
+              project_id: string | null;
+              record_id: string;
+              title: string;
+              redacted_body: string;
+              updated_at: number;
+            }>;
+          return {
+            results: rows.map((row) => ({
+              kind: row.kind,
+              agentId: row.agent_id,
+              conversationId: row.conversation_id,
+              projectId: row.project_id,
+              recordId: row.record_id,
+              title: row.title,
+              snippet: searchSnippet(row.redacted_body, input.q),
+              updatedAt: row.updated_at,
+            })),
+            indexMode: "fts5" as const,
+          };
+        } catch {
+          // Fall through to LIKE search if a SQLite build or query token rejects FTS.
+        }
+      }
+
+      const likeFilters = ["(title LIKE ? OR redacted_body LIKE ?)"];
+      const likeParams: unknown[] = [`%${input.q}%`, `%${input.q}%`, ...params, limit, offset];
+      const where = [...likeFilters, ...filters].join(" AND ");
+      const rows = db
+        .prepare(
+          `SELECT kind, agent_id, conversation_id, project_id, record_id, title, redacted_body, updated_at
+           FROM search_documents
+           WHERE ${where}
+           ORDER BY updated_at DESC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(...likeParams) as Array<{
+          kind: string;
+          agent_id: string | null;
+          conversation_id: string | null;
+          project_id: string | null;
+          record_id: string;
+          title: string;
+          redacted_body: string;
+          updated_at: number;
+        }>;
+      return {
+        results: rows.map((row) => ({
+          kind: row.kind,
+          agentId: row.agent_id,
+          conversationId: row.conversation_id,
+          projectId: row.project_id,
+          recordId: row.record_id,
+          title: row.title,
+          snippet: searchSnippet(row.redacted_body, input.q),
+          updatedAt: row.updated_at,
+        })),
+        indexMode: "like" as const,
+      };
     },
 
     recoverStaleRunningWork() {

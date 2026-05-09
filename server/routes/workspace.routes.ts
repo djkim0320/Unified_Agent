@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { z } from "zod";
 import type { createStore } from "../db.js";
 import type { createWorkspaceManager } from "../lib/workspace.js";
-import type { EngineRunRecord, ProviderKind, ReasoningLevel } from "../types.js";
+import type { ArtifactRecord, ArtifactVersionRecord, EngineRunRecord, ProviderKind, ReasoningLevel } from "../types.js";
 import { redactSensitiveText, redactUnknown } from "../lib/redaction.js";
 import { createUnifiedDiff } from "../lib/artifact-diff.js";
 import {
@@ -75,6 +75,81 @@ function isEngineRunRecord(value: unknown): value is EngineRunRecord {
   );
 }
 
+function sendArtifactDiffResponse(
+  response: express.Response,
+  artifact: ArtifactRecord,
+  snapshot: ArtifactVersionRecord | null,
+) {
+  if (!snapshot) {
+    response.json({
+      artifact,
+      diff: {
+        available: false,
+        reason: "No before snapshot is available. Only current file preview can be shown.",
+      },
+    });
+    return;
+  }
+  if (snapshot.binary || snapshot.truncated || snapshot.unsupportedEncoding) {
+    response.json({
+      artifact,
+      diff: {
+        available: false,
+        reason: snapshot.binary
+          ? "Binary files cannot produce a text diff."
+          : snapshot.unsupportedEncoding
+            ? "Unsupported text encoding cannot produce a diff."
+            : "The snapshot exceeded the configured diff storage limit.",
+        binary: snapshot.binary,
+        truncated: snapshot.truncated,
+        unsupportedEncoding: snapshot.unsupportedEncoding,
+      },
+    });
+    return;
+  }
+  if (snapshot.afterContent == null) {
+    response.json({
+      artifact,
+      diff: {
+        available: false,
+        reason: "The file was deleted or no text snapshot is available for diff generation.",
+      },
+    });
+    return;
+  }
+  const diff = createUnifiedDiff(artifact.path ?? snapshot.path, snapshot.beforeContent, snapshot.afterContent);
+  response.json({
+    artifact,
+    diff: diff.available
+      ? {
+          available: true,
+          reason: snapshot.beforeContent == null ? "new-file" : "snapshot",
+          content: diff.content,
+          binary: false,
+          truncated: false,
+          sizeBytes: diff.sizeBytes,
+          maxBytes: diff.maxBytes,
+          lineCountBefore: diff.lineCountBefore,
+          lineCountAfter: diff.lineCountAfter,
+          maxLines: diff.maxLines,
+          maxMatrixCells: diff.maxMatrixCells,
+          matrixCells: diff.matrixCells,
+        }
+      : {
+          available: false,
+          reason: diff.reason,
+          binary: false,
+          truncated: diff.truncated,
+          sizeBytes: diff.sizeBytes,
+          maxBytes: diff.maxBytes,
+          lineCountBefore: diff.lineCountBefore,
+          lineCountAfter: diff.lineCountAfter,
+          maxLines: diff.maxLines,
+          maxMatrixCells: diff.maxMatrixCells,
+          matrixCells: diff.matrixCells,
+        },
+  });
+}
 function buildSafeRunDebugRecord(run: ReturnType<WorkspaceRouteStore["getWorkspaceRunForConversation"]>) {
   if (!run) {
     return null;
@@ -418,64 +493,7 @@ export function registerWorkspaceRoutes(
       return;
     }
     const snapshot = store.getArtifactVersion?.(artifact.id) ?? null;
-    if (!snapshot) {
-      response.json({
-        artifact,
-        diff: {
-          available: false,
-          reason: "변경 전 기준이 없어 diff를 만들 수 없습니다. 현재 파일 미리보기만 제공됩니다.",
-        },
-      });
-      return;
-    }
-    if (snapshot.binary || snapshot.truncated) {
-      response.json({
-        artifact,
-        diff: {
-          available: false,
-          reason: snapshot.binary
-            ? "바이너리 파일은 텍스트 diff를 만들 수 없습니다."
-            : "스냅샷이 너무 커서 diff 저장 한도를 초과했습니다.",
-          binary: snapshot.binary,
-          truncated: snapshot.truncated,
-        },
-      });
-      return;
-    }
-    if (snapshot.afterContent == null) {
-      response.json({
-        artifact,
-        diff: {
-          available: false,
-          reason: "삭제되었거나 텍스트 스냅샷이 없어 diff를 만들 수 없습니다.",
-        },
-      });
-      return;
-    }
-    response.json({
-      artifact,
-      diff: (() => {
-        const diff = createUnifiedDiff(artifact.path ?? snapshot.path, snapshot.beforeContent, snapshot.afterContent);
-        return diff.available
-          ? {
-              available: true,
-              reason: snapshot.beforeContent == null ? "new-file" : "snapshot",
-              content: diff.content,
-              binary: false,
-              truncated: false,
-              sizeBytes: diff.sizeBytes,
-              maxBytes: diff.maxBytes,
-            }
-          : {
-              available: false,
-              reason: diff.reason,
-              binary: false,
-              truncated: diff.truncated,
-              sizeBytes: diff.sizeBytes,
-              maxBytes: diff.maxBytes,
-            };
-      })(),
-    });
+    return sendArtifactDiffResponse(response, artifact, snapshot);
   });
 
   app.get("/api/runs/:runId/debug", async (request, response) => {

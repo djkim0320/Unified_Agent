@@ -286,18 +286,20 @@ These features improve observability without adding another execution runtime.
 - Summary routes: `GET /api/conversations/:id/summary`, `PUT /api/conversations/:id/summary`, `POST /api/conversations/:id/summary/refresh`, `POST /api/conversations/:id/summary/refresh-task`, `GET /api/conversations/:id/summary/suggestions`, `POST /api/conversations/:id/summary/apply-suggestion`.
 - Artifact routes: `GET /api/runs/:runId/artifacts?conversationId=<id>`, `GET /api/artifacts/:artifactId/preview?mode=redacted|full`, `GET /api/artifacts/:artifactId/diff`.
 - Debug route: `GET /api/runs/:runId/debug?conversationId=<id>`.
-- Search/export routes: `GET /api/search?q=...&agentId=...&conversationId=...`, `GET /api/conversations/:id/export?mode=redacted|full`, `POST /api/conversations/import`.
+- Search/export routes: `GET /api/search?q=...&agentId=...&conversationId=...&projectId=...`, `POST /api/search/rebuild`, `GET /api/conversations/:id/export?mode=redacted|full`, `POST /api/conversations/import`.
 
 Safety invariants:
 
 - artifact paths are stored and returned as relative paths
 - preview is read-only and tied to the artifact's run/conversation ownership
 - preview prefers `artifact_versions.after_content`, falling back to current workspace only with an explicit source flag
-- snapshot capture uses capped text storage and streaming hashing; invalid UTF-8 is reported as unsupported encoding instead of rendered as mojibake
-- diff is only produced from real before/after snapshots; binary, truncated, oversized, or baseline-less cases return a structured unavailable reason
+- snapshot capture uses a two-phase metadata-first scan. AetherOps only reads/hashes changed files for artifact snapshots; large workspaces degrade with `snapshot_degraded` run events instead of failing normal runs.
+- diff is only produced from real before/after snapshots; binary, truncated, unsupported encoding, oversized, baseline-less, or excessive line/matrix complexity cases return a structured unavailable reason
 - debugger/report export defaults to redacted content and keeps prompt/result text presence as booleans
 - full report/artifact/session export requires a valid local API token header or explicit local-only full-export flag; never make full export the default UI path
-- search indexes AetherOps records only and returns redacted snippets; it does not crawl workspace files
+- search indexes AetherOps records only and returns redacted snippets; it uses SQLite FTS5 when available and falls back to LIKE search without crawling workspace files
+- research loop proposal/start/preflight use the same budget policy evaluator, so `autoStart` and manual start cannot bypass daily/consecutive/task-count or approval-gate requirements
+- completed research loop evidence extraction stores deterministic extraction keys to avoid duplicate evidence when a linked Flow is synced more than once
 - session import restores safe planning, summary, report, and flow metadata into a new session; it does not import provider secrets, workspace files, or historical execution state
 
 ## 4. Frontend Architecture

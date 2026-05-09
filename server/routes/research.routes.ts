@@ -17,14 +17,9 @@ import {
   type AppStore,
 } from "./context.js";
 import { buildTaskFlowResponse } from "../lib/task-flow-response.js";
-
-type ResearchFlowStepDraft = {
-  stepKey: string;
-  title: string;
-  prompt: string;
-  dependencyStepKey: string | null;
-  stepKind: "task" | "approval_gate" | "verification_gate";
-};
+import { evaluateResearchBudget } from "../lib/research/budget-policy.js";
+import { buildResearchLoopSteps } from "../lib/research/loop-planner.js";
+import { buildResearchReportMarkdown } from "../lib/research/report-builder.js";
 
 const ResearchProjectCreateSchema = z.object({
   agentId: z.string().min(1).max(120),
@@ -101,6 +96,11 @@ const SearchQuerySchema = z.object({
   conversationId: z.string().uuid().optional(),
 });
 
+const ListQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional().default(50),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+
 function mergeBudget(value: Record<string, unknown> | undefined): ResearchAutonomyBudget {
   return {
     ...DEFAULT_RESEARCH_AUTONOMY_BUDGET,
@@ -125,6 +125,14 @@ function mergePolicy(value: Record<string, unknown> | undefined): ResearchSafety
       ? value.approvalRequiredActions.filter((item): item is string => typeof item === "string")
       : DEFAULT_RESEARCH_SAFETY_POLICY.approvalRequiredActions,
   } as ResearchSafetyPolicy;
+}
+
+function dangerousAutoApproveEnabled() {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env.AETHEROPS_OPENCODE_AUTO_APPROVE ?? process.env.AETHEROPS_OPENCODE_DANGEROUS_SKIP_PERMISSIONS ?? "")
+      .trim()
+      .toLowerCase(),
+  );
 }
 
 function requireResearchProject(store: AppStore, response: express.Response, projectId: string) {
@@ -157,123 +165,6 @@ function resolveProjectConversation(store: AppStore, project: ResearchProjectRec
   );
 }
 
-function linearlyDependentSteps(project: ResearchProjectRecord, question: string, goal: string): ResearchFlowStepDraft[] {
-  const base = [
-    {
-      stepKey: "research-plan",
-      title: "연구 계획 수립",
-      prompt: [
-        `Research objective: ${project.objective}`,
-        `Focused question: ${question}`,
-        `Loop goal: ${goal}`,
-        "Produce a bounded research plan. Do not execute external or irreversible actions.",
-      ].join("\n"),
-      stepKind: "task" as const,
-    },
-    {
-      stepKey: "evidence-gathering",
-      title: "증거 수집",
-      prompt: "Inspect existing local reports, artifacts, summaries, and opencode-accessible project files. Gather evidence without fabricating citations.",
-      stepKind: "task" as const,
-    },
-    {
-      stepKey: "hypothesis-update",
-      title: "가설 갱신",
-      prompt: "Update hypotheses based on gathered evidence. Use sections: Claims, Evidence, Uncertainty, Next questions.",
-      stepKind: "task" as const,
-    },
-    {
-      stepKey: "operator-approval",
-      title: "운영자 승인",
-      prompt: "Human checkpoint before synthesis or any external/high-risk work.",
-      stepKind: "approval_gate" as const,
-    },
-    {
-      stepKey: "synthesis",
-      title: "종합",
-      prompt: "Synthesize findings into a concise research result. Keep uncertainty explicit.",
-      stepKind: "task" as const,
-    },
-    {
-      stepKey: "verification",
-      title: "검증",
-      prompt: "Verify claims against local evidence. List assumptions, gaps, and reproducibility notes.",
-      stepKind: "verification_gate" as const,
-    },
-    {
-      stepKey: "next-actions",
-      title: "다음 실험 제안",
-      prompt: "Recommend the next bounded research loop or stop condition. Do not invent external source claims.",
-      stepKind: "task" as const,
-    },
-  ];
-  return base.map((step, index) => ({
-    ...step,
-    dependencyStepKey: index === 0 ? null : base[index - 1].stepKey,
-  }));
-}
-
-function buildResearchReportMarkdown(input: {
-  project: ResearchProjectRecord;
-  questions: ReturnType<AppStore["listResearchQuestions"]>;
-  hypotheses: ReturnType<AppStore["listResearchHypotheses"]>;
-  evidence: ReturnType<AppStore["listResearchEvidence"]>;
-  loops: ResearchLoopRecord[];
-}) {
-  const { project, questions, hypotheses, evidence, loops } = input;
-  const evidenceLines = evidence.map(
-    (item) =>
-      `| ${item.claim.replace(/\|/g, "/")} | ${item.sourceType}:${item.sourceRef ?? "-"} | ${item.confidence.toFixed(2)} | ${
-        item.uncertainty ? item.uncertainty.replace(/\|/g, "/") : "-"
-      } |`,
-  );
-  return [
-    `# Research Report: ${project.title}`,
-    "",
-    "## Objective",
-    project.objective,
-    "",
-    "## Method",
-    "AetherOps collected local session, flow, task, run, report, and artifact records. Execution, when used, was routed through opencode-backed tasks/flows only.",
-    "",
-    "## Findings",
-    evidence.length
-      ? evidence.map((item) => `- ${item.claim} (confidence ${item.confidence.toFixed(2)})`).join("\n")
-      : "- No evidence has been recorded yet.",
-    "",
-    "## Evidence table",
-    "| Claim | Source | Confidence | Uncertainty |",
-    "| --- | --- | --- | --- |",
-    ...(evidenceLines.length ? evidenceLines : ["| No evidence | - | - | - |"]),
-    "",
-    "## Hypotheses and confidence",
-    hypotheses.length
-      ? hypotheses.map((item) => `- ${item.hypothesis}: ${item.status}, confidence ${item.confidence.toFixed(2)}`).join("\n")
-      : "- No hypotheses recorded.",
-    "",
-    "## Uncertainties",
-    evidence.some((item) => item.uncertainty)
-      ? evidence.filter((item) => item.uncertainty).map((item) => `- ${item.uncertainty}`).join("\n")
-      : "- No explicit uncertainty recorded yet.",
-    "",
-    "## Reproducibility notes",
-    `- Questions tracked: ${questions.length}`,
-    `- Loops tracked: ${loops.length}`,
-    "- No provider secrets or workspace files are embedded in this report.",
-    "",
-    "## Next experiments",
-    questions
-      .filter((item) => item.status === "open" || item.status === "investigating")
-      .slice(0, 5)
-      .map((item) => `- ${item.question}`)
-      .join("\n") || "- No open questions remain.",
-    "",
-    "## Appendix: linked records",
-    loops.map((loop) => `- Loop ${loop.id}: ${loop.status}, flow=${loop.proposedFlowId ?? "-"}`).join("\n") ||
-      "- No loops linked.",
-  ].join("\n");
-}
-
 function snippet(value: string, query: string) {
   const text = redactSensitiveText(value);
   const lower = text.toLowerCase();
@@ -282,9 +173,8 @@ function snippet(value: string, query: string) {
     return text.slice(0, 240);
   }
   const start = Math.max(0, index - 80);
-  return `${start > 0 ? "..." : ""}${text.slice(start, index + query.length + 160)}${
-    index + query.length + 160 < text.length ? "..." : ""
-  }`;
+  const end = Math.min(text.length, index + query.length + 160);
+  return `${start > 0 ? "..." : ""}${text.slice(start, end)}${end < text.length ? "..." : ""}`;
 }
 
 export function registerResearchRoutes(
@@ -443,7 +333,12 @@ export function registerResearchRoutes(
     if (!project) {
       return;
     }
-    response.json({ evidence: store.listResearchEvidence(project.id) });
+    const query = ListQuerySchema.parse(request.query);
+    const evidence = store.listResearchEvidence(project.id);
+    response.json({
+      evidence: evidence.slice(query.offset, query.offset + query.limit),
+      pagination: { total: evidence.length, limit: query.limit, offset: query.offset },
+    });
   });
 
   app.post("/api/research/projects/:projectId/evidence", (request, response) => {
@@ -473,7 +368,12 @@ export function registerResearchRoutes(
     if (!project) {
       return;
     }
-    response.json({ loops: store.listResearchLoops(project.id) });
+    const query = ListQuerySchema.parse(request.query);
+    const loops = store.listResearchLoops(project.id);
+    response.json({
+      loops: loops.slice(query.offset, query.offset + query.limit),
+      pagination: { total: loops.length, limit: query.limit, offset: query.offset },
+    });
   });
 
   app.post("/api/research/projects/:projectId/loops/propose", async (request, response) => {
@@ -482,15 +382,30 @@ export function registerResearchRoutes(
       return;
     }
     const body = ResearchLoopProposeSchema.parse(request.body ?? {});
-    if (body.autoStart && !project.autonomyEnabled) {
-      response.status(409).json({ error: "Research autonomy is disabled for this project." });
-      return;
-    }
     const questions = store.listResearchQuestions(project.id);
     const question =
       (body.questionId ? questions.find((item) => item.id === body.questionId) : null) ??
       questions.find((item) => item.status === "open" || item.status === "investigating") ??
       null;
+    const proposedSteps = question ? buildResearchLoopSteps(project, question.question, body.goal?.trim() || question.question) : [];
+    const budgetEvaluation = evaluateResearchBudget({
+      project,
+      loops: store.listResearchLoops(project.id),
+      questions,
+      proposedStepCount: proposedSteps.length,
+      autoStart: body.autoStart,
+      approvalGatePresent: proposedSteps.some((step) => step.stepKind === "approval_gate"),
+      dangerousAutoApprove: dangerousAutoApproveEnabled(),
+    });
+    if (budgetEvaluation.blocked && (body.autoStart || !question || project.status !== "active")) {
+      response.status(409).json({
+        error: "Research loop budget check failed.",
+        reasons: budgetEvaluation.errors,
+        warnings: budgetEvaluation.warnings,
+        evaluation: budgetEvaluation,
+      });
+      return;
+    }
     if (!question) {
       response.status(409).json({ error: "At least one open research question is required." });
       return;
@@ -507,7 +422,7 @@ export function registerResearchRoutes(
       conversationId: conversation.id,
       title: `${project.title}: ${question.question.slice(0, 80)}`,
       autoStart: false,
-      steps: linearlyDependentSteps(project, question.question, narrowedGoal),
+      steps: proposedSteps,
     });
     const updatedLoop = store.transitionResearchLoop({
       loopId: loop.id,
@@ -522,6 +437,7 @@ export function registerResearchRoutes(
       loop: store.getResearchLoop(updatedLoop.id),
       flow: buildTaskFlowResponse(store, flow).flow,
       steps: buildTaskFlowResponse(store, flow).steps,
+      budget: budgetEvaluation,
     });
   });
 
@@ -535,10 +451,35 @@ export function registerResearchRoutes(
       response.status(409).json({ error: "Research loop has no linked flow to start." });
       return;
     }
+    const project = store.getResearchProject(loop.projectId);
+    if (!project) {
+      response.status(404).json({ error: "Research project not found." });
+      return;
+    }
+    const flowSteps = store.listTaskFlowSteps(loop.proposedFlowId);
+    const budgetEvaluation = evaluateResearchBudget({
+      project,
+      loops: store.listResearchLoops(project.id).filter((item) => item.id !== loop.id),
+      questions: store.listResearchQuestions(project.id),
+      proposedStepCount: flowSteps.length,
+      manualStart: true,
+      approvalGatePresent: flowSteps.some((step) => step.stepKind === "approval_gate"),
+      dangerousAutoApprove: dangerousAutoApproveEnabled(),
+    });
+    if (budgetEvaluation.blocked) {
+      response.status(409).json({
+        error: "Research loop budget check failed.",
+        reasons: budgetEvaluation.errors,
+        warnings: budgetEvaluation.warnings,
+        evaluation: budgetEvaluation,
+      });
+      return;
+    }
     await gateway.taskManager.startTaskFlow(loop.proposedFlowId);
     response.json({
       loop: store.transitionResearchLoop({ loopId: loop.id, status: "running", clearErrorText: true }),
       flow: store.getTaskFlow(loop.proposedFlowId),
+      budget: budgetEvaluation,
     });
   });
 
@@ -569,17 +510,20 @@ export function registerResearchRoutes(
     const agent = store.getAgent(project.agentId);
     const questions = store.listResearchQuestions(project.id);
     const loops = store.listResearchLoops(project.id);
-    const checks: Array<{ id: string; label: string; status: "ok" | "warn" | "error"; message: string }> = [];
-    checks.push(project.status === "active" ? { id: "project", label: "Project", status: "ok", message: "연구 프로젝트가 활성 상태입니다." } : { id: "project", label: "Project", status: "error", message: "활성 상태의 연구 프로젝트만 Loop를 시작할 수 있습니다." });
-    checks.push(agent ? { id: "agent", label: "Agent", status: "ok", message: `${agent.name} 에이전트가 연결되어 있습니다.` } : { id: "agent", label: "Agent", status: "error", message: "연결된 에이전트를 찾을 수 없습니다." });
-    checks.push(questions.some((item) => item.status === "open" || item.status === "investigating") ? { id: "questions", label: "Questions", status: "ok", message: "열린 연구 질문이 있습니다." } : { id: "questions", label: "Questions", status: "warn", message: "열린 연구 질문이 없습니다." });
-    const today = Date.now() - 24 * 60 * 60 * 1000;
-    const loopsToday = loops.filter((loop) => loop.createdAt >= today).length;
-    checks.push(
-      loopsToday < project.autonomyBudget.maxLoopsPerDay
-        ? { id: "budget", label: "Budget", status: "ok", message: `오늘 Loop ${loopsToday}/${project.autonomyBudget.maxLoopsPerDay}개 사용.` }
-        : { id: "budget", label: "Budget", status: "error", message: "일일 Loop 예산을 초과했습니다." },
-    );
+    {
+    const budgetEvaluation = evaluateResearchBudget({
+      project,
+      loops,
+      questions,
+      approvalGatePresent: true,
+      dangerousAutoApprove: dangerousAutoApproveEnabled(),
+    });
+    const checks: Array<{ id: string; label: string; status: "ok" | "warn" | "error"; message: string }> = [
+      ...budgetEvaluation.checks,
+      agent
+        ? { id: "agent", label: "Agent", status: "ok", message: `${agent.name} ?먯씠?꾪듃媛 ?곌껐?섏뼱 ?덉뒿?덈떎.` }
+        : { id: "agent", label: "Agent", status: "error", message: "?곌껐???먯씠?꾪듃瑜?李얠쓣 ???놁뒿?덈떎." },
+    ];
     if (agent) {
       const engine = withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store, {
         providerKind: agent.providerKind,
@@ -592,26 +536,34 @@ export function registerResearchRoutes(
               id: "opencode",
               label: "opencode",
               status: engine.available ? "warn" : "error",
-              message: engine.authEvidence?.message ?? engine.lastFailure ?? "opencode 준비 상태를 확인해야 합니다.",
+              message: engine.authEvidence?.message ?? engine.lastFailure ?? "opencode 以鍮??곹깭瑜??뺤씤?댁빞 ?⑸땲??",
             },
       );
       checks.push(
         engine.environment.autoApprovePermissions
-          ? { id: "permissions", label: "Permissions", status: "warn", message: "위험 권한 자동 승인 플래그가 켜져 있습니다." }
-          : { id: "permissions", label: "Permissions", status: "ok", message: "위험 권한 자동 승인 플래그가 꺼져 있습니다." },
+          ? {
+              id: "permissions",
+              label: "Permissions",
+              status: "warn",
+              message: "?꾪뿕 沅뚰븳 ?먮룞 ?뱀씤 ?뚮옒洹멸? 耳쒖졇 ?덉뒿?덈떎. ?곌뎄 ?ㅽ뻾 ???뺤씤???꾩슂?⑸땲??",
+            }
+          : {
+              id: "permissions",
+              label: "Permissions",
+              status: "ok",
+              message: "?꾪뿕 沅뚰븳 ?먮룞 ?뱀씤 ?뚮옒洹멸? 爰쇱졇 ?덉뒿?덈떎.",
+            },
       );
     }
-    checks.push(
-      project.autonomyEnabled
-        ? { id: "autonomy", label: "Autonomy", status: "ok", message: "자율 Loop 실행이 켜져 있습니다. 그래도 승인 게이트는 유지됩니다." }
-        : { id: "autonomy", label: "Autonomy", status: "warn", message: "자율 실행은 꺼져 있습니다. 제안과 수동 시작은 가능합니다." },
-    );
     response.json({
       ok: !checks.some((check) => check.status === "error"),
       checks,
       budget: project.autonomyBudget,
       safetyPolicy: project.safetyPolicy,
+      evaluation: budgetEvaluation,
     });
+    return;
+    }
   });
 
   app.post("/api/research/projects/:projectId/report", (request, response) => {

@@ -45,6 +45,7 @@ vi.mock("./api", () => ({
   getMcpConfigStatus: vi.fn(),
   getPreflightStatus: vi.fn(),
   getRunDebug: vi.fn(),
+  getTokenUsageSummary: vi.fn(),
   getResearchPreflight: vi.fn(),
   getResearchProject: vi.fn(),
   getTaskFlow: vi.fn(),
@@ -75,8 +76,13 @@ vi.mock("./api", () => ({
   createResearchQuestion: vi.fn(),
   createResearchHypothesis: vi.fn(),
   createResearchEvidence: vi.fn(),
+  createResearchSource: vi.fn(),
   proposeResearchLoop: vi.fn(),
+  startResearchGoal: vi.fn(),
+  startSelfImprovementGoal: vi.fn(),
   startResearchLoop: vi.fn(),
+  stopResearchGoal: vi.fn(),
+  tickResearchGoal: vi.fn(),
   cancelResearchLoop: vi.fn(),
   createResearchReport: vi.fn(),
   createResearchReportTask: vi.fn(),
@@ -333,6 +339,32 @@ function mockDefaults() {
     messages: [],
   });
   vi.mocked(api.getEngineStatus).mockResolvedValue(engineStatus);
+  vi.mocked(api.getTokenUsageSummary).mockResolvedValue({
+    usage: {
+      inputTokens: 1200,
+      outputTokens: 800,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 2000,
+      runsWithUsage: 2,
+      lastUpdatedAt: 2,
+      byModel: [
+        {
+          providerKind: "openai-codex",
+          model: "gpt-5.5",
+          inputTokens: 1200,
+          outputTokens: 800,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 2000,
+          runsWithUsage: 2,
+          lastUpdatedAt: 2,
+        },
+      ],
+      source: "opencode-events",
+      note: "test usage",
+    },
+  });
   vi.mocked(api.getMcpCatalog).mockResolvedValue({
     boundary: "AetherOps는 MCP를 직접 실행하지 않습니다.",
     servers: [
@@ -820,12 +852,11 @@ describe("App frontend", () => {
     expect(container.querySelector(".chat-panel__current-model")).not.toBeInTheDocument();
     expect(shell.queryByRole("button", { name: "프로바이더" })).not.toBeInTheDocument();
 
-    await user.click(await shell.findByRole("button", { name: "워크플로우" }));
+    expect(await shell.findByText("프로젝트")).toBeInTheDocument();
+    expect(await shell.findByRole("button", { name: "채팅" })).toBeInTheDocument();
+    expect(shell.queryByRole("button", { name: "워크플로우" })).not.toBeInTheDocument();
 
-    expect(await shell.findByRole("heading", { name: "워크플로우 관제" })).toBeInTheDocument();
-    expect(await shell.findByRole("heading", { name: "Outline으로 빠르게 만들기" })).toBeInTheDocument();
-
-    await user.click(await shell.findByRole("button", { name: "MCP" }));
+    await user.click(await shell.findByRole("button", { name: "플러그인" }));
     expect(await shell.findByRole("heading", { name: "MCP 서버 관리" })).toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "연결 후보" })).toBeInTheDocument();
 
@@ -840,7 +871,7 @@ describe("App frontend", () => {
     const user = userEvent.setup();
 
     await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
-    await user.click(await shell.findByRole("button", { name: "설정 탭" }));
+    await user.click(await shell.findByRole("button", { name: "자동화" }));
 
     expect(await shell.findByRole("heading", { name: "로컬 실행 환경을 한곳에서 관리합니다" })).toBeInTheDocument();
     expect(await shell.findByRole("heading", { name: "opencode 엔진" })).toBeInTheDocument();
@@ -903,7 +934,7 @@ describe("App frontend", () => {
     const user = userEvent.setup();
 
     await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
-    await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
+    await user.click(await shell.findByRole("button", { name: "에이전트 설정" }));
 
     const dialog = await waitFor(() => {
       const node = container.querySelector('[role="dialog"]');
@@ -921,7 +952,7 @@ describe("App frontend", () => {
     const user = userEvent.setup();
 
     await shell.findByRole("heading", { name: "어떤 작업을 시작할까요?" });
-    await user.click(container.querySelector(".conversation-list__action-button") as HTMLElement);
+    await user.click(await shell.findByRole("button", { name: "에이전트 설정" }));
 
     const dialog = await waitFor(() => {
       const node = container.querySelector('[role="dialog"]');

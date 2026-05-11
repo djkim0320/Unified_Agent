@@ -62,6 +62,7 @@ interface ExtensionsSectionViewProps {
   onRefreshSkillTemplates: () => void;
   onTriggerHeartbeat: () => void;
   onUpdateCustomSkill: (template: SkillTemplateRecord, payload: CustomSkillPayload) => void;
+  onApplyMcpSnippet: (snippet: string) => void;
   onValidateMcpSnippet: (snippet: string) => void;
 }
 
@@ -237,6 +238,7 @@ export function ExtensionsSectionView({
   onRefreshSkillTemplates,
   onTriggerHeartbeat,
   onUpdateCustomSkill,
+  onApplyMcpSnippet,
   onValidateMcpSnippet,
 }: ExtensionsSectionViewProps) {
   const [copyState, setCopyState] = useState<string | null>(null);
@@ -445,6 +447,14 @@ export function ExtensionsSectionView({
               </button>
               <button className="cockpit-mini-button" onClick={() => copyText("MCP 스니펫", snippetDraft)} type="button">
                 스니펫 복사
+              </button>
+              <button
+                className="cockpit-mini-button is-primary"
+                disabled={!snippetDraft.trim() || mcpSnippetValidation?.ok === false}
+                onClick={() => onApplyMcpSnippet(snippetDraft)}
+                type="button"
+              >
+                opencode에 적용
               </button>
             </div>
             {mcpSnippetValidation ? (

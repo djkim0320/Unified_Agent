@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getTokenUsageSummary } from "../api";
 import { getModelOption } from "../model-catalog";
 import { getReasoningLabel } from "../reasoning-options";
 import {
@@ -13,6 +14,7 @@ import {
   type PlatformMetadata,
   type ProviderKind,
   type ProviderSummary,
+  type TokenUsageSummary,
 } from "../types";
 
 interface AutomationRuleDraft {
@@ -97,6 +99,29 @@ function formatDate(value: number | string | null | undefined) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(timestamp));
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat("ko-KR").format(value);
+}
+
+function formatCompactNumber(value: number) {
+  return new Intl.NumberFormat("ko-KR", {
+    notation: value >= 100_000 ? "compact" : "standard",
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
+function displayPathName(value: string | null | undefined, fallback: string) {
+  if (!value?.trim()) {
+    return fallback;
+  }
+  if (value.includes("[path")) {
+    return value;
+  }
+  const normalized = value.replace(/\\/g, "/");
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.at(-1) ?? fallback;
 }
 
 function providerStatusLabel(provider: ProviderSummary | undefined) {
@@ -240,6 +265,8 @@ export function SettingsSectionView({
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   const [editingRuleDraft, setEditingRuleDraft] = useState<AutomationRuleDraft>(createEmptyRuleDraft);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [tokenUsage, setTokenUsage] = useState<TokenUsageSummary | null>(null);
+  const [tokenUsageError, setTokenUsageError] = useState<string | null>(null);
 
   const configuredProviderCount = providers.filter(
     (provider) => provider.configured || provider.status !== "disconnected",
@@ -261,6 +288,23 @@ export function SettingsSectionView({
     engineStatus?.credentialSync?.entries.filter((entry) => entry.configured) ?? [];
   const latestHeartbeat = heartbeatLogs[0] ?? null;
   const triggeringRuleIds = new Set(triggeringAutomationRuleIds);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getTokenUsageSummary(controller.signal)
+      .then((response) => {
+        if (!controller.signal.aborted) {
+          setTokenUsage(response.usage);
+          setTokenUsageError(null);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setTokenUsageError(error instanceof Error ? error.message : "토큰 사용량을 불러오지 못했습니다.");
+        }
+      });
+    return () => controller.abort();
+  }, []);
 
   function submitNewRule() {
     const validation = validateRuleDraft(newRuleDraft);
@@ -332,6 +376,10 @@ export function SettingsSectionView({
           <span>자동화 규칙</span>
           <strong>{automationRules.length}</strong>
         </div>
+        <div className="settings-summary-chip">
+          <span>누적 토큰</span>
+          <strong>{tokenUsage ? formatCompactNumber(tokenUsage.totalTokens) : "확인 중"}</strong>
+        </div>
       </section>
 
       <div className="settings-view__grid">
@@ -353,7 +401,9 @@ export function SettingsSectionView({
           <div className="settings-kv-grid">
             <div>
               <span>실행 파일</span>
-              <strong>{engineStatus?.executable ?? "opencode"}</strong>
+              <strong title={engineStatus?.executable ?? undefined}>
+                {displayPathName(engineStatus?.executable, "opencode")}
+              </strong>
             </div>
             <div>
               <span>소스</span>
@@ -373,7 +423,9 @@ export function SettingsSectionView({
             </div>
             <div>
               <span>Config dir</span>
-              <strong>{engineStatus?.configDir ?? "기본 opencode 설정"}</strong>
+              <strong title={engineStatus?.configDir ?? undefined}>
+                {displayPathName(engineStatus?.configDir, "기본 opencode 설정")}
+              </strong>
             </div>
             <div>
               <span>권한 자동 승인</span>
@@ -468,6 +520,61 @@ export function SettingsSectionView({
               Codex 해제
             </button>
           </div>
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-panel__header">
+            <div>
+              <p className="settings-panel__eyebrow">Token Usage</p>
+              <h2>토큰 사용량</h2>
+              <p>opencode 실행 이벤트가 보고한 모델 토큰 사용량을 로컬 기록에서 집계합니다.</p>
+            </div>
+          </div>
+
+          <div className="settings-token-meter">
+            <div>
+              <span>총 사용량</span>
+              <strong>{formatNumber(tokenUsage?.totalTokens ?? 0)}</strong>
+              <small>tokens</small>
+            </div>
+            <div>
+              <span>입력</span>
+              <strong>{formatNumber(tokenUsage?.inputTokens ?? 0)}</strong>
+            </div>
+            <div>
+              <span>출력</span>
+              <strong>{formatNumber(tokenUsage?.outputTokens ?? 0)}</strong>
+            </div>
+            <div>
+              <span>집계 Run</span>
+              <strong>{formatNumber(tokenUsage?.runsWithUsage ?? 0)}</strong>
+            </div>
+          </div>
+
+          {tokenUsage?.cacheReadTokens || tokenUsage?.cacheWriteTokens ? (
+            <div className="settings-note">
+              캐시 읽기 {formatNumber(tokenUsage.cacheReadTokens)} / 캐시 쓰기 {formatNumber(tokenUsage.cacheWriteTokens)}
+            </div>
+          ) : null}
+
+          {tokenUsage?.byModel.length ? (
+            <div className="settings-token-list">
+              {tokenUsage.byModel.slice(0, 4).map((item) => (
+                <div className="settings-token-row" key={`${item.providerKind}-${item.model}`}>
+                  <div>
+                    <strong>{item.model}</strong>
+                    <span>{item.providerKind ?? "provider"} / {item.runsWithUsage} runs</span>
+                  </div>
+                  <em>{formatNumber(item.totalTokens)}</em>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="settings-note">아직 토큰 사용량을 보고한 opencode Run이 없습니다.</div>
+          )}
+
+          {tokenUsageError ? <div className="settings-warning">{tokenUsageError}</div> : null}
+          <div className="settings-note">{tokenUsage?.note ?? "사용량은 모델 이벤트가 제공할 때만 표시됩니다."}</div>
         </section>
 
         <section className="settings-panel">
@@ -612,7 +719,7 @@ export function SettingsSectionView({
                     value={newRuleDraft.prompt}
                   />
                 </label>
-                <label className="settings-toggle">
+                <label className="settings-inline-toggle">
                   <input
                     checked={newRuleDraft.enabled}
                     onChange={(event) => setNewRuleDraft((draft) => ({ ...draft, enabled: event.target.checked }))}
@@ -675,7 +782,7 @@ export function SettingsSectionView({
                                   value={editingRuleDraft.prompt}
                                 />
                               </label>
-                              <label className="settings-toggle">
+                              <label className="settings-inline-toggle">
                                 <input
                                   checked={editingRuleDraft.enabled}
                                   onChange={(event) =>

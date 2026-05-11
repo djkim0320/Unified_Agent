@@ -51,6 +51,7 @@ export interface AgentEngineRunParams {
   userMessage: string;
   messages: ChatMessage[];
   sessionSummary?: SessionSummaryRecord | null;
+  researchContext?: string | null;
   signal?: AbortSignal;
   unsafeShellEnabled?: boolean;
   isDetachedTask?: boolean;
@@ -60,6 +61,7 @@ export interface AgentEngineRunParams {
   nestingDepth?: number;
   conversationTitle?: string;
   parentRunId?: string | null;
+  workspaceMode?: "session" | "repository";
   sendEvent: (eventName: string, payload: Record<string, unknown>) => void;
 }
 

@@ -54,6 +54,17 @@ const RESEARCH_EVIDENCE_SOURCE_TYPES = [
   "human_note",
   "external",
 ] as const;
+const PROJECT_DOCUMENT_SOURCE_TYPES = [
+  "project",
+  "session_summary",
+  "source",
+  "evidence",
+  "artifact",
+  "report",
+  "flow",
+  "task",
+  "manual",
+] as const;
 const RESEARCH_LOOP_STATUSES = [
   "queued",
   "running",
@@ -198,6 +209,20 @@ export function createResearchProjectsSql(tableName: string) {
   `;
 }
 
+export function createResearchProjectSessionsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      role TEXT NOT NULL DEFAULT 'member',
+      include_in_context INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id, conversation_id)
+    );
+  `;
+}
+
 export function createResearchQuestionsSql(tableName: string) {
   return `
     CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -247,6 +272,30 @@ export function createResearchEvidenceSql(tableName: string) {
   `;
 }
 
+export function createResearchSourcesSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      evidence_id TEXT REFERENCES research_evidence(id) ON DELETE SET NULL,
+      url TEXT,
+      title TEXT NOT NULL,
+      author TEXT,
+      institution TEXT,
+      published_at TEXT,
+      accessed_at TEXT,
+      summary TEXT NOT NULL,
+      quote TEXT,
+      snapshot TEXT,
+      reliability REAL NOT NULL DEFAULT 0.5,
+      related_claim TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+}
+
 export function createResearchLoopsSql(tableName: string) {
   return `
     CREATE TABLE IF NOT EXISTS ${tableName} (
@@ -264,6 +313,43 @@ export function createResearchLoopsSql(tableName: string) {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       completed_at INTEGER
+    );
+  `;
+}
+
+export function createProjectDocumentsSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL CHECK(source_type IN ('${PROJECT_DOCUMENT_SOURCE_TYPES.join("', '")}')),
+      source_ref TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT,
+      uri TEXT,
+      reliability REAL NOT NULL DEFAULT 0.5,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(project_id, source_type, source_ref)
+    );
+  `;
+}
+
+export function createProjectDocumentChunksSql(tableName: string) {
+  return `
+    CREATE TABLE IF NOT EXISTS ${tableName} (
+      id TEXT PRIMARY KEY,
+      document_id TEXT NOT NULL REFERENCES project_documents(id) ON DELETE CASCADE,
+      project_id TEXT NOT NULL REFERENCES research_projects(id) ON DELETE CASCADE,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      redacted_content TEXT NOT NULL,
+      token_hint INTEGER NOT NULL DEFAULT 0,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL,
+      UNIQUE(document_id, chunk_index)
     );
   `;
 }

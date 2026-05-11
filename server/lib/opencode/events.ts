@@ -1,4 +1,5 @@
 import path from "node:path";
+import { aggregateTokenUsage } from "../token-usage.js";
 
 function parseJsonLine(line: string) {
   const trimmed = line.trim();
@@ -92,6 +93,10 @@ export function summarizeJsonEvents(events: unknown[]) {
     counts[type] = (counts[type] ?? 0) + 1;
   }
   return counts;
+}
+
+export function summarizeTokenUsage(events: unknown[]) {
+  return aggregateTokenUsage(events);
 }
 
 export function extractJsonEventErrorText(events: unknown[]) {

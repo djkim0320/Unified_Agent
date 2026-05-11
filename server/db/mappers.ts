@@ -10,6 +10,9 @@ import type {
   MessageRecord,
   ProviderAccountRecord,
   ProviderKind,
+  ProjectDocumentChunkRecord,
+  ProjectDocumentRecord,
+  ProjectDocumentSourceType,
   ReasoningLevel,
   ResearchAutonomyBudget,
   ResearchEvidenceRecord,
@@ -19,10 +22,12 @@ import type {
   ResearchLoopRecord,
   ResearchLoopStatus,
   ResearchProjectRecord,
+  ResearchProjectSessionRecord,
   ResearchProjectStatus,
   ResearchQuestionRecord,
   ResearchQuestionStatus,
   ResearchSafetyPolicy,
+  ResearchSourceRecord,
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
@@ -206,6 +211,15 @@ export type ResearchQuestionRow = {
   updated_at: number;
 };
 
+export type ResearchProjectSessionRow = {
+  project_id: string;
+  conversation_id: string;
+  role: string;
+  include_in_context: number;
+  created_at: number;
+  updated_at: number;
+};
+
 export type ResearchHypothesisRow = {
   id: string;
   project_id: string;
@@ -231,6 +245,53 @@ export type ResearchEvidenceRow = {
   metadata_json: string;
   created_at: number;
   updated_at: number;
+};
+
+export type ResearchSourceRow = {
+  id: string;
+  project_id: string;
+  evidence_id: string | null;
+  url: string | null;
+  title: string;
+  author: string | null;
+  institution: string | null;
+  published_at: string | null;
+  accessed_at: string | null;
+  summary: string;
+  quote: string | null;
+  snapshot: string | null;
+  reliability: number;
+  related_claim: string | null;
+  metadata_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ProjectDocumentRow = {
+  id: string;
+  project_id: string;
+  source_type: ProjectDocumentSourceType;
+  source_ref: string;
+  title: string;
+  summary: string | null;
+  uri: string | null;
+  reliability: number;
+  confidence: number;
+  metadata_json: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ProjectDocumentChunkRow = {
+  id: string;
+  document_id: string;
+  project_id: string;
+  chunk_index: number;
+  content: string;
+  redacted_content: string;
+  token_hint: number;
+  metadata_json: string;
+  created_at: number;
 };
 
 export type ResearchLoopRow = {
@@ -539,6 +600,17 @@ export function mapResearchProject(row: ResearchProjectRow): ResearchProjectReco
   };
 }
 
+export function mapResearchProjectSession(row: ResearchProjectSessionRow): ResearchProjectSessionRecord {
+  return {
+    projectId: row.project_id,
+    conversationId: row.conversation_id,
+    role: row.role,
+    includeInContext: row.include_in_context === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export function mapResearchQuestion(row: ResearchQuestionRow): ResearchQuestionRecord {
   return {
     id: row.id,
@@ -579,6 +651,59 @@ export function mapResearchEvidence(row: ResearchEvidenceRow): ResearchEvidenceR
     metadata: parseJsonObject(row.metadata_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+export function mapResearchSource(row: ResearchSourceRow): ResearchSourceRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    evidenceId: row.evidence_id,
+    url: row.url,
+    title: row.title,
+    author: row.author,
+    institution: row.institution,
+    publishedAt: row.published_at,
+    accessedAt: row.accessed_at,
+    summary: row.summary,
+    quote: row.quote,
+    snapshot: row.snapshot,
+    reliability: row.reliability,
+    relatedClaim: row.related_claim,
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapProjectDocument(row: ProjectDocumentRow): ProjectDocumentRecord {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    sourceType: row.source_type,
+    sourceRef: row.source_ref,
+    title: row.title,
+    summary: row.summary,
+    uri: row.uri,
+    reliability: row.reliability,
+    confidence: row.confidence,
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function mapProjectDocumentChunk(row: ProjectDocumentChunkRow): ProjectDocumentChunkRecord {
+  return {
+    id: row.id,
+    documentId: row.document_id,
+    projectId: row.project_id,
+    chunkIndex: row.chunk_index,
+    content: row.content,
+    redactedContent: row.redacted_content,
+    tokenHint: row.token_hint,
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
   };
 }
 

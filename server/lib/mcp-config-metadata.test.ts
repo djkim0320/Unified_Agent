@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { validateMcpSnippet } from "./mcp-config-metadata.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { applyMcpSnippetToManagedConfig, validateMcpSnippet } from "./mcp-config-metadata.js";
 
 describe("MCP config metadata", () => {
   it("validates safe opencode MCP snippets without executing MCP servers", () => {
@@ -42,5 +45,46 @@ describe("MCP config metadata", () => {
 
     expect(validation.ok).toBe(false);
     expect(validation.errors.join(" ")).toMatch(/secret|token/i);
+  });
+
+  it("applies validated snippets to the managed opencode config without exposing backup paths", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aetherops-mcp-"));
+    const configPath = path.join(dir, "opencode.json");
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        model: "openai/gpt-5.4",
+        mcp: {
+          filesystem: {
+            type: "stdio",
+            command: "mock-fs",
+          },
+        },
+      }),
+    );
+
+    const result = applyMcpSnippetToManagedConfig({
+      managedConfigPath: configPath,
+      snippet: JSON.stringify({
+        mcp: {
+          github: {
+            type: "stdio",
+            command: "npx",
+            args: ["-y", "@modelcontextprotocol/server-github"],
+            env: {
+              GITHUB_TOKEN: "{env:GITHUB_TOKEN}",
+            },
+          },
+        },
+      }),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.backupCreated).toBe(true);
+    expect(result.backupPath).toBeNull();
+    const written = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    expect(written.model).toBe("openai/gpt-5.4");
+    expect(written.mcp.filesystem.command).toBe("mock-fs");
+    expect(written.mcp.github.command).toBe("npx");
   });
 });

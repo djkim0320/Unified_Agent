@@ -1,5 +1,8 @@
 import { createAbortError } from "./process-control.js";
 import { isEngineRunError } from "./agent-engine.js";
+import { evaluateResearchBudget } from "./research/budget-policy.js";
+import { buildResearchLoopSteps } from "./research/loop-planner.js";
+import { buildResearchRagContext } from "./research/rag-context.js";
 import type {
   AgentHeartbeatRecord,
   AutomationRuleRecord,
@@ -7,6 +10,12 @@ import type {
   HeartbeatLogRecord,
   HeartbeatTriggerSource,
   ProviderKind,
+  ResearchLoopRecord,
+  ResearchProjectRecord,
+  ResearchQuestionRecord,
+  ResearchEvidenceRecord,
+  ResearchHypothesisRecord,
+  ResearchSourceRecord,
   ReasoningLevel,
   TaskKind,
   TaskFlowRecord,
@@ -49,6 +58,14 @@ function dueTimestamp(task: TaskRecord) {
   return task.scheduledFor ?? task.createdAt;
 }
 
+function dangerousAutoApproveEnabled() {
+  return ["1", "true", "yes", "on"].includes(
+    String(process.env.AETHEROPS_OPENCODE_AUTO_APPROVE ?? process.env.AETHEROPS_OPENCODE_DANGEROUS_SKIP_PERMISSIONS ?? "")
+      .trim()
+      .toLowerCase(),
+  );
+}
+
 export function createTaskManager(params: {
   store: {
     createTask: (input: {
@@ -73,6 +90,48 @@ export function createTaskManager(params: {
     listTasksForConversation?: (conversationId: string) => TaskRecord[];
     getConversation?: (conversationId: string) => ConversationRecord | null;
     listAgents?: () => Array<{ id: string }>;
+    listResearchProjects?: (agentId?: string) => ResearchProjectRecord[];
+    listResearchQuestions?: (projectId: string) => ResearchQuestionRecord[];
+    listResearchHypotheses?: (projectId: string) => ResearchHypothesisRecord[];
+    listResearchEvidence?: (projectId: string) => ResearchEvidenceRecord[];
+    listResearchSources?: (projectId: string) => ResearchSourceRecord[];
+    listResearchLoops?: (projectId: string) => ResearchLoopRecord[];
+    createResearchLoop?: (input: {
+      projectId: string;
+      goal: string;
+      selectedQuestionId?: string | null;
+      proposedFlowId?: string | null;
+      taskId?: string | null;
+      runId?: string | null;
+      status?: ResearchLoopRecord["status"];
+    }) => ResearchLoopRecord;
+    transitionResearchLoop?: (input: {
+      loopId: string;
+      status?: ResearchLoopRecord["status"];
+      iteration?: number;
+      goal?: string;
+      selectedQuestionId?: string | null;
+      proposedFlowId?: string | null;
+      taskId?: string | null;
+      runId?: string | null;
+      resultSummary?: string | null;
+      errorText?: string | null;
+      completedAt?: number | null;
+      clearErrorText?: boolean;
+      clearCompletedAt?: boolean;
+    }) => ResearchLoopRecord | null;
+    updateResearchProject?: (input: {
+      projectId: string;
+      title?: string;
+      objective?: string;
+      domain?: string | null;
+      status?: ResearchProjectRecord["status"];
+      autonomyEnabled?: boolean;
+      autonomyBudget?: Partial<ResearchProjectRecord["autonomyBudget"]>;
+      safetyPolicy?: Partial<ResearchProjectRecord["safetyPolicy"]>;
+      completedAt?: number | null;
+    }) => ResearchProjectRecord | null;
+    syncResearchLoopsForFlow?: (flowId: string) => ResearchLoopRecord[];
     listHeartbeatLogs?: (agentId: string) => HeartbeatLogRecord[];
     listDueAutomationRules?: (timestamp: number) => AutomationRuleRecord[];
     enqueueAutomationRuleTask?: (
@@ -851,6 +910,132 @@ export function createTaskManager(params: {
     return task;
   }
 
+  function researchStoreReady() {
+    return Boolean(
+        params.store.listResearchProjects &&
+        params.store.listResearchQuestions &&
+        params.store.listResearchEvidence &&
+        params.store.listResearchSources &&
+        params.store.listResearchLoops &&
+        params.store.createResearchLoop &&
+        params.store.transitionResearchLoop &&
+        params.store.createTaskFlow &&
+        params.store.createTaskFlowStep,
+    );
+  }
+
+  function activeResearchLoop(loops: ResearchLoopRecord[]) {
+    return (
+      loops.find((loop) => loop.status === "running" || loop.status === "waiting_approval") ??
+      loops.find((loop) => loop.status === "queued") ??
+      null
+    );
+  }
+
+  function nextResearchQuestion(questions: ResearchQuestionRecord[]) {
+    return [...questions]
+      .filter((question) => question.status === "open" || question.status === "investigating")
+      .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt)[0] ?? null;
+  }
+
+  async function advanceAutonomousResearchGoal(project: ResearchProjectRecord) {
+    if (!project.autonomyEnabled || project.status !== "active" || !project.conversationId || !researchStoreReady()) {
+      return;
+    }
+
+    const loops = params.store.listResearchLoops!(project.id);
+    const activeLoop = activeResearchLoop(loops);
+    if (activeLoop) {
+      if (!activeLoop.proposedFlowId) {
+        return;
+      }
+      const flow = params.store.getTaskFlow?.(activeLoop.proposedFlowId) ?? null;
+      if (!flow) {
+        params.store.transitionResearchLoop?.({
+          loopId: activeLoop.id,
+          status: "failed",
+          errorText: "Linked TaskFlow was not found.",
+          completedAt: Date.now(),
+        });
+        return;
+      }
+      if (flow.status === "completed" || flow.status === "failed" || flow.status === "cancelled") {
+        params.store.syncResearchLoopsForFlow?.(flow.id);
+        return;
+      }
+      await startTaskFlow(flow.id);
+      return;
+    }
+
+    const questions = params.store.listResearchQuestions!(project.id);
+    const question = nextResearchQuestion(questions);
+    if (!question) {
+      if (project.autonomyBudget.stopWhenNoOpenQuestions) {
+        params.store.updateResearchProject?.({
+          projectId: project.id,
+          status: "completed",
+          autonomyEnabled: false,
+          completedAt: Date.now(),
+        });
+      }
+      return;
+    }
+
+    const researchContext = buildResearchRagContext({
+      project,
+      question,
+      goal: question.question,
+      hypotheses: params.store.listResearchHypotheses?.(project.id) ?? [],
+      evidence: params.store.listResearchEvidence?.(project.id) ?? [],
+      sources: params.store.listResearchSources?.(project.id) ?? [],
+    });
+    const proposedSteps = buildResearchLoopSteps(project, question.question, question.question, researchContext);
+    const budgetEvaluation = evaluateResearchBudget({
+      project,
+      loops,
+      questions,
+      proposedStepCount: proposedSteps.length,
+      autoStart: true,
+      approvalGatePresent: proposedSteps.some((step) => step.stepKind === "approval_gate"),
+      dangerousAutoApprove: dangerousAutoApproveEnabled(),
+    });
+    if (budgetEvaluation.blocked) {
+      return;
+    }
+
+    const loop = params.store.createResearchLoop!({
+      projectId: project.id,
+      goal: question.question,
+      selectedQuestionId: question.id,
+      status: "queued",
+    });
+    const flow = params.store.createTaskFlow!({
+      agentId: project.agentId,
+      conversationId: project.conversationId,
+      title: `${project.title}: ${question.question.slice(0, 80)}`,
+      triggerSource: "schedule",
+    });
+    proposedSteps.forEach((step, index) => {
+      params.store.createTaskFlowStep!({
+        flowId: flow.id,
+        stepKey: step.stepKey,
+        dependencyStepKey: step.dependencyStepKey ?? null,
+        position: index,
+        title: step.title,
+        prompt: step.prompt,
+        stepKind: step.stepKind,
+      });
+    });
+    params.store.transitionResearchLoop!({
+      loopId: loop.id,
+      proposedFlowId: flow.id,
+      status: "running",
+      clearErrorText: true,
+      clearCompletedAt: true,
+    });
+    await startTaskFlow(flow.id);
+  }
+
   async function cancelTask(taskId: string) {
     const task = params.store.getTask(taskId);
     if (!task) {
@@ -943,6 +1128,16 @@ export function createTaskManager(params: {
             .listTaskFlows(agentId)
             .filter((item) => item.status === "queued" || item.status === "running")) {
             await startTaskFlow(flow.id);
+          }
+        }
+      }
+
+      if (params.store.listResearchProjects) {
+        for (const agentId of agentIds) {
+          for (const project of params.store
+            .listResearchProjects(agentId)
+            .filter((item) => item.status === "active" && item.autonomyEnabled)) {
+            await advanceAutonomousResearchGoal(project);
           }
         }
       }

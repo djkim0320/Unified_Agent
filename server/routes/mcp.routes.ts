@@ -5,6 +5,7 @@ import {
   getMcpCatalogEntry,
   getStaticMcpCatalog,
   validateMcpSnippet,
+  applyMcpSnippetToManagedConfig,
 } from "../lib/mcp-config-metadata.js";
 import { withEngineAuthEvidence } from "../lib/engine-auth-evidence.js";
 import { normalizeReasoningLevel } from "../reasoning-options.js";
@@ -22,12 +23,18 @@ const McpSnippetValidateSchema = z.object({
   snippet: z.string().min(1).max(50_000),
 });
 
+const McpSnippetApplySchema = z.object({
+  snippet: z.string().min(1).max(50_000),
+  confirm: z.boolean().optional().default(true),
+});
+
 export function registerMcpRoutes(
   app: express.Express,
   params: {
     store: AppStore;
     gateway: AppGateway;
     exposeWorkspaceDebugPaths: boolean;
+    managedOpenCodeConfigPath: string;
   },
 ) {
   const { store, gateway } = params;
@@ -45,6 +52,7 @@ export function registerMcpRoutes(
       status: buildMcpConfigStatus({
         engineStatus,
         exposeDebugPaths: params.exposeWorkspaceDebugPaths,
+        managedConfigPath: params.managedOpenCodeConfigPath,
       }),
     });
   });
@@ -53,6 +61,19 @@ export function registerMcpRoutes(
     const body = McpSnippetValidateSchema.parse(request.body);
     const result = validateMcpSnippet(body.snippet);
     response.status(result.ok ? 200 : 400).json({ validation: result });
+  });
+
+  app.post("/api/mcp/config/apply-snippet", (request, response) => {
+    const body = McpSnippetApplySchema.parse(request.body);
+    if (!body.confirm) {
+      response.status(400).json({ error: "MCP 설정 적용에는 confirm=true가 필요합니다." });
+      return;
+    }
+    const result = applyMcpSnippetToManagedConfig({
+      snippet: body.snippet,
+      managedConfigPath: params.managedOpenCodeConfigPath,
+    });
+    response.status(result.ok ? 200 : 400).json({ apply: result });
   });
 
   app.post("/api/mcp/test-run", (request, response) => {

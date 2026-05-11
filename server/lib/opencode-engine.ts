@@ -34,6 +34,7 @@ import {
   parseSessionsFromOutput,
   sanitizeSessionForStatus,
   summarizeJsonEvents,
+  summarizeTokenUsage,
 } from "./opencode/events.js";
 import type { createWorkspaceManager } from "./workspace.js";
 import type {
@@ -76,9 +77,38 @@ function clip(text: string, maxLength: number) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
+function workspaceModeForRun(input: AgentEngineRunParams) {
+  return input.workspaceMode === "repository" ? "repository" : "session";
+}
+
+function resolveRunWorkspace(params: {
+  input: AgentEngineRunParams;
+  projectRoot: string;
+  workspace: ReturnType<typeof createWorkspaceManager>;
+}) {
+  params.workspace.createAgentWorkspace(params.input.agentId);
+  params.workspace.createConversationWorkspace(params.input.conversationId);
+  if (workspaceModeForRun(params.input) === "repository") {
+    return {
+      directory: params.projectRoot,
+      label: "repository-root",
+      mode: "repository" as const,
+    };
+  }
+  const resolvedWorkspace = params.workspace.resolveSandboxDirectory({
+    conversationId: params.input.conversationId,
+  });
+  return {
+    directory: resolvedWorkspace.absolutePath,
+    label: resolvedWorkspace.relativePath,
+    mode: "session" as const,
+  };
+}
+
 function buildPrompt(params: {
   input: AgentEngineRunParams;
   workspacePath: string;
+  workspaceMode: "session" | "repository";
   workspace: ReturnType<typeof createWorkspaceManager>;
 }) {
   const { input } = params;
@@ -104,6 +134,11 @@ function buildPrompt(params: {
     "- Ask for explicit user approval before destructive actions, external submissions, account changes, uploads, purchases, or irreversible operations.",
     "- Prefer small, reversible file edits and summarize changed files at the end.",
     "",
+    "Response style:",
+    "- Prefer plain text with short headings and simple numbered or dashed lists.",
+    "- Do not use Markdown emphasis markers such as **bold** or __bold__; write the words directly instead.",
+    "- Use fenced code blocks only when showing code, commands, or file contents.",
+    "",
     "Run context:",
     `- agent_id: ${input.agentId}`,
     `- agent_name: ${input.agent.name}`,
@@ -115,7 +150,20 @@ function buildPrompt(params: {
     `- requested_model: ${input.model}`,
     `- reasoning_level: ${input.reasoningLevel}`,
     `- workspace_path: ${params.workspacePath}`,
+    `- workspace_mode: ${params.workspaceMode}`,
+    params.workspaceMode === "repository"
+      ? "- repository_workspace: current working directory is the AetherOps repository root. This mode is explicitly enabled for a bounded research goal."
+      : "- repository_workspace: disabled. Current working directory is the conversation sandbox.",
     "",
+    ...(params.workspaceMode === "repository"
+      ? [
+          "Repository workspace safety:",
+          "- You may inspect and edit source, docs, and tests in this repository.",
+          "- Do not read, print, edit, or summarize `.data`, `.env*`, `secret.key`, token files, provider secret storage, workspace user data, or unrelated private files.",
+          "- Keep changes small and stop after the requested validation/report loop.",
+          "",
+        ]
+      : []),
     "AetherOps workspace guidance:",
     "## AGENTS.md",
     guides.agents.trim() || "(empty)",
@@ -144,6 +192,9 @@ function buildPrompt(params: {
           .filter(Boolean)
           .join("\n")
       : "(none)",
+    "",
+    "Research project shared context:",
+    input.researchContext?.trim() || "(none)",
     "",
     "Recent conversation:",
     recentMessages || "(none)",
@@ -193,6 +244,7 @@ export function createOpenCodeEngine(params: {
   binary?: string;
   runner?: OpenCodeCommandRunner;
   runTimeoutMs?: number;
+  managedConfigPath?: string | null;
 }): AgentEngine {
   const testHarnessRunner = !params.runner && process.env.VITEST ? makeOpenCodeTestHarnessRunner() : null;
   const launcher = params.binary
@@ -210,10 +262,10 @@ export function createOpenCodeEngine(params: {
   let lastFailure: string | null = null;
 
   async function runTurn(input: AgentEngineRunParams) {
-    params.workspace.createAgentWorkspace(input.agentId);
-    const workspaceDirectory = params.workspace.createConversationWorkspace(input.conversationId);
-    const resolvedWorkspace = params.workspace.resolveSandboxDirectory({
-      conversationId: input.conversationId,
+    const runWorkspace = resolveRunWorkspace({
+      input,
+      projectRoot: params.projectRoot,
+      workspace: params.workspace,
     });
     const run = params.store.createWorkspaceRun({
       conversationId: input.conversationId,
@@ -235,10 +287,11 @@ export function createOpenCodeEngine(params: {
       resumeToken: null,
     });
     const startedAt = Date.now();
-    const beforeSnapshot = snapshotWorkspace(workspaceDirectory, { createBaseline: true });
+    const beforeSnapshot = snapshotWorkspace(runWorkspace.directory, { createBaseline: true });
     const prompt = buildPrompt({
       input,
-      workspacePath: resolvedWorkspace.relativePath,
+      workspacePath: runWorkspace.label,
+      workspaceMode: runWorkspace.mode,
       workspace: params.workspace,
     });
     const previousSessionId = latestExternalSessionId(params.store, input.conversationId, run.id);
@@ -262,7 +315,10 @@ export function createOpenCodeEngine(params: {
       prompt,
     ];
     const command = commandForStorage(launcher.displayName, args);
-    const env = buildOpenCodeEnvironment({ credentialSync });
+    const env = buildOpenCodeEnvironment({
+      credentialSync,
+      managedConfigPath: params.managedConfigPath,
+    });
     const permissionMode = autoApprovePermissions ? "dangerous_skip_permissions" : "default";
     const permissionWarning = autoApprovePermissions
       ? "Dangerous opencode permission skipping is enabled by AetherOps environment flags."
@@ -360,7 +416,8 @@ export function createOpenCodeEngine(params: {
         phase: "engine_run_started",
         engineKind: "opencode",
         command,
-        workspacePath: ".",
+        workspacePath: runWorkspace.label,
+        workspaceMode: runWorkspace.mode,
         externalSessionId,
         model: opencodeModel,
         credentialSync: {
@@ -380,13 +437,15 @@ export function createOpenCodeEngine(params: {
         message: "opencode Workspace Engine 실행을 시작했습니다.",
         phase: "engine_run_started",
         engineKind: "opencode",
+        workspaceMode: runWorkspace.mode,
+        workspacePath: runWorkspace.label,
         permissionMode,
         permissionWarning,
       });
       patchRun("planning");
 
       const result = await runner.runStreaming(args, {
-        cwd: workspaceDirectory,
+        cwd: runWorkspace.directory,
         env,
         timeoutMs: params.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
         signal: input.signal,
@@ -406,9 +465,9 @@ export function createOpenCodeEngine(params: {
       }
 
       const snapshotTimingStartedAt = Date.now();
-      const afterSnapshot = snapshotWorkspace(workspaceDirectory);
+      const afterSnapshot = snapshotWorkspace(runWorkspace.directory);
       const changedFiles = changedFilesBetween(beforeSnapshot, afterSnapshot);
-      const artifactSnapshots = artifactSnapshotsForChangedFiles(workspaceDirectory, beforeSnapshot, afterSnapshot, changedFiles);
+      const artifactSnapshots = artifactSnapshotsForChangedFiles(runWorkspace.directory, beforeSnapshot, afterSnapshot, changedFiles);
       const snapshotDurationMs = Date.now() - snapshotTimingStartedAt + beforeSnapshot.durationMs;
       if (beforeSnapshot.degraded || afterSnapshot.degraded) {
         emit("status", {
@@ -463,6 +522,7 @@ export function createOpenCodeEngine(params: {
       const eventSummary = {
         jsonEventCounts: summarizeJsonEvents(jsonEvents),
         jsonEventCount: jsonEvents.length,
+        tokenUsage: summarizeTokenUsage(jsonEvents),
         stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
         stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
         stderr: clip(result.stderr.trim(), 4000),
@@ -479,7 +539,7 @@ export function createOpenCodeEngine(params: {
           runId: run.id,
           status: terminalState,
           externalSessionId,
-          workspacePath: ".",
+          workspacePath: runWorkspace.label,
           model: opencodeModel,
           command,
           exitCode: result.exitCode,
@@ -511,7 +571,7 @@ export function createOpenCodeEngine(params: {
           runId: run.id,
           status: terminalState,
           externalSessionId,
-          workspacePath: ".",
+          workspacePath: runWorkspace.label,
           model: opencodeModel,
           command,
           exitCode: result.exitCode,
@@ -538,7 +598,7 @@ export function createOpenCodeEngine(params: {
           runId: run.id,
           status: terminalState,
           externalSessionId,
-          workspacePath: ".",
+          workspacePath: runWorkspace.label,
           model: opencodeModel,
           command,
           exitCode: result.exitCode,
@@ -565,7 +625,7 @@ export function createOpenCodeEngine(params: {
           runId: run.id,
           status: terminalState,
           externalSessionId,
-          workspacePath: ".",
+          workspacePath: runWorkspace.label,
           model: opencodeModel,
           command,
           exitCode: result.exitCode,
@@ -589,8 +649,6 @@ export function createOpenCodeEngine(params: {
           engineKind: "opencode",
           message: "opencode completed without a final assistant text event.",
         });
-      } else {
-        send("delta", { delta: assistantText });
       }
 
       terminalState = "completed";
@@ -599,7 +657,7 @@ export function createOpenCodeEngine(params: {
         runId: run.id,
         status: terminalState,
         externalSessionId,
-        workspacePath: ".",
+        workspacePath: runWorkspace.label,
         model: opencodeModel,
         command,
         exitCode: result.exitCode,
@@ -648,7 +706,10 @@ export function createOpenCodeEngine(params: {
 
   async function getStatus(): Promise<EngineStatus> {
     const credentialSync = buildCredentialSync({ store: params.store });
-    const env = buildOpenCodeEnvironment({ credentialSync });
+    const env = buildOpenCodeEnvironment({
+      credentialSync,
+      managedConfigPath: params.managedConfigPath,
+    });
     const cwd = params.projectRoot;
     const versionResult = await runner.run(["--version"], {
       cwd,
@@ -729,7 +790,10 @@ export function createOpenCodeEngine(params: {
 
   async function refreshModels() {
     const credentialSync = buildCredentialSync({ store: params.store });
-    const env = buildOpenCodeEnvironment({ credentialSync });
+    const env = buildOpenCodeEnvironment({
+      credentialSync,
+      managedConfigPath: params.managedConfigPath,
+    });
     const result = await runner.run(["models", "--refresh", "--format", "json"], {
       cwd: params.projectRoot,
       env,
@@ -796,7 +860,9 @@ export function createOpenCodeEngine(params: {
         ["/c", "start", "AetherOps opencode OAuth", launcher.command, ...launcher.argsPrefix, ...args],
         {
           cwd: params.projectRoot,
-          env: buildOpenCodeEnvironment(),
+          env: buildOpenCodeEnvironment({
+            managedConfigPath: params.managedConfigPath,
+          }),
           detached: true,
           stdio: "ignore",
           windowsHide: false,

@@ -34,6 +34,8 @@ The product boundary is intentionally narrow:
 - Safe record search across sessions, summaries, reports, artifacts, tasks, and flows without crawling workspace files.
 - Redacted session export/import bundles for backup and handoff without provider secrets or workspace file import.
 - Research projects with questions, hypotheses, evidence ledgers, bounded autonomy budgets, human approval gates, deterministic loop proposals, and final research reports.
+- Project-scoped research memory with normalized source/evidence/report/session-summary documents, SQLite FTS-backed RAG search, and redacted snippets for opencode context injection.
+- Research Loop tick controls that advance or reconcile linked TaskFlows while keeping execution on the opencode-only path.
 - Embedded `opencode-ai` Workspace Engine integration; chat, tasks, flows, heartbeat, and sub-agents all use the same opencode engine path.
 
 ## Run on Windows PowerShell
@@ -75,6 +77,7 @@ Start the built server:
 - SQLite DB: `.data/chat.sqlite`
 - Encryption key: `.data/secret.key`
 - opencode session workspaces: `workspace/opencode/agents/<agentId>/sessions/<conversationId>/`
+- research project files: `workspace/opencode/agents/<agentId>/projects/<projectId>/`
 - AetherOps agent control files: `workspace/opencode/agents/<agentId>/SOUL.md`, `STANDING_ORDERS.md`, and `HEARTBEAT.md`
 - One-time opencode-only migration marker: `.data/opencode-only-migration.json`
 - On first server start after the opencode-only migration, only legacy AetherOps runtime folders are deleted: `workspace/agents`, `workspace/shared/skills`, and `workspace/shared/plugins`.
@@ -159,11 +162,12 @@ The MCP tab is an opencode configuration assistant, not an MCP runtime.
 
 - `GET /api/mcp/catalog` returns static candidate metadata for Filesystem, Browser/Web, GitHub, and Database MCP categories.
 - `GET /api/mcp/config/status` reports parser type, source label, write safety, validation warnings, configured server metadata, and auth evidence.
-- `POST /api/mcp/config/validate-snippet` dry-runs an opencode MCP config snippet, reports risk warnings and env placeholders, and rejects literal token-looking values. AetherOps still does not write config in this flow.
+- `POST /api/mcp/config/validate-snippet` dry-runs an opencode MCP config snippet, reports risk warnings and env placeholders, and rejects literal token-looking values.
+- `POST /api/mcp/config/apply-snippet` writes a validated snippet into AetherOps' managed opencode config overlay under `.data/opencode-config/opencode.json`. Future AetherOps-launched opencode runs receive that MCP config automatically.
 - `POST /api/mcp/test-run` creates a normal opencode-backed background task that asks opencode to verify an MCP setup.
 - `POST /api/mcp/servers` remains `410 Gone`; AetherOps does not register or execute MCP servers itself.
 
-The UI shows config source labels, configured server count, risk warnings, copyable config snippets, and test-run creation actions. Absolute local config paths stay hidden unless debug path exposure is explicitly enabled.
+The UI shows config source labels, configured server count, risk warnings, copyable config snippets, safe apply actions, and test-run creation actions. Absolute local config paths stay hidden unless debug path exposure is explicitly enabled.
 
 ## Skill Template Library
 

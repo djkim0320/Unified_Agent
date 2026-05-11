@@ -2,14 +2,19 @@ import { apiRequest } from "../../apiClient";
 import type {
   ArtifactRecord,
   ProviderKind,
+  ProjectRagQueryResult,
+  ProjectRagRebuildResponse,
+  ProjectRagSearchResponse,
   ReasoningLevel,
   ResearchEvidenceRecord,
   ResearchHypothesisRecord,
   ResearchLoopRecord,
   ResearchPreflightResponse,
   ResearchProjectRecord,
+  ResearchProjectSessionRecord,
   ResearchQuestionRecord,
   ResearchSearchResult,
+  ResearchSourceRecord,
   TaskFlowDetailResponse,
   TaskRecord,
 } from "../../types";
@@ -27,7 +32,11 @@ export async function createResearchProject(payload: {
   domain?: string | null;
   autonomyEnabled?: boolean;
 }) {
-  return apiRequest<{ project: ResearchProjectRecord }>("/api/research/projects", {
+  return apiRequest<{
+    project: ResearchProjectRecord;
+    sessions?: ResearchProjectSessionRecord[];
+    files?: { rootLabel: string; files: Array<{ path: string; content: string }> } | null;
+  }>("/api/research/projects", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -36,9 +45,12 @@ export async function createResearchProject(payload: {
 export async function getResearchProject(projectId: string, signal?: AbortSignal) {
   return apiRequest<{
     project: ResearchProjectRecord;
+    sessions?: ResearchProjectSessionRecord[];
+    files?: { rootLabel: string; files: Array<{ path: string; content: string }> } | null;
     questions: ResearchQuestionRecord[];
     hypotheses: ResearchHypothesisRecord[];
     evidence: ResearchEvidenceRecord[];
+    sources: ResearchSourceRecord[];
     loops: ResearchLoopRecord[];
   }>(`/api/research/projects/${encodeURIComponent(projectId)}`, { signal });
 }
@@ -47,10 +59,57 @@ export async function updateResearchProject(
   projectId: string,
   payload: Partial<Pick<ResearchProjectRecord, "title" | "objective" | "domain" | "status" | "autonomyEnabled">>,
 ) {
-  return apiRequest<{ project: ResearchProjectRecord }>(`/api/research/projects/${encodeURIComponent(projectId)}`, {
+  return apiRequest<{
+    project: ResearchProjectRecord;
+    sessions?: ResearchProjectSessionRecord[];
+    files?: { rootLabel: string; files: Array<{ path: string; content: string }> } | null;
+  }>(`/api/research/projects/${encodeURIComponent(projectId)}`, {
     method: "PATCH",
     body: JSON.stringify(payload),
   });
+}
+
+export async function listResearchProjectSessions(projectId: string, signal?: AbortSignal) {
+  return apiRequest<{
+    sessions: Array<
+      ResearchProjectSessionRecord & {
+        conversation?: unknown;
+        summary?: unknown;
+      }
+    >;
+  }>(`/api/research/projects/${encodeURIComponent(projectId)}/sessions`, { signal });
+}
+
+export async function linkResearchProjectSession(
+  projectId: string,
+  payload: { conversationId: string; role?: string; includeInContext?: boolean },
+) {
+  return apiRequest<{
+    session: ResearchProjectSessionRecord;
+    sessions: ResearchProjectSessionRecord[];
+    files?: { rootLabel: string; files: Array<{ path: string; content: string }> } | null;
+  }>(`/api/research/projects/${encodeURIComponent(projectId)}/sessions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function unlinkResearchProjectSession(projectId: string, conversationId: string) {
+  return apiRequest<{
+    deleted: boolean;
+    sessions: ResearchProjectSessionRecord[];
+    files?: { rootLabel: string; files: Array<{ path: string; content: string }> } | null;
+  }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/sessions/${encodeURIComponent(conversationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function getResearchProjectFiles(projectId: string, signal?: AbortSignal) {
+  return apiRequest<{ rootLabel: string; files: Array<{ path: string; content: string }> }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/files`,
+    { signal },
+  );
 }
 
 export async function createResearchQuestion(
@@ -118,6 +177,66 @@ export async function createResearchEvidence(
   );
 }
 
+export async function createResearchSource(
+  projectId: string,
+  payload: {
+    evidenceId?: string | null;
+    url?: string | null;
+    title: string;
+    author?: string | null;
+    institution?: string | null;
+    publishedAt?: string | null;
+    accessedAt?: string | null;
+    summary: string;
+    quote?: string | null;
+    snapshot?: string | null;
+    reliability?: number;
+    relatedClaim?: string | null;
+    metadata?: Record<string, unknown>;
+  },
+) {
+  return apiRequest<{ source: ResearchSourceRecord }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/sources`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export async function getResearchRagContext(
+  projectId: string,
+  query?: { q?: string; questionId?: string | null },
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams();
+  if (query?.q) params.set("q", query.q);
+  if (query?.questionId) params.set("questionId", query.questionId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return apiRequest<{ context: string; ragResults?: ProjectRagQueryResult[] }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/rag-context${suffix}`,
+    { signal },
+  );
+}
+
+export async function rebuildProjectRag(projectId: string) {
+  return apiRequest<{ project: ResearchProjectRecord; rag: ProjectRagRebuildResponse }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/rag/rebuild`,
+    { method: "POST" },
+  );
+}
+
+export async function searchProjectRag(
+  projectId: string,
+  query: { q: string; limit?: number; offset?: number },
+  signal?: AbortSignal,
+) {
+  const params = new URLSearchParams({ q: query.q });
+  if (query.limit) params.set("limit", String(query.limit));
+  if (query.offset) params.set("offset", String(query.offset));
+  return apiRequest<ProjectRagSearchResponse>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/rag/search?${params.toString()}`,
+    { signal },
+  );
+}
+
 export async function getResearchPreflight(projectId: string, signal?: AbortSignal) {
   return apiRequest<ResearchPreflightResponse>(
     `/api/research/projects/${encodeURIComponent(projectId)}/preflight`,
@@ -140,6 +259,81 @@ export async function startResearchLoop(loopId: string) {
     `/api/research/loops/${encodeURIComponent(loopId)}/start`,
     { method: "POST" },
   );
+}
+
+export async function tickResearchLoop(loopId: string) {
+  return apiRequest<{
+    loop: ResearchLoopRecord | null;
+    flow: TaskFlowDetailResponse["flow"] | null;
+    action: "started_flow" | "synced_terminal_flow" | "waiting_for_flow";
+    summary: unknown;
+  }>(`/api/research/loops/${encodeURIComponent(loopId)}/tick`, {
+    method: "POST",
+  });
+}
+
+export async function startResearchGoal(
+  projectId: string,
+  payload?: {
+    questionId?: string | null;
+    goal?: string | null;
+    autoStart?: boolean;
+    enableAutonomy?: boolean;
+    workspaceMode?: "session" | "repository";
+  },
+) {
+  return apiRequest<{
+    project: ResearchProjectRecord;
+    loop: ResearchLoopRecord;
+    flow: TaskFlowDetailResponse["flow"];
+    steps: TaskFlowDetailResponse["steps"];
+    mode: "goal_runner";
+  }>(`/api/research/projects/${encodeURIComponent(projectId)}/goal/start`, {
+    method: "POST",
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
+export async function tickResearchGoal(projectId: string) {
+  return apiRequest<{
+    project: ResearchProjectRecord;
+    loop: ResearchLoopRecord;
+    flow: TaskFlowDetailResponse["flow"] | null;
+    steps?: TaskFlowDetailResponse["steps"];
+    mode: "goal_runner_tick";
+    action: string;
+  }>(`/api/research/projects/${encodeURIComponent(projectId)}/goal/tick`, {
+    method: "POST",
+  });
+}
+
+export async function stopResearchGoal(projectId: string) {
+  return apiRequest<{ project: ResearchProjectRecord; mode: "goal_runner"; stopped: boolean }>(
+    `/api/research/projects/${encodeURIComponent(projectId)}/goal/stop`,
+    { method: "POST" },
+  );
+}
+
+export async function startSelfImprovementGoal(
+  agentId: string,
+  payload?: {
+    conversationId?: string | null;
+    goal?: string | null;
+    autoStart?: boolean;
+    workspaceMode?: "session" | "repository";
+  },
+) {
+  return apiRequest<{
+    project: ResearchProjectRecord;
+    question: ResearchQuestionRecord;
+    loop: ResearchLoopRecord;
+    flow: TaskFlowDetailResponse["flow"];
+    steps: TaskFlowDetailResponse["steps"];
+    mode: "self_improvement_goal";
+  }>(`/api/research/agents/${encodeURIComponent(agentId)}/self-improvement-goal`, {
+    method: "POST",
+    body: JSON.stringify(payload ?? {}),
+  });
 }
 
 export async function cancelResearchLoop(loopId: string) {

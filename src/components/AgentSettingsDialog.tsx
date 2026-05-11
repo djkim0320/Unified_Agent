@@ -137,10 +137,14 @@ export function AgentSettingsDialog({
   const canDeleteActiveAgent = Boolean(activeAgent && activeAgent.id !== DEFAULT_AGENT_ID);
 
   return (
-    <div className="provider-dialog-backdrop" role="presentation" onClick={onClose}>
+    <div
+      className="provider-dialog-backdrop provider-dialog-backdrop--agent-settings"
+      role="presentation"
+      onClick={onClose}
+    >
       <div
         aria-label="에이전트 설정"
-        className="modal-card modal-card--settings"
+        className="modal-card modal-card--settings modal-card--agent-settings"
         onClick={(event) => event.stopPropagation()}
         role="dialog"
       >

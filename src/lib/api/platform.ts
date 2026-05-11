@@ -1,5 +1,5 @@
 import { apiRequest } from "../../apiClient";
-import type { ChannelSummary, PlatformMetadata, PluginManifest } from "../../types";
+import type { ChannelSummary, PlatformMetadata, PluginManifest, TokenUsageSummary } from "../../types";
 
 export async function listPlugins(signal?: AbortSignal) {
   return apiRequest<{ plugins: PluginManifest[] }>("/api/plugins", { signal });
@@ -7,6 +7,10 @@ export async function listPlugins(signal?: AbortSignal) {
 
 export async function listChannels(signal?: AbortSignal) {
   return apiRequest<{ channels: ChannelSummary[] }>("/api/channels", { signal });
+}
+
+export async function getTokenUsageSummary(signal?: AbortSignal) {
+  return apiRequest<{ usage: TokenUsageSummary }>("/api/usage/tokens", { signal });
 }
 
 export async function listPlatformMetadata(

@@ -21,6 +21,7 @@ import {
   getPreflightStatus,
   getRunDebug,
   getTaskDebug,
+  getTokenUsageSummary,
   getAgentSoul,
   getAgentStandingOrders,
   getConversationSummary,
@@ -922,6 +923,11 @@ describe("api helpers", () => {
           headers: { "Content-Type": "application/json" },
         });
       }
+      if (url === "/api/usage/tokens") {
+        return new Response(JSON.stringify({ usage: { totalTokens: 42, byModel: [] } }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json" },
       });
@@ -930,6 +936,7 @@ describe("api helpers", () => {
     await deleteAgent("agent-1");
     await listPlugins();
     await listChannels();
+    const usage = await getTokenUsageSummary();
     const metadata = await listPlatformMetadata();
 
     expect(metadata).toEqual({
@@ -938,6 +945,7 @@ describe("api helpers", () => {
       channels: [],
       agentSkills: [],
     });
+    expect(usage.usage.totalTokens).toBe(42);
     expect(fetch).toHaveBeenNthCalledWith(
       1,
       "/api/agents/agent-1",

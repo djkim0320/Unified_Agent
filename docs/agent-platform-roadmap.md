@@ -22,7 +22,8 @@ The repository already supports:
 - safe search across AetherOps DB records without workspace crawling
 - human approval and verification gates inside task flows
 - research projects with questions, hypotheses, evidence ledgers, autonomy budgets, deterministic loop proposals, linked Flow execution, and redacted final reports
-- MCP configuration assistant for opencode config snippets, dry-run validation, risk notes, and opencode-backed test tasks
+- project-scoped RAG documents/chunks for sources, evidence, reports, artifacts, session summaries, and flow records, with SQLite FTS5 plus LIKE fallback
+- MCP configuration assistant for opencode config snippets, dry-run validation, managed opencode config apply, risk notes, and opencode-backed test tasks
 - skill template library for built-in and custom reusable prompts, flow templates, standing-order patches, verification checklists, and heartbeat recipes
 - opencode-backed execution through the embedded `opencode-ai` launcher
 - multi-provider account and model selection
@@ -77,7 +78,7 @@ The current implementation is opencode-only for execution. The remaining work is
 
 ### 4. External capabilities
 
-- implemented: surface opencode MCP catalog/status/test-run metadata and snippet validation without adding an AetherOps runtime
+- implemented: surface opencode MCP catalog/status/test-run metadata, snippet validation, and safe managed-config apply without adding an AetherOps runtime
 - improve guidance for configuring filesystem, command, browser, and MCP behavior in opencode
 - keep removed compatibility routes explicit with `410 Gone`
 
@@ -97,6 +98,7 @@ The current implementation is opencode-only for execution. The remaining work is
 - implemented: research budget enforcement is shared by preflight, loop proposal, and loop start; evidence extraction is idempotent with deterministic source keys
 - implemented: workspace snapshots now use metadata-first scans with degraded-mode events for oversized workspaces, and diffs guard line/matrix complexity before LCS allocation
 - implemented: search has a SQLite FTS5-backed index when available, plus a safe LIKE fallback and explicit rebuild endpoint
+- implemented: project RAG has explicit rebuild/search endpoints and Loop tick controls that advance or reconcile normal TaskFlows without adding a hidden runtime
 - keep autonomy disabled by default and bounded by loop/day/runtime/task budgets
 - keep external/MCP/browser-style work behind explicit approval gates and opencode configuration
 - next: improve evidence review UX, source provenance scoring, and final report editing workflows

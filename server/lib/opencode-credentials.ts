@@ -197,3 +197,38 @@ export function mergeOpenCodeConfigContent(
     },
   });
 }
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+export function mergeOpenCodeConfigObjects(
+  ...configs: Array<Record<string, unknown> | null | undefined>
+) {
+  const merged: Record<string, unknown> = {};
+
+  for (const config of configs) {
+    if (!config) {
+      continue;
+    }
+    const previousProvider = objectValue(merged.provider);
+    const previousMcp = objectValue(merged.mcp);
+    Object.assign(merged, config);
+    if ("provider" in config) {
+      merged.provider = {
+        ...previousProvider,
+        ...objectValue(config.provider),
+      };
+    }
+    if ("mcp" in config) {
+      merged.mcp = {
+        ...previousMcp,
+        ...objectValue(config.mcp),
+      };
+    }
+  }
+
+  return merged;
+}

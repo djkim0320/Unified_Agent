@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import {
   buildOpenCodeCredentialSync,
   mergeOpenCodeConfigContent,
@@ -34,12 +35,18 @@ export function buildCredentialSync(params: {
 export function buildOpenCodeEnvironment(params?: {
   overrides?: NodeJS.ProcessEnv;
   credentialSync?: ReturnType<typeof buildOpenCodeCredentialSync>;
+  managedConfigPath?: string | null;
 }) {
   const configDir = configuredOpenCodeConfigDir();
   const credentialSync = params?.credentialSync;
+  const managedConfig = readManagedOpenCodeConfig(params?.managedConfigPath);
+  const baseConfigContent = mergeOpenCodeConfigContent(
+    process.env.OPENCODE_CONFIG_CONTENT,
+    managedConfig,
+  );
   const configContent = credentialSync
-    ? mergeOpenCodeConfigContent(process.env.OPENCODE_CONFIG_CONTENT, credentialSync.config)
-    : process.env.OPENCODE_CONFIG_CONTENT;
+    ? mergeOpenCodeConfigContent(baseConfigContent, credentialSync.config)
+    : baseConfigContent;
   return createSanitizedEnvironment({
     OPENCODE_DISABLE_AUTOUPDATE: process.env.OPENCODE_DISABLE_AUTOUPDATE ?? "true",
     OPENCODE_DISABLE_PRUNE: process.env.OPENCODE_DISABLE_PRUNE ?? "true",
@@ -53,6 +60,21 @@ export function buildOpenCodeEnvironment(params?: {
     ...(credentialSync?.env ?? {}),
     ...(params?.overrides ?? {}),
   });
+}
+
+function readManagedOpenCodeConfig(configPath: string | null | undefined) {
+  if (!configPath) {
+    return {};
+  }
+  try {
+    const content = fs.readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(content) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 function isEnabledEnvFlag(value: string | undefined) {

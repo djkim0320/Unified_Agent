@@ -11,15 +11,20 @@ type PlatformRouteChannelRegistry = {
   listChannels: () => unknown[];
 };
 
+type PlatformRouteStore = {
+  getTokenUsageSummary?: () => unknown;
+};
+
 export function registerPlatformRoutes(
   app: express.Express,
   params: {
     localApiToken: string;
     gateway: PlatformRouteGateway;
     channelRegistry: PlatformRouteChannelRegistry;
+    store?: PlatformRouteStore;
   },
 ) {
-  const { localApiToken, gateway, channelRegistry } = params;
+  const { localApiToken, gateway, channelRegistry, store } = params;
 
   app.get("/api/local-api-token", (_request, response) => {
     response.setHeader("Cache-Control", "no-store");
@@ -44,6 +49,23 @@ export function registerPlatformRoutes(
   app.get("/api/channels", (_request, response) => {
     response.json({
       channels: channelRegistry.listChannels(),
+    });
+  });
+
+  app.get("/api/usage/tokens", (_request, response) => {
+    response.json({
+      usage: store?.getTokenUsageSummary?.() ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 0,
+        runsWithUsage: 0,
+        lastUpdatedAt: null,
+        byModel: [],
+        source: "opencode-events",
+        note: "토큰 사용량 집계 기능을 사용할 수 없습니다.",
+      },
     });
   });
 }

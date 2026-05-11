@@ -8,17 +8,27 @@ import {
   createResearchQuestion,
   createResearchReport,
   createResearchReportTask,
+  createResearchSource,
   createResearchSubagent,
   getResearchPreflight,
   getResearchProject,
   listResearchProjects,
   proposeResearchLoop,
+  rebuildProjectRag,
+  searchProjectRag,
   searchResearch,
+  startResearchGoal,
   startResearchLoop,
+  startSelfImprovementGoal,
+  stopResearchGoal,
+  tickResearchGoal,
+  tickResearchLoop,
   updateResearchProject,
 } from "../api";
 import type {
   ArtifactRecord,
+  ProjectRagQueryResult,
+  ProjectRagRebuildResponse,
   ResearchEvidenceRecord,
   ResearchHypothesisRecord,
   ResearchLoopRecord,
@@ -26,6 +36,7 @@ import type {
   ResearchProjectRecord,
   ResearchQuestionRecord,
   ResearchSearchResult,
+  ResearchSourceRecord,
   TaskFlowDetailResponse,
   TaskRecord,
 } from "../types";
@@ -41,9 +52,12 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
   const [researchQuestions, setResearchQuestions] = useState<ResearchQuestionRecord[]>([]);
   const [researchHypotheses, setResearchHypotheses] = useState<ResearchHypothesisRecord[]>([]);
   const [researchEvidence, setResearchEvidence] = useState<ResearchEvidenceRecord[]>([]);
+  const [researchSources, setResearchSources] = useState<ResearchSourceRecord[]>([]);
   const [researchLoops, setResearchLoops] = useState<ResearchLoopRecord[]>([]);
   const [researchPreflight, setResearchPreflight] = useState<ResearchPreflightResponse | null>(null);
   const [researchSearchResults, setResearchSearchResults] = useState<ResearchSearchResult[]>([]);
+  const [researchRagResults, setResearchRagResults] = useState<ProjectRagQueryResult[]>([]);
+  const [researchRagStatus, setResearchRagStatus] = useState<ProjectRagRebuildResponse | null>(null);
   const [researchLastReport, setResearchLastReport] = useState<ArtifactRecord | null>(null);
   const [researchLoading, setResearchLoading] = useState(false);
 
@@ -99,6 +113,7 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
       setResearchQuestions(detail.questions);
       setResearchHypotheses(detail.hypotheses);
       setResearchEvidence(detail.evidence);
+      setResearchSources(detail.sources);
       setResearchLoops(detail.loops);
       setResearchPreflight(preflight);
     } catch (error) {
@@ -175,6 +190,17 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
     }
   }
 
+  async function addSource(projectId: string, payload: Parameters<typeof createResearchSource>[1]) {
+    try {
+      const response = await createResearchSource(projectId, payload);
+      setResearchSources((current) => [response.source, ...current]);
+      return response.source;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "출처 저장에 실패했습니다.");
+      return null;
+    }
+  }
+
   async function proposeLoop(projectId: string, payload: { questionId?: string | null; goal?: string | null; autoStart?: boolean }) {
     setResearchLoading(true);
     try {
@@ -201,6 +227,99 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
     } catch (error) {
       onNotice?.(error instanceof Error ? error.message : "연구 Loop 시작에 실패했습니다.");
       return null;
+    }
+  }
+
+  async function tickLoop(loopId: string) {
+    try {
+      const response = await tickResearchLoop(loopId);
+      if (response.loop) {
+        setResearchLoops((current) => [response.loop!, ...current.filter((loop) => loop.id !== response.loop!.id)]);
+      }
+      if (response.flow) onFlowCreated?.(response.flow.id);
+      onNotice?.("연구 Loop 상태를 갱신했습니다.");
+      return response;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "연구 Loop 갱신에 실패했습니다.");
+      return null;
+    }
+  }
+
+  async function startGoal(
+    projectId: string,
+    payload?: {
+      questionId?: string | null;
+      goal?: string | null;
+      autoStart?: boolean;
+      enableAutonomy?: boolean;
+      workspaceMode?: "session" | "repository";
+    },
+  ) {
+    setResearchLoading(true);
+    try {
+      const response = await startResearchGoal(projectId, payload);
+      mergeProject(response.project);
+      setResearchLoops((current) => [response.loop, ...current.filter((loop) => loop.id !== response.loop.id)]);
+      onFlowCreated?.(response.flow.id);
+      onNotice?.("Goal Runner를 시작했습니다. 이후 루프는 예산과 승인 게이트 안에서 이어집니다.");
+      return response;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "Goal Runner 시작에 실패했습니다.");
+      return null;
+    } finally {
+      setResearchLoading(false);
+    }
+  }
+
+  async function tickGoal(projectId: string) {
+    try {
+      const response = await tickResearchGoal(projectId);
+      mergeProject(response.project);
+      setResearchLoops((current) => [response.loop, ...current.filter((loop) => loop.id !== response.loop.id)]);
+      if (response.flow) onFlowCreated?.(response.flow.id);
+      onNotice?.("Goal Runner를 다음 단계로 진행했습니다.");
+      return response;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "Goal Runner 진행에 실패했습니다.");
+      return null;
+    }
+  }
+
+  async function stopGoal(projectId: string) {
+    try {
+      const response = await stopResearchGoal(projectId);
+      mergeProject(response.project);
+      onNotice?.("Goal Runner를 중지했습니다.");
+      return response.project;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "Goal Runner 중지에 실패했습니다.");
+      return null;
+    }
+  }
+
+  async function startSelfImprovement(
+    agentId: string,
+    payload?: {
+      conversationId?: string | null;
+      goal?: string | null;
+      autoStart?: boolean;
+      workspaceMode?: "session" | "repository";
+    },
+  ) {
+    setResearchLoading(true);
+    try {
+      const response = await startSelfImprovementGoal(agentId, payload);
+      mergeProject(response.project);
+      setResearchQuestions((current) => [response.question, ...current.filter((item) => item.id !== response.question.id)]);
+      setResearchLoops((current) => [response.loop, ...current.filter((loop) => loop.id !== response.loop.id)]);
+      onFlowCreated?.(response.flow.id);
+      onNotice?.("AetherOps 자기개선 Goal을 만들고 Flow로 연결했습니다.");
+      return response;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "자기개선 Goal 시작에 실패했습니다.");
+      return null;
+    } finally {
+      setResearchLoading(false);
     }
   }
 
@@ -263,6 +382,33 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
     }
   }
 
+  async function rebuildRag(projectId: string) {
+    try {
+      const response = await rebuildProjectRag(projectId);
+      mergeProject(response.project);
+      setResearchRagStatus(response.rag);
+      onNotice?.(`프로젝트 RAG를 재색인했습니다. 문서 ${response.rag.documentCount}개, 청크 ${response.rag.chunkCount}개`);
+      return response.rag;
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "프로젝트 RAG 재색인에 실패했습니다.");
+      return null;
+    }
+  }
+
+  async function searchRag(projectId: string, q: string) {
+    if (!q.trim()) {
+      setResearchRagResults([]);
+      return;
+    }
+    try {
+      const response = await searchProjectRag(projectId, { q, limit: 10 });
+      setResearchRagResults(response.results);
+      onNotice?.(`프로젝트 RAG에서 ${response.results.length}개 근거를 찾았습니다.`);
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "프로젝트 RAG 검색에 실패했습니다.");
+    }
+  }
+
   function abortResearchRequests() {
     abortRef(controllerRef);
   }
@@ -274,6 +420,7 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
     addEvidence,
     addHypothesis,
     addQuestion,
+    addSource,
     cancelLoop,
     createProject,
     createReport,
@@ -291,9 +438,19 @@ export function useResearchProjects({ onNotice, onFlowCreated }: UseResearchProj
     researchPreflight,
     researchProjects,
     researchQuestions,
+    researchRagResults,
+    researchRagStatus,
     researchSearchResults,
+    researchSources,
+    rebuildProjectRagIndex: rebuildRag,
+    searchProjectRagRecords: searchRag,
     searchResearchRecords: search,
     setActiveResearchProjectId,
+    startGoal,
+    startSelfImprovement,
     startLoop,
+    stopGoal,
+    tickGoal,
+    tickLoop,
   };
 }

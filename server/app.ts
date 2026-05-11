@@ -83,8 +83,10 @@ export function createApp(options?: {
   const localApiAllowedPorts = [port, 5173];
   const fetchImpl = options?.fetchImpl ?? fetch;
   const localApiToken = loadOrCreateLocalApiToken(dataDir);
+  const managedOpenCodeConfigPath = path.join(dataDir, "opencode-config", "opencode.json");
   const opencodeOnlyMigration = runOpenCodeOnlyWorkspaceMigration({ projectRoot, dataDir });
   app.locals.localApiToken = localApiToken;
+  app.locals.managedOpenCodeConfigPath = managedOpenCodeConfigPath;
   app.locals.opencodeOnlyMigration = opencodeOnlyMigration;
 
   const exposeWorkspaceDebugPaths = process.env.ENABLE_WORKSPACE_DEBUG_PATHS === "true";
@@ -100,6 +102,7 @@ export function createApp(options?: {
   });
   const gateway = createAgentGateway({
     projectRoot,
+    managedOpenCodeConfigPath,
     workspace,
     store,
     resolveSecret,
@@ -118,7 +121,7 @@ export function createApp(options?: {
     }),
   );
 
-  registerPlatformRoutes(app, { localApiToken, gateway, channelRegistry });
+  registerPlatformRoutes(app, { localApiToken, gateway, channelRegistry, store });
   app.get("/api/engine/status", async (_request, response) => {
     response.json(withEngineAuthEvidence(await gateway.agentEngine.getStatus(), store));
   });
@@ -281,8 +284,8 @@ export function createApp(options?: {
     localApiAllowedPorts,
   });
   registerSearchRoutes(app, { store });
-  registerResearchRoutes(app, { store, gateway });
-  registerMcpRoutes(app, { store, gateway, exposeWorkspaceDebugPaths });
+    registerResearchRoutes(app, { store, gateway, workspace });
+  registerMcpRoutes(app, { store, gateway, exposeWorkspaceDebugPaths, managedOpenCodeConfigPath });
   registerSkillTemplateRoutes(app, { store, workspace });
   app.use("/api/computer-use", (_request, response) => {
     sendLegacyGone(response, "Custom Computer Use API");

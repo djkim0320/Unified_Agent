@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { mergeOpenCodeConfigObjects } from "./opencode-credentials.js";
 import type {
   EngineStatusRecord,
   McpConfigStatus,
@@ -144,6 +145,43 @@ function stripJsonComments(content: string) {
     .replace(/^\s*\/\/.*$/gm, "");
 }
 
+function parseConfigObject(content: string | undefined, warnings: string[] = []) {
+  if (!content?.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(stripJsonComments(content));
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    warnings.push("opencode JSON/JSONC 설정을 안전하게 파싱하지 못했습니다.");
+    return null;
+  }
+}
+
+function readConfigFile(filePath: string, warnings: string[]) {
+  try {
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return null;
+    }
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    warnings.push("opencode 설정 파일을 읽지 못했습니다. 파일 권한 또는 상태를 확인하세요.");
+    return null;
+  }
+}
+
+function ensurePrivateFile(filePath: string) {
+  if (process.platform === "win32") {
+    return;
+  }
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Best effort only. The config can contain command metadata, so keep this
+    // hardening attempt here even when the host filesystem does not support it.
+  }
+}
+
 function detectParserType(content: string | undefined): "json" | "jsonc" | "unsupported" | "not-found" {
   if (!content?.trim()) {
     return "not-found";
@@ -214,6 +252,66 @@ function readConfiguredMcpFromEnvOrConfig(configDir: string | null, warnings: st
   }
 
   return { source: null, mcp: null, parserType: "not-found" as const, canWriteSafely: false };
+}
+
+function readConfiguredMcpFromSources(params: {
+  configDir: string | null;
+  managedConfigPath?: string | null;
+  warnings: string[];
+}) {
+  const configs: Array<{ source: string; content: string; writable: boolean }> = [];
+
+  if (process.env.OPENCODE_CONFIG_CONTENT?.trim()) {
+    configs.push({
+      source: "OPENCODE_CONFIG_CONTENT",
+      content: process.env.OPENCODE_CONFIG_CONTENT,
+      writable: false,
+    });
+  }
+
+  if (params.managedConfigPath) {
+    const content = readConfigFile(params.managedConfigPath, params.warnings);
+    if (content) {
+      configs.push({
+        source: "AetherOps managed opencode config",
+        content,
+        writable: true,
+      });
+    }
+  }
+
+  if (params.configDir && !params.configDir.includes("configured")) {
+    for (const fileName of ["opencode.json", "opencode.jsonc", "config.json"]) {
+      const content = readConfigFile(path.join(params.configDir, fileName), params.warnings);
+      if (content) {
+        configs.push({
+          source: fileName,
+          content,
+          writable: fileName.endsWith(".json") || fileName.endsWith(".jsonc"),
+        });
+      }
+    }
+  }
+
+  const parsedConfigs = configs
+    .map((entry) => ({
+      ...entry,
+      parsed: parseConfigObject(entry.content, params.warnings),
+      parserType: detectParserType(entry.content),
+    }))
+    .filter((entry) => entry.parsed);
+  const mergedConfig = mergeOpenCodeConfigObjects(
+    ...parsedConfigs.map((entry) => entry.parsed as Record<string, unknown>),
+  );
+  const writableSource = parsedConfigs.find((entry) => entry.writable);
+  const firstSource = parsedConfigs[0];
+
+  return {
+    source: writableSource?.source ?? firstSource?.source ?? null,
+    mcp: isObject(mergedConfig.mcp) ? mergedConfig.mcp : null,
+    parserType: firstSource?.parserType ?? ("not-found" as const),
+    canWriteSafely: Boolean(params.managedConfigPath),
+  };
 }
 
 function inferCategory(name: string, value: unknown): McpServerCategory {
@@ -298,6 +396,7 @@ export function getMcpCatalogEntry(id: string) {
 export function buildMcpConfigStatus(params: {
   engineStatus: EngineStatusRecord;
   exposeDebugPaths?: boolean;
+  managedConfigPath?: string | null;
 }): McpConfigStatus {
   const warnings: string[] = [];
   const configDir = params.engineStatus.configDir;
@@ -310,7 +409,11 @@ export function buildMcpConfigStatus(params: {
       : configDirSource === "default"
         ? "opencode 기본 설정 경로"
         : "opencode 상태 확인 필요";
-  const { source, mcp, parserType, canWriteSafely } = readConfiguredMcpFromEnvOrConfig(configDir, warnings);
+  const { source, mcp, parserType, canWriteSafely } = readConfiguredMcpFromSources({
+    configDir,
+    managedConfigPath: params.managedConfigPath,
+    warnings,
+  });
   const configuredServers = isObject(mcp)
     ? Object.entries(mcp).map(([name, value]) => configuredServerSummary(name, value, source))
     : [];
@@ -395,5 +498,74 @@ export function validateMcpSnippet(snippet: string): McpSnippetValidationResult 
     envPlaceholders: envPlaceholdersFromSnippet(trimmed),
     errors,
     configuredServers,
+  };
+}
+
+export function applyMcpSnippetToManagedConfig(params: {
+  snippet: string;
+  managedConfigPath: string;
+}) {
+  const validation = validateMcpSnippet(params.snippet);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      appliedServerCount: 0,
+      sourceLabel: "AetherOps managed opencode config",
+      backupCreated: false,
+      backupPath: null,
+      configuredServers: validation.configuredServers,
+      validation,
+      message: "MCP 스니펫 검증을 통과하지 못해 opencode 설정에 적용하지 않았습니다.",
+    };
+  }
+
+  const snippetConfig = parseConfigObject(params.snippet, []);
+  const snippetMcp = isObject(snippetConfig?.mcp) ? snippetConfig.mcp : null;
+  if (!snippetMcp) {
+    return {
+      ok: false,
+      appliedServerCount: 0,
+      sourceLabel: "AetherOps managed opencode config",
+      backupCreated: false,
+      backupPath: null,
+      configuredServers: [],
+      validation,
+      message: "적용할 mcp 설정을 찾지 못했습니다.",
+    };
+  }
+
+  fs.mkdirSync(path.dirname(params.managedConfigPath), { recursive: true });
+  const existingContent = readConfigFile(params.managedConfigPath, []);
+  const existingConfig = parseConfigObject(existingContent ?? undefined, []) ?? {};
+  const nextConfig = mergeOpenCodeConfigObjects(existingConfig, {
+    mcp: {
+      ...((isObject(existingConfig.mcp) ? existingConfig.mcp : {}) as Record<string, unknown>),
+      ...snippetMcp,
+    },
+  });
+  let backupPath: string | null = null;
+  if (existingContent !== null) {
+    backupPath = `${params.managedConfigPath}.${Date.now()}.bak`;
+    fs.copyFileSync(params.managedConfigPath, backupPath);
+    ensurePrivateFile(backupPath);
+  }
+  const tempPath = `${params.managedConfigPath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(nextConfig, null, 2)}\n`, { mode: 0o600 });
+  ensurePrivateFile(tempPath);
+  fs.renameSync(tempPath, params.managedConfigPath);
+  ensurePrivateFile(params.managedConfigPath);
+
+  const configuredServers = Object.entries(snippetMcp).map(([name, value]) =>
+    configuredServerSummary(name, value, "AetherOps managed opencode config"),
+  );
+  return {
+    ok: true,
+    appliedServerCount: configuredServers.length,
+    sourceLabel: "AetherOps managed opencode config",
+    backupCreated: Boolean(backupPath),
+    backupPath: null,
+    configuredServers,
+    validation,
+    message: `MCP 서버 ${configuredServers.length}개를 AetherOps 관리 opencode 설정에 적용했습니다. 다음 opencode Run부터 자동으로 반영됩니다.`,
   };
 }

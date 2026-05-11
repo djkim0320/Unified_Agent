@@ -18,12 +18,24 @@ const SNAPSHOT_SKIP_DIRS = new Set([
   ".git",
   ".hg",
   ".svn",
+  ".data",
   "node_modules",
   ".opencode",
   ".aetherops-tmp",
+  "workspace",
   "dist",
   "build",
   ".vite",
+  "coverage",
+]);
+
+const SNAPSHOT_SKIP_FILES = new Set([
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.production",
+  "local-api.token",
+  "secret.key",
 ]);
 
 export type SnapshotEntry = {
@@ -178,6 +190,9 @@ export function snapshotWorkspace(root: string, options: { createBaseline?: bool
   const visit = (directory: string, relativeBase: string) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       if (SNAPSHOT_SKIP_DIRS.has(entry.name)) {
+        continue;
+      }
+      if (SNAPSHOT_SKIP_FILES.has(entry.name)) {
         continue;
       }
       const absolutePath = path.join(directory, entry.name);

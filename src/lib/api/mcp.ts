@@ -3,6 +3,7 @@ import type {
   ConversationRecord,
   McpConfigStatus,
   McpServerSummary,
+  McpSnippetApplyResult,
   McpSnippetValidationResult,
   TaskRecord,
 } from "../../types";
@@ -39,5 +40,12 @@ export async function validateMcpSnippet(snippet: string) {
   return apiRequest<{ validation: McpSnippetValidationResult }>("/api/mcp/config/validate-snippet", {
     method: "POST",
     body: JSON.stringify({ snippet }),
+  });
+}
+
+export async function applyMcpSnippet(snippet: string) {
+  return apiRequest<{ apply: McpSnippetApplyResult }>("/api/mcp/config/apply-snippet", {
+    method: "POST",
+    body: JSON.stringify({ snippet, confirm: true }),
   });
 }

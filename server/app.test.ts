@@ -2680,6 +2680,46 @@ describe("createApp", () => {
       expect(JSON.stringify(statusResponse.body)).not.toContain(dataDir);
       expect(statusResponse.body.status.displayPath).toBe("opencode 기본 설정 경로");
 
+      const applyResponse = await request(app)
+        .post("/api/mcp/config/apply-snippet")
+        .send({
+          snippet: JSON.stringify({
+            mcp: {
+              github: {
+                type: "stdio",
+                command: "npx",
+                args: ["-y", "@modelcontextprotocol/server-github"],
+                env: {
+                  GITHUB_TOKEN: "{env:GITHUB_TOKEN}",
+                },
+              },
+            },
+          }),
+          confirm: true,
+        })
+        .expect(200);
+      expect(applyResponse.body.apply).toEqual(
+        expect.objectContaining({
+          ok: true,
+          appliedServerCount: 1,
+          backupPath: null,
+        }),
+      );
+      const managedConfigPath = app.locals.managedOpenCodeConfigPath as string;
+      expect(JSON.stringify(applyResponse.body)).not.toContain(managedConfigPath);
+      expect(fs.existsSync(managedConfigPath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(managedConfigPath, "utf8")).mcp.github).toEqual(
+        expect.objectContaining({ command: "npx" }),
+      );
+
+      const appliedStatusResponse = await request(app).get("/api/mcp/config/status").expect(200);
+      expect(appliedStatusResponse.body.status.configuredServers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "filesystem", status: "configured" }),
+          expect.objectContaining({ id: "github", status: "configured" }),
+        ]),
+      );
+
       const testRunResponse = await request(app)
         .post("/api/mcp/test-run")
         .send({
@@ -2796,7 +2836,7 @@ describe("createApp", () => {
       })
       .expect(200);
 
-    await request(app)
+    const evidenceResponse = await request(app)
       .post(`/api/research/projects/${projectId}/evidence`)
       .send({
         questionId,
@@ -2804,6 +2844,57 @@ describe("createApp", () => {
         summary: "The product policy requires human approval for external/high-risk actions.",
       })
       .expect(200);
+    const evidenceId = evidenceResponse.body.evidence.id as string;
+
+    await request(app)
+      .post(`/api/research/projects/${projectId}/sources`)
+      .send({
+        evidenceId,
+        url: "https://example.com/research-note",
+        title: "Bounded autonomy source note",
+        institution: "AetherOps Lab",
+        summary: "A saved source should connect the evidence claim to the text read at the time.",
+        quote: "Keep the source snapshot connected to the claim.",
+        snapshot: "Source body snapshot captured for later verification.",
+        reliability: 0.7,
+      })
+      .expect(200);
+
+    const detailResponse = await request(app)
+      .get(`/api/research/projects/${projectId}`)
+      .expect(200);
+    expect(detailResponse.body.sources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          evidenceId,
+          title: "Bounded autonomy source note",
+          reliability: 0.7,
+        }),
+      ]),
+    );
+
+    const ragRebuildResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/rag/rebuild`)
+      .expect(200);
+    expect(ragRebuildResponse.body.rag).toEqual(
+      expect.objectContaining({
+        projectId,
+        documentCount: expect.any(Number),
+        chunkCount: expect.any(Number),
+        indexMode: expect.any(String),
+      }),
+    );
+
+    const ragSearchResponse = await request(app)
+      .get(`/api/research/projects/${projectId}/rag/search?q=${encodeURIComponent("approval gates")}`)
+      .expect(200);
+    expect(ragSearchResponse.body.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          document: expect.objectContaining({ sourceType: "evidence" }),
+        }),
+      ]),
+    );
 
     const loopResponse = await request(app)
       .post(`/api/research/projects/${projectId}/loops/propose`)
@@ -2825,6 +2916,76 @@ describe("createApp", () => {
     );
     expect(store.listTaskFlows("default-agent").some((flow) => flow.id === loopResponse.body.flow.id)).toBe(true);
 
+    store.transitionTaskFlow({
+      flowId: loopResponse.body.flow.id,
+      status: "completed",
+      resultSummary: "Claims: Approval gate evidence is sufficient.\nEvidence: Bounded autonomy source note supports the gate.",
+      completedAt: Date.now(),
+    });
+    const loopTickResponse = await request(app)
+      .post(`/api/research/loops/${loopResponse.body.loop.id}/tick`)
+      .expect(200);
+    expect(loopTickResponse.body.action).toBe("synced_terminal_flow");
+    expect(loopTickResponse.body.summary).toEqual(
+      expect.objectContaining({
+        loopId: loopResponse.body.loop.id,
+        status: "completed",
+      }),
+    );
+
+    const goalResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/goal/start`)
+      .send({
+        goal: "Run one bounded goal loop without starting execution.",
+        autoStart: false,
+        workspaceMode: "repository",
+      })
+      .expect(200);
+    expect(goalResponse.body.mode).toBe("goal_runner");
+    expect(goalResponse.body.project).toEqual(
+      expect.objectContaining({
+        autonomyEnabled: true,
+        safetyPolicy: expect.objectContaining({ workspaceMode: "repository" }),
+      }),
+    );
+    expect(goalResponse.body.loop).toEqual(expect.objectContaining({ status: "queued" }));
+    expect(goalResponse.body.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stepKind: "approval_gate",
+        }),
+      ]),
+    );
+
+    const stopGoalResponse = await request(app)
+      .post(`/api/research/projects/${projectId}/goal/stop`)
+      .expect(200);
+    expect(stopGoalResponse.body.project).toEqual(expect.objectContaining({ autonomyEnabled: false }));
+
+    const selfImprovementResponse = await request(app)
+      .post("/api/research/agents/default-agent/self-improvement-goal")
+      .send({
+        conversationId: conversation.id,
+        autoStart: false,
+        goal: "Use hypotheses to pick one safe AetherOps improvement.",
+      })
+      .expect(200);
+    expect(selfImprovementResponse.body.mode).toBe("self_improvement_goal");
+    expect(selfImprovementResponse.body.project).toEqual(
+      expect.objectContaining({
+        domain: "self-improvement",
+        safetyPolicy: expect.objectContaining({ workspaceMode: "repository" }),
+      }),
+    );
+    expect(selfImprovementResponse.body.question.question).toContain("가장 안전하고 영향도 높은");
+    expect(selfImprovementResponse.body.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stepKey: "hypothesis-plan" }),
+        expect.objectContaining({ stepKind: "approval_gate" }),
+        expect.objectContaining({ stepKey: "validate" }),
+      ]),
+    );
+
     const reportResponse = await request(app)
       .post(`/api/research/projects/${projectId}/report`)
       .expect(200);
@@ -2839,5 +3000,14 @@ describe("createApp", () => {
       .expect(200);
     expect(searchResponse.body.results.length).toBeGreaterThan(0);
     expect(JSON.stringify(searchResponse.body)).not.toContain("API_KEY=");
+
+    const sourceSearchResponse = await request(app)
+      .get(`/api/research/search?q=${encodeURIComponent("snapshot")}&agentId=default-agent`)
+      .expect(200);
+    expect(sourceSearchResponse.body.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "source" }),
+      ]),
+    );
   });
 });

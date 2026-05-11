@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { abortRef, beginRequest } from "../appStateUtils";
-import { getMcpCatalog, getMcpConfigStatus, validateMcpSnippet } from "../api";
+import { applyMcpSnippet, getMcpCatalog, getMcpConfigStatus, validateMcpSnippet } from "../api";
 import type { McpConfigStatus, McpServerSummary, McpSnippetValidationResult } from "../types";
 
 interface UseMcpMetadataOptions {
@@ -65,12 +65,24 @@ export function useMcpMetadata({ onNotice }: UseMcpMetadataOptions = {}) {
     }
   }
 
+  async function handleApplyMcpSnippet(snippet: string) {
+    try {
+      const response = await applyMcpSnippet(snippet);
+      setMcpSnippetValidation(response.apply.validation);
+      onNotice?.(response.apply.message);
+      await refreshMcpMetadata();
+    } catch (error) {
+      onNotice?.(error instanceof Error ? error.message : "MCP 스니펫을 opencode 설정에 적용하지 못했습니다.");
+    }
+  }
+
   function abortMcpMetadataRequests() {
     abortRef(mcpMetadataControllerRef);
   }
 
   return {
     abortMcpMetadataRequests,
+    handleApplyMcpSnippet,
     handleValidateMcpSnippet,
     mcpCatalog,
     mcpLoading,

@@ -82,6 +82,16 @@ export type ResearchLoopStatus =
   | "completed"
   | "failed"
   | "cancelled";
+export type ProjectDocumentSourceType =
+  | "project"
+  | "session_summary"
+  | "source"
+  | "evidence"
+  | "artifact"
+  | "report"
+  | "flow"
+  | "task"
+  | "manual";
 
 export interface AgentRecord {
   id: string;
@@ -298,6 +308,31 @@ export interface EngineRunRecord {
   completedAt: number | null;
 }
 
+export interface TokenUsageModelSummary {
+  providerKind: ProviderKind | string | null;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  runsWithUsage: number;
+  lastUpdatedAt: number | null;
+}
+
+export interface TokenUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  runsWithUsage: number;
+  lastUpdatedAt: number | null;
+  byModel: TokenUsageModelSummary[];
+  source: "opencode-events";
+  note: string;
+}
+
 export interface EngineStatusRecord {
   engineKind: AgentEngineKind;
   configuredEngineKind: AgentEngineKind;
@@ -390,6 +425,17 @@ export interface McpSnippetValidationResult {
   envPlaceholders: string[];
   errors: string[];
   configuredServers: McpServerSummary[];
+}
+
+export interface McpSnippetApplyResult {
+  ok: boolean;
+  appliedServerCount: number;
+  sourceLabel: string;
+  backupCreated: boolean;
+  backupPath: string | null;
+  configuredServers: McpServerSummary[];
+  validation: McpSnippetValidationResult;
+  message: string;
 }
 
 export interface EngineAuthLoginResult {
@@ -589,6 +635,7 @@ export interface ResearchSafetyPolicy {
   blockedActions: string[];
   approvalRequiredActions: string[];
   notes: string;
+  workspaceMode?: "session" | "repository";
   [key: string]: unknown;
 }
 
@@ -606,6 +653,15 @@ export interface ResearchProjectRecord {
   createdAt: number;
   updatedAt: number;
   completedAt: number | null;
+}
+
+export interface ResearchProjectSessionRecord {
+  projectId: string;
+  conversationId: string;
+  role: string;
+  includeInContext: boolean;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface ResearchQuestionRecord {
@@ -643,6 +699,72 @@ export interface ResearchEvidenceRecord {
   metadata: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface ResearchSourceRecord {
+  id: string;
+  projectId: string;
+  evidenceId: string | null;
+  url: string | null;
+  title: string;
+  author: string | null;
+  institution: string | null;
+  publishedAt: string | null;
+  accessedAt: string | null;
+  summary: string;
+  quote: string | null;
+  snapshot: string | null;
+  reliability: number;
+  relatedClaim: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectDocumentRecord {
+  id: string;
+  projectId: string;
+  sourceType: ProjectDocumentSourceType;
+  sourceRef: string;
+  title: string;
+  summary: string | null;
+  uri: string | null;
+  reliability: number;
+  confidence: number;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectDocumentChunkRecord {
+  id: string;
+  documentId: string;
+  projectId: string;
+  chunkIndex: number;
+  content: string;
+  redactedContent: string;
+  tokenHint: number;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface ProjectRagQueryResult {
+  document: ProjectDocumentRecord;
+  chunk: ProjectDocumentChunkRecord;
+  snippet: string;
+  score: number;
+  indexMode: "fts5" | "like";
+}
+
+export interface ResearchLoopRunSummary {
+  loopId: string;
+  status: ResearchLoopStatus;
+  flowId: string | null;
+  questionId: string | null;
+  evidenceCount: number;
+  sourceCount: number;
+  resultSummary: string | null;
+  nextAction: string;
 }
 
 export interface ResearchLoopRecord {

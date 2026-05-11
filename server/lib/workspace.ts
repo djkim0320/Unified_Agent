@@ -6,6 +6,13 @@ import type {
   AgentHeartbeatRecord,
   AgentStandingOrdersRecord,
   AgentSoulRecord,
+  ResearchEvidenceRecord,
+  ResearchHypothesisRecord,
+  ResearchLoopRecord,
+  ResearchProjectRecord,
+  ResearchProjectSessionRecord,
+  ResearchQuestionRecord,
+  ResearchSourceRecord,
   WorkspaceFileRecord,
   WorkspaceScope,
   WorkspaceTreeNode,
@@ -36,11 +43,26 @@ const TEXT_EXTENSIONS = new Set([
 
 type ResolveMode = "read" | "write" | "delete";
 
+type ResearchProjectWorkspaceSnapshot = {
+  project: ResearchProjectRecord;
+  sessions: Array<ResearchProjectSessionRecord & { title?: string | null }>;
+  questions: ResearchQuestionRecord[];
+  hypotheses: ResearchHypothesisRecord[];
+  evidence: ResearchEvidenceRecord[];
+  sources: ResearchSourceRecord[];
+  loops: ResearchLoopRecord[];
+};
+
 function readBootstrapFile(root: string, fileName: string, defaultContent: string) {
   const filePath = path.join(root, fileName);
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, defaultContent, "utf8");
   }
+}
+
+function clipMarkdown(text: string | null | undefined, maxLength = 1600) {
+  const value = (text ?? "").trim();
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
 function normalizeWorkspacePath(relativePath = ".") {
@@ -425,6 +447,191 @@ export function createWorkspaceManager(
     const sandboxDir = getSandboxDir(conversationId);
     fs.mkdirSync(path.join(sandboxDir, "research"), { recursive: true });
     return sandboxDir;
+  }
+
+  function getResearchProjectDir(agentId: string, projectId: string) {
+    assertSafeEntityId(projectId, "Research project");
+    return path.join(createAgentWorkspace(agentId), "projects", projectId);
+  }
+
+  function createResearchProjectWorkspace(agentId: string, projectId: string) {
+    const projectDir = getResearchProjectDir(agentId, projectId);
+    fs.mkdirSync(path.join(projectDir, "artifacts"), { recursive: true });
+    ensureCanonicalInside(createAgentWorkspace(agentId), projectDir);
+    readBootstrapFile(projectDir, "PROJECT.md", "# Research Project\n\nProject metadata will be synchronized here.\n");
+    readBootstrapFile(projectDir, "SESSIONS.md", "# Linked Sessions\n\nNo linked sessions yet.\n");
+    readBootstrapFile(projectDir, "RESEARCH_DB.md", "# Research DB\n\nQuestions, hypotheses, evidence, and loop state.\n");
+    readBootstrapFile(projectDir, "SOURCES.md", "# Sources\n\nSource records and read-time snapshots.\n");
+    return {
+      absolutePath: projectDir,
+      relativePath: path.relative(rootDir, projectDir).replace(/\\/g, "/"),
+    };
+  }
+
+  function writeResearchProjectFile(projectDir: string, fileName: string, content: string) {
+    if (!["PROJECT.md", "SESSIONS.md", "RESEARCH_DB.md", "SOURCES.md"].includes(fileName)) {
+      throw new Error("Unsupported research project file.");
+    }
+    atomicWriteResolved(
+      {
+        root: projectDir,
+        absolutePath: path.join(projectDir, fileName),
+        relativePath: fileName,
+      },
+      content,
+    );
+  }
+
+  function writeResearchProjectSnapshot(snapshot: ResearchProjectWorkspaceSnapshot) {
+    const { absolutePath, relativePath } = createResearchProjectWorkspace(
+      snapshot.project.agentId,
+      snapshot.project.id,
+    );
+    const project = snapshot.project;
+    writeResearchProjectFile(
+      absolutePath,
+      "PROJECT.md",
+      [
+        "# Research Project",
+        "",
+        `- id: ${project.id}`,
+        `- title: ${project.title}`,
+        `- domain: ${project.domain ?? "(none)"}`,
+        `- status: ${project.status}`,
+        `- autonomy_enabled: ${project.autonomyEnabled ? "true" : "false"}`,
+        "",
+        "## Objective",
+        clipMarkdown(project.objective, 4000) || "(empty)",
+        "",
+        "## Workspace Contract",
+        "- AetherOps stores this project memory for opencode runs.",
+        "- Treat these files as local project memory, not as external truth.",
+        "- Record useful sources in the requested `Sources to record:` format when found.",
+      ].join("\n"),
+    );
+
+    writeResearchProjectFile(
+      absolutePath,
+      "SESSIONS.md",
+      [
+        "# Linked Sessions",
+        "",
+        ...snapshot.sessions.map((session) =>
+          [
+            `## ${session.title?.trim() || session.conversationId}`,
+            `- conversation_id: ${session.conversationId}`,
+            `- role: ${session.role}`,
+            `- include_in_context: ${session.includeInContext ? "true" : "false"}`,
+          ].join("\n"),
+        ),
+        snapshot.sessions.length ? "" : "No linked sessions yet.",
+      ].join("\n\n"),
+    );
+
+    writeResearchProjectFile(
+      absolutePath,
+      "RESEARCH_DB.md",
+      [
+        "# Research DB",
+        "",
+        "## Questions",
+        snapshot.questions.length
+          ? snapshot.questions
+              .map((question) => `- [${question.status}] p${question.priority} ${clipMarkdown(question.question, 500)}`)
+              .join("\n")
+          : "No questions recorded yet.",
+        "",
+        "## Hypotheses",
+        snapshot.hypotheses.length
+          ? snapshot.hypotheses
+              .map(
+                (hypothesis) =>
+                  `- [${hypothesis.status}] confidence=${hypothesis.confidence.toFixed(2)} ${clipMarkdown(
+                    hypothesis.hypothesis,
+                    500,
+                  )}`,
+              )
+              .join("\n")
+          : "No hypotheses recorded yet.",
+        "",
+        "## Evidence",
+        snapshot.evidence.length
+          ? snapshot.evidence
+              .slice(0, 80)
+              .map((evidence) =>
+                [
+                  `- claim: ${clipMarkdown(evidence.claim, 500)}`,
+                  `  confidence: ${evidence.confidence.toFixed(2)}`,
+                  `  source: ${evidence.sourceType}${evidence.sourceRef ? `:${evidence.sourceRef}` : ""}`,
+                  `  summary: ${clipMarkdown(evidence.summary, 800)}`,
+                  evidence.uncertainty ? `  uncertainty: ${clipMarkdown(evidence.uncertainty, 400)}` : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+              )
+              .join("\n")
+          : "No evidence recorded yet.",
+        "",
+        "## Loops",
+        snapshot.loops.length
+          ? snapshot.loops
+              .slice(0, 40)
+              .map((loop) => `- [${loop.status}] ${clipMarkdown(loop.goal, 500)}`)
+              .join("\n")
+          : "No loops recorded yet.",
+      ].join("\n"),
+    );
+
+    writeResearchProjectFile(
+      absolutePath,
+      "SOURCES.md",
+      [
+        "# Sources",
+        "",
+        snapshot.sources.length
+          ? snapshot.sources
+              .slice(0, 80)
+              .map((source) =>
+                [
+                  `## ${clipMarkdown(source.title, 160)}`,
+                  source.url ? `- url: ${source.url}` : "- url:",
+                  source.author ? `- author: ${clipMarkdown(source.author, 160)}` : null,
+                  source.institution ? `- institution: ${clipMarkdown(source.institution, 160)}` : null,
+                  source.publishedAt ? `- published_at: ${source.publishedAt}` : null,
+                  source.accessedAt ? `- accessed_at: ${source.accessedAt}` : null,
+                  `- reliability: ${source.reliability.toFixed(2)}`,
+                  source.relatedClaim ? `- related_claim: ${clipMarkdown(source.relatedClaim, 400)}` : null,
+                  "",
+                  `summary: ${clipMarkdown(source.summary, 1000)}`,
+                  source.quote ? `quote: ${clipMarkdown(source.quote, 600)}` : null,
+                  source.snapshot ? `snapshot: ${clipMarkdown(source.snapshot, 1000)}` : null,
+                ]
+                  .filter(Boolean)
+                  .join("\n"),
+              )
+              .join("\n\n")
+          : "No sources recorded yet.",
+      ].join("\n"),
+    );
+
+    return {
+      rootLabel: relativePath,
+      files: ["PROJECT.md", "SESSIONS.md", "RESEARCH_DB.md", "SOURCES.md"].map((fileName) => ({
+        path: `${relativePath}/${fileName}`,
+        content: fs.readFileSync(path.join(absolutePath, fileName), "utf8"),
+      })),
+    };
+  }
+
+  function readResearchProjectFiles(agentId: string, projectId: string) {
+    const { absolutePath, relativePath } = createResearchProjectWorkspace(agentId, projectId);
+    return {
+      rootLabel: relativePath,
+      files: ["PROJECT.md", "SESSIONS.md", "RESEARCH_DB.md", "SOURCES.md"].map((fileName) => ({
+        path: `${relativePath}/${fileName}`,
+        content: fs.readFileSync(path.join(absolutePath, fileName), "utf8"),
+      })),
+    };
   }
 
   function getScopeRoot(conversationId: string, scope: WorkspaceScope, createSandbox = false) {
@@ -848,6 +1055,9 @@ export function createWorkspaceManager(
     createConversationWorkspace,
     deleteConversationWorkspace,
     createAgentWorkspace,
+    createResearchProjectWorkspace,
+    writeResearchProjectSnapshot,
+    readResearchProjectFiles,
     deleteAgentWorkspace,
     getSandboxDir,
     getScopeRoot,

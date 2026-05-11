@@ -47,9 +47,9 @@ describe("workspace run persistence consistency", () => {
       .prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC")
       .all() as Array<{ version: number; name: string }>;
 
-    expect(migrations.map((migration) => migration.version)).toEqual(
-      expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
-    );
+      expect(migrations.map((migration) => migration.version)).toEqual(
+        expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17]),
+      );
     expect(store.rawDb.pragma("busy_timeout", { simple: true })).toBe(5000);
     expect(String(store.rawDb.pragma("journal_mode", { simple: true })).toLowerCase()).toBe("wal");
   });
@@ -851,12 +851,35 @@ describe("workspace run persistence consistency", () => {
     expect(store.listResearchLoops(project.id)).toEqual([
       expect.objectContaining({ id: loop.id, proposedFlowId: flow.id, status: "running" }),
     ]);
+    const linkedConversation = store.saveConversation({
+      agentId: conversation.agentId,
+      title: "linked research notes",
+      providerKind: conversation.providerKind,
+      model: conversation.model,
+      reasoningLevel: conversation.reasoningLevel,
+    });
+    const linkedSession = store.linkResearchProjectSession({
+      projectId: project.id,
+      conversationId: linkedConversation.id,
+      role: "literature-review",
+      includeInContext: true,
+    });
+    expect(store.listResearchProjectSessions(project.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ conversationId: conversation.id, role: "primary" }),
+        expect.objectContaining({ conversationId: linkedConversation.id, role: "literature-review" }),
+      ]),
+    );
+    expect(linkedSession.includeInContext).toBe(true);
+    expect(store.findResearchProjectForConversation(linkedConversation.id)).toEqual(
+      expect.objectContaining({ id: project.id }),
+    );
 
     store.transitionTaskFlow({
       flowId: flow.id,
       status: "completed",
       resultSummary:
-        "Claims\nApproval gates reduce unsafe autonomous actions.\n\nEvidence\nFlow completed with human checkpoint guidance.\n\nUncertainty\nExternal MCP validation still needs review.",
+        "Hypotheses\nA staged hypothesis-plan step improves autonomous research reliability.\n\nClaims\nApproval gates reduce unsafe autonomous actions.\n\nEvidence\nFlow completed with human checkpoint guidance.\n\nUncertainty\nExternal MCP validation still needs review.",
       completedAt: Date.now(),
     });
 
@@ -876,6 +899,15 @@ describe("workspace run persistence consistency", () => {
           sourceRef: flow.id,
           confidence: 0.65,
           metadata: expect.objectContaining({ researchLoopId: loop.id }),
+        }),
+      ]),
+    );
+    expect(store.listResearchHypotheses(project.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          hypothesis: "A staged hypothesis-plan step improves autonomous research reliability.",
+          status: "proposed",
+          confidence: 0.4,
         }),
       ]),
     );

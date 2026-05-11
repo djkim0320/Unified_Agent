@@ -4,7 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { createSecretBox } from "./lib/crypto.js";
 import { redactSensitiveText } from "./lib/redaction.js";
+import { extractResearchSections, extractResearchSources } from "./lib/research/section-parser.js";
 import { buildFlowReportArtifact, buildRunReportArtifact } from "./lib/run-report.js";
+import { addTokenUsage, emptyTokenUsage, extractTokenUsage } from "./lib/token-usage.js";
 import {
   migrateAutomationRuleColumns,
   migrateConversationLineageColumns,
@@ -29,11 +31,15 @@ import {
   createAutomationRulesSql,
   createConversationsSql,
   createHeartbeatLogsSql,
+  createProjectDocumentChunksSql,
+  createProjectDocumentsSql,
   createResearchEvidenceSql,
   createResearchHypothesesSql,
   createResearchLoopsSql,
+  createResearchProjectSessionsSql,
   createResearchProjectsSql,
   createResearchQuestionsSql,
+  createResearchSourcesSql,
   createSessionSummariesSql,
   createTaskEventsSql,
   createTaskFlowsSql,
@@ -52,11 +58,15 @@ import {
   mapConversation,
   mapHeartbeatLog,
   mapMessage,
+  mapProjectDocument,
+  mapProjectDocumentChunk,
   mapResearchEvidence,
   mapResearchHypothesis,
   mapResearchLoop,
   mapResearchProject,
+  mapResearchProjectSession,
   mapResearchQuestion,
+  mapResearchSource,
   mapSessionSummary,
   mapSkillTemplate,
   mapTask,
@@ -73,11 +83,15 @@ import {
   type ConversationRow,
   type HeartbeatLogRow,
   type MessageRow,
+  type ProjectDocumentChunkRow,
+  type ProjectDocumentRow,
   type ResearchEvidenceRow,
   type ResearchHypothesisRow,
   type ResearchLoopRow,
   type ResearchProjectRow,
+  type ResearchProjectSessionRow,
   type ResearchQuestionRow,
+  type ResearchSourceRow,
   type SecretRow,
   type SessionSummaryRow,
   type SkillTemplateRow,
@@ -101,6 +115,9 @@ import type {
   ProviderAccountRecord,
   ProviderKind,
   ProviderSecret,
+  ProjectDocumentRecord,
+  ProjectDocumentSourceType,
+  ProjectRagQueryResult,
   ReasoningLevel,
   ResearchAutonomyBudget,
   ResearchEvidenceRecord,
@@ -110,10 +127,12 @@ import type {
   ResearchLoopRecord,
   ResearchLoopStatus,
   ResearchProjectRecord,
+  ResearchProjectSessionRecord,
   ResearchProjectStatus,
   ResearchQuestionRecord,
   ResearchQuestionStatus,
   ResearchSafetyPolicy,
+  ResearchSourceRecord,
   RunCheckpoint,
   SessionKind,
   SessionSummaryRecord,
@@ -128,6 +147,8 @@ import type {
   TaskEventRecord,
   TaskRecord,
   TaskStatus,
+  TokenUsageModelSummary,
+  TokenUsageSummary,
   WorkspaceRunEventRecord,
   WorkspaceRunPhase,
   WorkspaceRunRecord,
@@ -155,6 +176,7 @@ export const DEFAULT_RESEARCH_SAFETY_POLICY: ResearchSafetyPolicy = {
   blockedActions: ["purchase", "submit", "delete", "publish", "transfer"],
   approvalRequiredActions: ["external", "file_write", "command_execution", "mcp", "browser"],
   notes: "External, MCP, browser, file write, and command execution work requires an operator checkpoint by default.",
+  workspaceMode: "session",
 };
 
 function tableSql(db: Database.Database, tableName: string) {
@@ -207,6 +229,39 @@ function ensureSearchTables(db: Database.Database) {
   }
 }
 
+function projectRagFtsAvailable(db: Database.Database) {
+  return Boolean(tableSql(db, "project_document_chunks_fts"));
+}
+
+function ensureProjectRagTables(db: Database.Database) {
+  db.exec(`
+    ${createProjectDocumentsSql("project_documents")}
+    ${createProjectDocumentChunksSql("project_document_chunks")}
+    CREATE INDEX IF NOT EXISTS project_documents_project_type_idx
+      ON project_documents(project_id, source_type, updated_at);
+    CREATE INDEX IF NOT EXISTS project_documents_project_updated_idx
+      ON project_documents(project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS project_document_chunks_project_idx
+      ON project_document_chunks(project_id, created_at);
+    CREATE INDEX IF NOT EXISTS project_document_chunks_document_idx
+      ON project_document_chunks(document_id, chunk_index);
+  `);
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS project_document_chunks_fts USING fts5(
+        project_id UNINDEXED,
+        document_id UNINDEXED,
+        chunk_id UNINDEXED,
+        title,
+        content,
+        redacted_content
+      );
+    `);
+  } catch {
+    // SQLite builds without FTS5 still use the project_document_chunks LIKE fallback.
+  }
+}
+
 function safeSearchId(kind: string, recordId: string) {
   return `${kind}:${recordId}`;
 }
@@ -226,6 +281,54 @@ function searchSnippet(text: string, query: string) {
   const start = Math.max(0, index - 80);
   const end = Math.min(redacted.length, index + query.length + 160);
   return `${start > 0 ? "..." : ""}${redacted.slice(start, end)}${end < redacted.length ? "..." : ""}`;
+}
+
+function clampScore(value: number | null | undefined, fallback = 0.5) {
+  if (typeof value !== "number" || Number.isNaN(value)) return fallback;
+  return Math.max(0, Math.min(1, value));
+}
+
+function estimateTokenHint(text: string) {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function chunkProjectDocumentText(text: string, maxChunkChars = 1400, maxChunks = 24) {
+  const normalized = redactSensitiveText(text)
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+  if (!normalized) return [];
+  const chunks: string[] = [];
+  const paragraphs = normalized.split(/\n{2,}/);
+  let current = "";
+  for (const paragraph of paragraphs) {
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
+    if (candidate.length <= maxChunkChars) {
+      current = candidate;
+    } else {
+      if (current) chunks.push(current);
+      if (paragraph.length <= maxChunkChars) {
+        current = paragraph;
+      } else {
+        for (let index = 0; index < paragraph.length && chunks.length < maxChunks; index += maxChunkChars) {
+          chunks.push(paragraph.slice(index, index + maxChunkChars));
+        }
+        current = "";
+      }
+    }
+    if (chunks.length >= maxChunks) break;
+  }
+  if (current && chunks.length < maxChunks) chunks.push(current);
+  return chunks.slice(0, maxChunks);
+}
+
+function projectDocumentBody(input: {
+  title: string;
+  summary?: string | null;
+  uri?: string | null;
+  body: string;
+}) {
+  return [input.title, input.uri ?? "", input.summary ?? "", input.body].filter(Boolean).join("\n");
 }
 
 function normalizeArtifactPath(relativePath: string) {
@@ -265,35 +368,6 @@ function mergeResearchPolicy(value?: Partial<ResearchSafetyPolicy> | null): Rese
     approvalRequiredActions: Array.isArray(value?.approvalRequiredActions)
       ? value.approvalRequiredActions.filter((item): item is string => typeof item === "string")
       : DEFAULT_RESEARCH_SAFETY_POLICY.approvalRequiredActions,
-  };
-}
-
-function extractResearchSections(text: string) {
-  const sections: Record<string, string[]> = {};
-  let current: string | null = null;
-  const aliases: Array<[RegExp, string]> = [
-    [/^claims?\s*:?\s*$/i, "claims"],
-    [/^evidence\s*:?\s*$/i, "evidence"],
-    [/^uncertainty|uncertainties\s*:?\s*$/i, "uncertainty"],
-    [/^next questions?\s*:?\s*$/i, "nextQuestions"],
-  ];
-  for (const line of text.split(/\r?\n/)) {
-    const normalized = line.replace(/^#+\s*/, "").trim();
-    const match = aliases.find(([pattern]) => pattern.test(normalized));
-    if (match) {
-      current = match[1];
-      sections[current] ??= [];
-      continue;
-    }
-    if (current && normalized) {
-      sections[current].push(normalized.replace(/^[-*\d.)\s]+/, "").trim());
-    }
-  }
-  return {
-    claims: sections.claims ?? [],
-    evidence: sections.evidence ?? [],
-    uncertainty: sections.uncertainty?.join("\n") || null,
-    nextQuestions: sections.nextQuestions ?? [],
   };
 }
 
@@ -389,13 +463,21 @@ export function createStore(dataDir: string) {
 
     ${createResearchProjectsSql("research_projects")}
 
+    ${createResearchProjectSessionsSql("research_project_sessions")}
+
     ${createResearchQuestionsSql("research_questions")}
 
     ${createResearchHypothesesSql("research_hypotheses")}
 
     ${createResearchEvidenceSql("research_evidence")}
 
+    ${createResearchSourcesSql("research_sources")}
+
     ${createResearchLoopsSql("research_loops")}
+
+    ${createProjectDocumentsSql("project_documents")}
+
+    ${createProjectDocumentChunksSql("project_document_chunks")}
 
     ${createHeartbeatLogsSql("heartbeat_logs")}
 
@@ -464,12 +546,32 @@ export function createStore(dataDir: string) {
   runSchemaMigration(db, 14, "research_autonomy_tables", () => {
     db.exec(`
       ${createResearchProjectsSql("research_projects")}
+      ${createResearchProjectSessionsSql("research_project_sessions")}
       ${createResearchQuestionsSql("research_questions")}
       ${createResearchHypothesesSql("research_hypotheses")}
       ${createResearchEvidenceSql("research_evidence")}
+      ${createResearchSourcesSql("research_sources")}
       ${createResearchLoopsSql("research_loops")}
     `);
   });
+  runSchemaMigration(db, 16, "research_sources", () => {
+    db.exec(createResearchSourcesSql("research_sources"));
+  });
+  runSchemaMigration(db, 17, "research_project_sessions", () => {
+    db.exec(createResearchProjectSessionsSql("research_project_sessions"));
+    db.exec(`
+      INSERT OR IGNORE INTO research_project_sessions (
+        project_id, conversation_id, role, include_in_context, created_at, updated_at
+      )
+      SELECT id, conversation_id, 'primary', 1, created_at, updated_at
+      FROM research_projects
+      WHERE conversation_id IS NOT NULL
+    `);
+  });
+  runSchemaMigration(db, 18, "project_rag_documents", () => {
+    ensureProjectRagTables(db);
+  });
+  ensureProjectRagTables(db);
   const summaryColumns = db
     .prepare(`PRAGMA table_info(session_summaries)`)
     .all() as Array<{ name: string }>;
@@ -492,12 +594,20 @@ export function createStore(dataDir: string) {
       ON skill_templates(agent_id, scope, updated_at);
     CREATE INDEX IF NOT EXISTS research_projects_agent_status_idx
       ON research_projects(agent_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS research_project_sessions_conversation_idx
+      ON research_project_sessions(conversation_id);
+    CREATE INDEX IF NOT EXISTS research_project_sessions_project_context_idx
+      ON research_project_sessions(project_id, include_in_context, updated_at);
     CREATE INDEX IF NOT EXISTS research_questions_project_status_idx
       ON research_questions(project_id, status, priority);
     CREATE INDEX IF NOT EXISTS research_hypotheses_project_status_idx
       ON research_hypotheses(project_id, status, confidence);
     CREATE INDEX IF NOT EXISTS research_evidence_project_idx
       ON research_evidence(project_id, created_at);
+    CREATE INDEX IF NOT EXISTS research_sources_project_idx
+      ON research_sources(project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS research_sources_evidence_idx
+      ON research_sources(evidence_id, updated_at);
     CREATE INDEX IF NOT EXISTS research_loops_project_status_idx
       ON research_loops(project_id, status, updated_at);
   `);
@@ -1370,6 +1480,98 @@ export function createStore(dataDir: string) {
       return rows.map(mapWorkspaceRunEvent);
     },
 
+    getTokenUsageSummary(): TokenUsageSummary {
+      const rows = db
+        .prepare(
+          `SELECT runs.id, runs.provider_kind, runs.model, runs.updated_at, events.payload_json
+           FROM workspace_run_events events
+           JOIN workspace_runs runs ON runs.id = events.run_id
+           WHERE events.payload_json LIKE '%tokenUsage%'
+              OR events.payload_json LIKE '%token_usage%'
+              OR events.payload_json LIKE '%prompt_tokens%'
+              OR events.payload_json LIKE '%completion_tokens%'
+              OR events.payload_json LIKE '%input_tokens%'
+              OR events.payload_json LIKE '%output_tokens%'
+           ORDER BY events.created_at ASC`,
+        )
+        .all() as Array<{
+          id: string;
+          provider_kind: ProviderKind;
+          model: string;
+          updated_at: number;
+          payload_json: string;
+        }>;
+      const usageByRun = new Map<
+        string,
+        {
+          providerKind: ProviderKind;
+          model: string;
+          updatedAt: number;
+          usage: ReturnType<typeof emptyTokenUsage>;
+        }
+      >();
+      for (const row of rows) {
+        try {
+          const payload = JSON.parse(row.payload_json) as unknown;
+          const usage =
+            extractTokenUsage(payload) ??
+            (typeof payload === "object" && payload !== null
+              ? extractTokenUsage((payload as { engineRun?: { eventSummary?: unknown } }).engineRun?.eventSummary)
+              : null);
+          if (!usage || usage.totalTokens <= 0) {
+            continue;
+          }
+          usageByRun.set(row.id, {
+            providerKind: row.provider_kind,
+            model: row.model,
+            updatedAt: row.updated_at,
+            usage,
+          });
+        } catch {
+          // Ignore malformed historical payloads. Token usage is an observability
+          // convenience and should not make settings unavailable.
+        }
+      }
+
+      let total = emptyTokenUsage();
+      let lastUpdatedAt: number | null = null;
+      const modelMap = new Map<string, TokenUsageModelSummary>();
+      for (const entry of usageByRun.values()) {
+        total = addTokenUsage(total, entry.usage);
+        lastUpdatedAt = Math.max(lastUpdatedAt ?? 0, entry.updatedAt);
+        const key = `${entry.providerKind}:${entry.model}`;
+        const current =
+          modelMap.get(key) ??
+          ({
+            providerKind: entry.providerKind,
+            model: entry.model,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 0,
+            runsWithUsage: 0,
+            lastUpdatedAt: null,
+          } satisfies TokenUsageModelSummary);
+        const next = addTokenUsage(current, entry.usage);
+        modelMap.set(key, {
+          ...current,
+          ...next,
+          runsWithUsage: current.runsWithUsage + 1,
+          lastUpdatedAt: Math.max(current.lastUpdatedAt ?? 0, entry.updatedAt),
+        });
+      }
+
+      return {
+        ...total,
+        runsWithUsage: usageByRun.size,
+        lastUpdatedAt,
+        byModel: [...modelMap.values()].sort((left, right) => right.totalTokens - left.totalTokens),
+        source: "opencode-events",
+        note: "opencode JSON 이벤트가 제공한 토큰 사용량만 집계합니다. 모델/버전에 따라 0으로 보일 수 있습니다.",
+      };
+    },
+
     getSessionSummary(conversationId: string): SessionSummaryRecord | null {
       const row = db
         .prepare(
@@ -1404,7 +1606,30 @@ export function createStore(dataDir: string) {
         created_at: existing?.createdAt ?? timestamp,
         updated_at: timestamp,
       });
-      return store.getSessionSummary(input.conversationId)!;
+      const summary = store.getSessionSummary(input.conversationId)!;
+      const project = store.findResearchProjectForConversation(input.conversationId);
+      if (project) {
+        const conversation = store.getConversation(input.conversationId);
+        store.upsertProjectDocument({
+          projectId: project.id,
+          sourceType: "session_summary",
+          sourceRef: input.conversationId,
+          title: `Session memory: ${conversation?.title ?? input.conversationId}`,
+          summary: summary.summary,
+          body: [
+            summary.summary,
+            summary.decisions.length ? `Decisions:\n${summary.decisions.join("\n")}` : "",
+            summary.openQuestions.length ? `Open questions:\n${summary.openQuestions.join("\n")}` : "",
+            summary.nextActions.length ? `Next actions:\n${summary.nextActions.join("\n")}` : "",
+            JSON.stringify(summary.metadata ?? {}),
+          ].filter(Boolean).join("\n\n"),
+          reliability: 0.65,
+          confidence: 0.65,
+          metadata: { conversationId: input.conversationId, source: "session_summary" },
+          updatedAt: summary.updatedAt,
+        });
+      }
+      return summary;
     },
 
     createRunReportArtifact(runId: string): ArtifactRecord | null {
@@ -1447,7 +1672,23 @@ export function createStore(dataDir: string) {
           updated_at: timestamp,
         });
       })();
-      return store.getArtifact(id);
+      const artifact = store.getArtifact(id);
+      const project = artifact ? store.findResearchProjectForConversation(artifact.conversationId) : null;
+      if (artifact && project) {
+        store.upsertProjectDocument({
+          projectId: project.id,
+          sourceType: "report",
+          sourceRef: artifact.id,
+          title: artifact.title,
+          summary: artifact.summary,
+          body: [artifact.title, artifact.summary ?? "", report.metadata.markdown].filter(Boolean).join("\n"),
+          reliability: 0.7,
+          confidence: 0.7,
+          metadata: { runId: run.id, taskId: run.taskId, source: "run_report" },
+          updatedAt: artifact.updatedAt,
+        });
+      }
+      return artifact;
     },
 
     createFlowReportArtifact(flowId: string): ArtifactRecord | null {
@@ -1496,7 +1737,23 @@ export function createStore(dataDir: string) {
           updated_at: timestamp,
         });
       })();
-      return store.getArtifact(id);
+      const artifact = store.getArtifact(id);
+      const project = artifact ? store.findResearchProjectForConversation(artifact.conversationId) : null;
+      if (artifact && project) {
+        store.upsertProjectDocument({
+          projectId: project.id,
+          sourceType: "report",
+          sourceRef: artifact.id,
+          title: artifact.title,
+          summary: artifact.summary,
+          body: [artifact.title, artifact.summary ?? "", report.metadata.markdown].filter(Boolean).join("\n"),
+          reliability: 0.72,
+          confidence: 0.72,
+          metadata: { flowId: flow.id, source: "flow_report" },
+          updatedAt: artifact.updatedAt,
+        });
+      }
+      return artifact;
     },
 
     getLatestFlowReportArtifact(flowId: string): ArtifactRecord | null {
@@ -1593,7 +1850,39 @@ export function createStore(dataDir: string) {
           }
         }
       })();
-      return store.listArtifactsForRun(input.conversationId, input.runId);
+      const artifacts = store.listArtifactsForRun(input.conversationId, input.runId);
+      const project = store.findResearchProjectForConversation(input.conversationId);
+      if (project) {
+        for (const artifact of artifacts.filter((item) => item.kind === "file")) {
+          const version = store.getArtifactVersion(artifact.id);
+          store.upsertProjectDocument({
+            projectId: project.id,
+            sourceType: "artifact",
+            sourceRef: artifact.id,
+            title: artifact.title,
+            summary: artifact.summary,
+            uri: artifact.path,
+            body: [
+              artifact.title,
+              artifact.path ?? "",
+              artifact.summary ?? "",
+              version?.afterContent ?? "",
+            ].filter(Boolean).join("\n"),
+            reliability: 0.55,
+            confidence: 0.55,
+            metadata: {
+              runId: artifact.runId,
+              taskId: artifact.taskId,
+              path: artifact.path,
+              binary: version?.binary ?? null,
+              truncated: version?.truncated ?? null,
+              unsupportedEncoding: version?.unsupportedEncoding ?? null,
+            },
+            updatedAt: artifact.updatedAt,
+          });
+        }
+      }
+      return artifacts;
     },
 
     getArtifactVersion(artifactId: string): ArtifactVersionRecord | null {
@@ -1631,6 +1920,447 @@ export function createStore(dataDir: string) {
         )
         .get(artifactId) as ArtifactRow | undefined;
       return row ? mapArtifact(row) : null;
+    },
+
+    getProjectDocument(documentId: string): ProjectDocumentRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, project_id, source_type, source_ref, title, summary, uri, reliability, confidence,
+                  metadata_json, created_at, updated_at
+           FROM project_documents
+           WHERE id = ?`,
+        )
+        .get(documentId) as ProjectDocumentRow | undefined;
+      return row ? mapProjectDocument(row) : null;
+    },
+
+    listProjectDocuments(projectId: string): ProjectDocumentRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, source_type, source_ref, title, summary, uri, reliability, confidence,
+                  metadata_json, created_at, updated_at
+           FROM project_documents
+           WHERE project_id = ?
+           ORDER BY updated_at DESC, title ASC`,
+        )
+        .all(projectId) as ProjectDocumentRow[];
+      return rows.map(mapProjectDocument);
+    },
+
+    upsertProjectDocument(input: {
+      projectId: string;
+      sourceType: ProjectDocumentSourceType;
+      sourceRef: string;
+      title: string;
+      body: string;
+      summary?: string | null;
+      uri?: string | null;
+      reliability?: number | null;
+      confidence?: number | null;
+      metadata?: Record<string, unknown>;
+      updatedAt?: number;
+    }): { document: ProjectDocumentRecord; chunkCount: number } {
+      if (!store.getResearchProject(input.projectId)) {
+        throw new Error("Research project not found.");
+      }
+      const timestamp = input.updatedAt ?? now();
+      const existing = db
+        .prepare(
+          `SELECT id, project_id, source_type, source_ref, title, summary, uri, reliability, confidence,
+                  metadata_json, created_at, updated_at
+           FROM project_documents
+           WHERE project_id = ? AND source_type = ? AND source_ref = ?`,
+        )
+        .get(input.projectId, input.sourceType, input.sourceRef) as ProjectDocumentRow | undefined;
+      const documentId = existing?.id ?? crypto.randomUUID();
+      const body = projectDocumentBody({
+        title: input.title,
+        summary: input.summary,
+        uri: input.uri,
+        body: input.body,
+      });
+      const chunks = chunkProjectDocumentText(body);
+      const metadataJson = JSON.stringify(
+        input.metadata ?? (existing ? (JSON.parse(existing.metadata_json) as Record<string, unknown>) : {}),
+      );
+      db.transaction(() => {
+        db.prepare(
+          `INSERT INTO project_documents (
+            id, project_id, source_type, source_ref, title, summary, uri, reliability, confidence,
+            metadata_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(project_id, source_type, source_ref) DO UPDATE SET
+            title = excluded.title,
+            summary = excluded.summary,
+            uri = excluded.uri,
+            reliability = excluded.reliability,
+            confidence = excluded.confidence,
+            metadata_json = excluded.metadata_json,
+            updated_at = excluded.updated_at`,
+        ).run(
+          documentId,
+          input.projectId,
+          input.sourceType,
+          input.sourceRef,
+          redactSensitiveText(input.title),
+          input.summary ? redactSensitiveText(input.summary) : null,
+          input.uri ?? null,
+          clampScore(input.reliability),
+          clampScore(input.confidence),
+          metadataJson,
+          existing?.created_at ?? timestamp,
+          timestamp,
+        );
+        db.prepare(`DELETE FROM project_document_chunks WHERE document_id = ?`).run(documentId);
+        if (projectRagFtsAvailable(db)) {
+          db.prepare(`DELETE FROM project_document_chunks_fts WHERE document_id = ?`).run(documentId);
+        }
+        for (const [index, chunk] of chunks.entries()) {
+          const chunkId = crypto.randomUUID();
+          const redactedContent = redactSensitiveText(chunk);
+          db.prepare(
+            `INSERT INTO project_document_chunks (
+              id, document_id, project_id, chunk_index, content, redacted_content, token_hint, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            chunkId,
+            documentId,
+            input.projectId,
+            index,
+            chunk,
+            redactedContent,
+            estimateTokenHint(chunk),
+            JSON.stringify({ sourceType: input.sourceType, sourceRef: input.sourceRef }),
+            timestamp,
+          );
+          if (projectRagFtsAvailable(db)) {
+            db.prepare(
+              `INSERT INTO project_document_chunks_fts (
+                project_id, document_id, chunk_id, title, content, redacted_content
+              ) VALUES (?, ?, ?, ?, ?, ?)`,
+            ).run(input.projectId, documentId, chunkId, redactSensitiveText(input.title), chunk, redactedContent);
+          }
+        }
+      })();
+      const document = store.getProjectDocument(documentId);
+      if (!document) {
+        throw new Error("Failed to upsert project document.");
+      }
+      return { document, chunkCount: chunks.length };
+    },
+
+    rebuildProjectRagIndex(projectId: string) {
+      const startedAt = Date.now();
+      const project = store.getResearchProject(projectId);
+      if (!project) {
+        throw new Error("Research project not found.");
+      }
+      db.transaction(() => {
+        db.prepare(`DELETE FROM project_document_chunks WHERE project_id = ?`).run(projectId);
+        db.prepare(`DELETE FROM project_documents WHERE project_id = ?`).run(projectId);
+        if (projectRagFtsAvailable(db)) {
+          db.prepare(`DELETE FROM project_document_chunks_fts WHERE project_id = ?`).run(projectId);
+        }
+      })();
+      let documentCount = 0;
+      let chunkCount = 0;
+      const addDocument = (input: Parameters<typeof store.upsertProjectDocument>[0]) => {
+        const result = store.upsertProjectDocument(input);
+        documentCount += 1;
+        chunkCount += result.chunkCount;
+      };
+
+      addDocument({
+        projectId,
+        sourceType: "project",
+        sourceRef: project.id,
+        title: project.title,
+        summary: project.objective,
+        body: [
+          `Objective: ${project.objective}`,
+          project.domain ? `Domain: ${project.domain}` : "",
+          `Status: ${project.status}`,
+          `Autonomy enabled: ${project.autonomyEnabled ? "yes" : "no"}`,
+        ].filter(Boolean).join("\n"),
+        reliability: 0.8,
+        confidence: 0.8,
+        metadata: { status: project.status, domain: project.domain },
+        updatedAt: project.updatedAt,
+      });
+
+      const linkedConversationIds = new Set<string>();
+      if (project.conversationId) linkedConversationIds.add(project.conversationId);
+      for (const link of store.listResearchProjectSessions(projectId)) {
+        linkedConversationIds.add(link.conversationId);
+        const summary = store.getSessionSummary(link.conversationId);
+        const conversation = store.getConversation(link.conversationId);
+        if (summary) {
+          addDocument({
+            projectId,
+            sourceType: "session_summary",
+            sourceRef: link.conversationId,
+            title: `Session memory: ${conversation?.title ?? link.conversationId}`,
+            summary: summary.summary,
+            body: [
+              summary.summary,
+              summary.decisions.length ? `Decisions:\n${summary.decisions.join("\n")}` : "",
+              summary.openQuestions.length ? `Open questions:\n${summary.openQuestions.join("\n")}` : "",
+              summary.nextActions.length ? `Next actions:\n${summary.nextActions.join("\n")}` : "",
+              JSON.stringify(summary.metadata ?? {}),
+            ].filter(Boolean).join("\n\n"),
+            reliability: 0.65,
+            confidence: 0.65,
+            metadata: { conversationId: link.conversationId, role: link.role },
+            updatedAt: summary.updatedAt,
+          });
+        }
+      }
+
+      for (const source of store.listResearchSources(projectId)) {
+        addDocument({
+          projectId,
+          sourceType: "source",
+          sourceRef: source.id,
+          title: source.title,
+          summary: source.summary,
+          uri: source.url,
+          body: [
+            source.title,
+            source.url ?? "",
+            source.author ? `Author: ${source.author}` : "",
+            source.institution ? `Institution: ${source.institution}` : "",
+            source.publishedAt ? `Published: ${source.publishedAt}` : "",
+            source.accessedAt ? `Accessed: ${source.accessedAt}` : "",
+            source.summary,
+            source.quote ? `Quote: ${source.quote}` : "",
+            source.snapshot ? `Snapshot: ${source.snapshot}` : "",
+            source.relatedClaim ? `Related claim: ${source.relatedClaim}` : "",
+          ].filter(Boolean).join("\n"),
+          reliability: source.reliability,
+          confidence: source.reliability,
+          metadata: { evidenceId: source.evidenceId, relatedClaim: source.relatedClaim },
+          updatedAt: source.updatedAt,
+        });
+      }
+
+      for (const evidence of store.listResearchEvidence(projectId)) {
+        addDocument({
+          projectId,
+          sourceType: "evidence",
+          sourceRef: evidence.id,
+          title: evidence.claim.slice(0, 160),
+          summary: evidence.summary,
+          body: [
+            `Claim: ${evidence.claim}`,
+            `Summary: ${evidence.summary}`,
+            evidence.uncertainty ? `Uncertainty: ${evidence.uncertainty}` : "",
+          ].filter(Boolean).join("\n"),
+          reliability: evidence.confidence,
+          confidence: evidence.confidence,
+          metadata: {
+            questionId: evidence.questionId,
+            hypothesisId: evidence.hypothesisId,
+            sourceType: evidence.sourceType,
+            sourceRef: evidence.sourceRef,
+          },
+          updatedAt: evidence.updatedAt,
+        });
+      }
+
+      for (const loop of store.listResearchLoops(projectId)) {
+        if (!loop.proposedFlowId) continue;
+        const flow = store.getTaskFlow(loop.proposedFlowId);
+        if (!flow) continue;
+        const steps = store.listTaskFlowSteps(flow.id);
+        addDocument({
+          projectId,
+          sourceType: "flow",
+          sourceRef: flow.id,
+          title: flow.title,
+          summary: flow.resultSummary ?? flow.errorText,
+          body: [
+            flow.title,
+            flow.resultSummary ?? "",
+            flow.errorText ?? "",
+            ...steps.map((step) => `${step.position + 1}. ${step.title}\n${step.prompt}`),
+          ].filter(Boolean).join("\n\n"),
+          reliability: flow.status === "completed" ? 0.7 : 0.45,
+          confidence: flow.status === "completed" ? 0.7 : 0.45,
+          metadata: { loopId: loop.id, status: flow.status },
+          updatedAt: flow.updatedAt,
+        });
+      }
+
+      for (const conversationId of linkedConversationIds) {
+        const rows = db
+          .prepare(
+            `SELECT id, agent_id, conversation_id, run_id, task_id, kind, title, path, summary, metadata_json, created_at, updated_at
+             FROM artifacts
+             WHERE conversation_id = ?
+             ORDER BY updated_at DESC
+             LIMIT 100`,
+          )
+          .all(conversationId) as ArtifactRow[];
+        for (const artifact of rows.map(mapArtifact)) {
+          const markdown = typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : "";
+          addDocument({
+            projectId,
+            sourceType: artifact.kind === "report" ? "report" : "artifact",
+            sourceRef: artifact.id,
+            title: artifact.title,
+            summary: artifact.summary,
+            body: [artifact.title, artifact.summary ?? "", markdown, artifact.path ?? ""].filter(Boolean).join("\n"),
+            reliability: artifact.kind === "report" ? 0.7 : 0.55,
+            confidence: artifact.kind === "report" ? 0.7 : 0.55,
+            metadata: { runId: artifact.runId, taskId: artifact.taskId, kind: artifact.kind, path: artifact.path },
+            updatedAt: artifact.updatedAt,
+          });
+        }
+      }
+
+      return {
+        projectId,
+        documentCount,
+        chunkCount,
+        indexMode: projectRagFtsAvailable(db) ? "fts5" as const : "like" as const,
+        durationMs: Date.now() - startedAt,
+        embedding: {
+          enabled: false as const,
+          provider: "none" as const,
+          reason: "Vector embeddings are intentionally disabled by default; SQLite FTS powers v1 project RAG.",
+        },
+      };
+    },
+
+    searchProjectRag(input: {
+      projectId: string;
+      q: string;
+      limit?: number;
+      offset?: number;
+    }): { results: ProjectRagQueryResult[]; indexMode: "fts5" | "like" } {
+      const project = store.getResearchProject(input.projectId);
+      if (!project) {
+        throw new Error("Research project not found.");
+      }
+      const limit = Math.min(Math.max(input.limit ?? 10, 1), 50);
+      const offset = Math.max(input.offset ?? 0, 0);
+      type RagSearchRow = {
+        doc_id: string;
+        doc_project_id: string;
+        doc_source_type: ProjectDocumentSourceType;
+        doc_source_ref: string;
+        doc_title: string;
+        doc_summary: string | null;
+        doc_uri: string | null;
+        doc_reliability: number;
+        doc_confidence: number;
+        doc_metadata_json: string;
+        doc_created_at: number;
+        doc_updated_at: number;
+        chunk_id: string;
+        chunk_document_id: string;
+        chunk_project_id: string;
+        chunk_index: number;
+        chunk_content: string;
+        chunk_redacted_content: string;
+        chunk_token_hint: number;
+        chunk_metadata_json: string;
+        chunk_created_at: number;
+        rank?: number;
+      };
+      const rowsToResults = (
+        rows: RagSearchRow[],
+        indexMode: "fts5" | "like",
+      ) => {
+        const nowMs = Date.now();
+        return rows
+          .map((row) => {
+            const document = mapProjectDocument({
+              id: row.doc_id,
+              project_id: row.doc_project_id,
+              source_type: row.doc_source_type,
+              source_ref: row.doc_source_ref,
+              title: row.doc_title,
+              summary: row.doc_summary,
+              uri: row.doc_uri,
+              reliability: row.doc_reliability,
+              confidence: row.doc_confidence,
+              metadata_json: row.doc_metadata_json,
+              created_at: row.doc_created_at,
+              updated_at: row.doc_updated_at,
+            });
+            const chunk = mapProjectDocumentChunk({
+              id: row.chunk_id,
+              document_id: row.chunk_document_id,
+              project_id: row.chunk_project_id,
+              chunk_index: row.chunk_index,
+              content: row.chunk_content,
+              redacted_content: row.chunk_redacted_content,
+              token_hint: row.chunk_token_hint,
+              metadata_json: row.chunk_metadata_json,
+              created_at: row.chunk_created_at,
+            });
+            const ageDays = Math.max(0, (nowMs - document.updatedAt) / 86_400_000);
+            const recencyBoost = Math.max(0, 1 - ageDays / 30) * 0.2;
+            const rankScore = indexMode === "fts5" ? 1 / (1 + Math.abs(row.rank ?? 0)) : 1;
+            const score =
+              rankScore +
+              document.reliability * 0.25 +
+              document.confidence * 0.35 +
+              recencyBoost;
+            return {
+              document,
+              chunk,
+              snippet: searchSnippet(chunk.redactedContent, input.q),
+              score,
+              indexMode,
+            };
+          })
+          .sort((left, right) => right.score - left.score || right.document.updatedAt - left.document.updatedAt)
+          .slice(0, limit);
+      };
+
+      const selectColumns = `
+        d.id AS doc_id, d.project_id AS doc_project_id, d.source_type AS doc_source_type,
+        d.source_ref AS doc_source_ref, d.title AS doc_title, d.summary AS doc_summary,
+        d.uri AS doc_uri, d.reliability AS doc_reliability, d.confidence AS doc_confidence,
+        d.metadata_json AS doc_metadata_json, d.created_at AS doc_created_at, d.updated_at AS doc_updated_at,
+        c.id AS chunk_id, c.document_id AS chunk_document_id, c.project_id AS chunk_project_id,
+        c.chunk_index AS chunk_index, c.content AS chunk_content, c.redacted_content AS chunk_redacted_content,
+        c.token_hint AS chunk_token_hint, c.metadata_json AS chunk_metadata_json, c.created_at AS chunk_created_at
+      `;
+      const ftsQuery = buildFtsQuery(input.q);
+      if (projectRagFtsAvailable(db) && ftsQuery) {
+        try {
+          const rows = db
+            .prepare(
+              `SELECT ${selectColumns}, bm25(project_document_chunks_fts) AS rank
+               FROM project_document_chunks_fts
+               JOIN project_document_chunks c ON c.id = project_document_chunks_fts.chunk_id
+               JOIN project_documents d ON d.id = c.document_id
+               WHERE project_document_chunks_fts MATCH ? AND project_document_chunks_fts.project_id = ?
+               ORDER BY rank
+               LIMIT ? OFFSET ?`,
+            )
+            .all(ftsQuery, input.projectId, limit * 4, offset) as RagSearchRow[];
+          return { results: rowsToResults(rows, "fts5"), indexMode: "fts5" };
+        } catch {
+          // Fall through to LIKE search when FTS is unavailable or rejects a query.
+        }
+      }
+
+      const like = `%${input.q}%`;
+      const rows = db
+        .prepare(
+          `SELECT ${selectColumns}
+           FROM project_document_chunks c
+           JOIN project_documents d ON d.id = c.document_id
+           WHERE c.project_id = ? AND (d.title LIKE ? OR c.redacted_content LIKE ?)
+           ORDER BY d.updated_at DESC
+           LIMIT ? OFFSET ?`,
+        )
+        .all(input.projectId, like, like, limit * 4, offset) as RagSearchRow[];
+      return { results: rowsToResults(rows, "like"), indexMode: "like" };
     },
 
     createMetadataArtifact(input: {
@@ -1672,6 +2402,26 @@ export function createStore(dataDir: string) {
         body: `${artifact.title}\n${artifact.summary ?? ""}\n${typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : ""}`,
         updatedAt: artifact.updatedAt,
       });
+      const project = store.findResearchProjectForConversation(artifact.conversationId);
+      if (project) {
+        store.upsertProjectDocument({
+          projectId: project.id,
+          sourceType: artifact.kind === "report" ? "report" : "artifact",
+          sourceRef: artifact.id,
+          title: artifact.title,
+          summary: artifact.summary,
+          body: [
+            artifact.title,
+            artifact.summary ?? "",
+            typeof artifact.metadata.markdown === "string" ? artifact.metadata.markdown : "",
+            artifact.path ?? "",
+          ].filter(Boolean).join("\n"),
+          reliability: artifact.kind === "report" ? 0.7 : 0.55,
+          confidence: artifact.kind === "report" ? 0.7 : 0.55,
+          metadata: { runId: artifact.runId, taskId: artifact.taskId, kind: artifact.kind, path: artifact.path },
+          updatedAt: artifact.updatedAt,
+        });
+      }
       return artifact;
     },
 
@@ -1729,6 +2479,14 @@ export function createStore(dataDir: string) {
         input.status === "completed" ? timestamp : null,
       );
       const project = store.getResearchProject(id)!;
+      if (project.conversationId) {
+        store.linkResearchProjectSession({
+          projectId: project.id,
+          conversationId: project.conversationId,
+          role: "primary",
+          includeInContext: true,
+        });
+      }
       store.upsertSearchDocument({
         kind: "research_project",
         agentId: project.agentId,
@@ -1744,6 +2502,7 @@ export function createStore(dataDir: string) {
 
     updateResearchProject(input: {
       projectId: string;
+      conversationId?: string | null;
       title?: string;
       objective?: string;
       domain?: string | null;
@@ -1758,17 +2517,24 @@ export function createStore(dataDir: string) {
       }
       const timestamp = now();
       const status = input.status ?? existing.status;
+      if (input.conversationId) {
+        const conversation = store.getConversation(input.conversationId);
+        if (!conversation || conversation.agentId !== existing.agentId) {
+          throw new Error("Conversation not found for research project.");
+        }
+      }
       db.prepare(
         `UPDATE research_projects
-         SET title = ?, objective = ?, domain = ?, status = ?, autonomy_enabled = ?,
+         SET conversation_id = ?, title = ?, objective = ?, domain = ?, status = ?, autonomy_enabled = ?,
              autonomy_budget_json = ?, safety_policy_json = ?, updated_at = ?,
              completed_at = CASE
                WHEN ? = 'completed' THEN COALESCE(completed_at, ?)
                WHEN ? != 'completed' THEN NULL
                ELSE completed_at
              END
-         WHERE id = ?`,
+       WHERE id = ?`,
       ).run(
+        input.conversationId === undefined ? existing.conversationId : input.conversationId,
         input.title ?? existing.title,
         input.objective ?? existing.objective,
         input.domain === undefined ? existing.domain : input.domain,
@@ -1782,7 +2548,16 @@ export function createStore(dataDir: string) {
         status,
         input.projectId,
       );
-      return store.getResearchProject(input.projectId);
+      const updated = store.getResearchProject(input.projectId);
+      if (updated?.conversationId) {
+        store.linkResearchProjectSession({
+          projectId: updated.id,
+          conversationId: updated.conversationId,
+          role: "primary",
+          includeInContext: true,
+        });
+      }
+      return updated;
     },
 
     getResearchProject(projectId: string): ResearchProjectRecord | null {
@@ -1817,6 +2592,93 @@ export function createStore(dataDir: string) {
             )
             .all() as ResearchProjectRow[]);
       return rows.map(mapResearchProject);
+    },
+
+    linkResearchProjectSession(input: {
+      projectId: string;
+      conversationId: string;
+      role?: string;
+      includeInContext?: boolean;
+    }): ResearchProjectSessionRecord {
+      const project = store.getResearchProject(input.projectId);
+      if (!project) {
+        throw new Error("Research project not found.");
+      }
+      const conversation = store.getConversation(input.conversationId);
+      if (!conversation || conversation.agentId !== project.agentId) {
+        throw new Error("Conversation not found for research project.");
+      }
+      const timestamp = now();
+      db.prepare(
+        `INSERT INTO research_project_sessions (
+          project_id, conversation_id, role, include_in_context, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id, conversation_id) DO UPDATE SET
+          role = excluded.role,
+          include_in_context = excluded.include_in_context,
+          updated_at = excluded.updated_at`,
+      ).run(
+        project.id,
+        conversation.id,
+        input.role?.trim() || "member",
+        input.includeInContext === false ? 0 : 1,
+        timestamp,
+        timestamp,
+      );
+      if (!project.conversationId) {
+        db.prepare(`UPDATE research_projects SET conversation_id = ?, updated_at = ? WHERE id = ?`).run(
+          conversation.id,
+          timestamp,
+          project.id,
+        );
+      }
+      return store
+        .listResearchProjectSessions(project.id)
+        .find((session) => session.conversationId === conversation.id)!;
+    },
+
+    unlinkResearchProjectSession(projectId: string, conversationId: string): boolean {
+      const result = db
+        .prepare(`DELETE FROM research_project_sessions WHERE project_id = ? AND conversation_id = ?`)
+        .run(projectId, conversationId);
+      const project = store.getResearchProject(projectId);
+      if (project?.conversationId === conversationId) {
+        const replacement = store.listResearchProjectSessions(projectId)[0] ?? null;
+        db.prepare(`UPDATE research_projects SET conversation_id = ?, updated_at = ? WHERE id = ?`).run(
+          replacement?.conversationId ?? null,
+          now(),
+          projectId,
+        );
+      }
+      return result.changes > 0;
+    },
+
+    listResearchProjectSessions(projectId: string): ResearchProjectSessionRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT project_id, conversation_id, role, include_in_context, created_at, updated_at
+           FROM research_project_sessions
+           WHERE project_id = ?
+           ORDER BY role = 'primary' DESC, updated_at DESC`,
+        )
+        .all(projectId) as ResearchProjectSessionRow[];
+      return rows.map(mapResearchProjectSession);
+    },
+
+    findResearchProjectForConversation(conversationId: string): ResearchProjectRecord | null {
+      const row = db
+        .prepare(
+          `SELECT p.id, p.agent_id, p.conversation_id, p.title, p.objective, p.domain, p.status,
+                  p.autonomy_enabled, p.autonomy_budget_json, p.safety_policy_json,
+                  p.created_at, p.updated_at, p.completed_at
+           FROM research_projects p
+           LEFT JOIN research_project_sessions s ON s.project_id = p.id
+           WHERE p.conversation_id = ? OR s.conversation_id = ?
+           ORDER BY CASE WHEN p.conversation_id = ? THEN 0 ELSE 1 END, p.updated_at DESC
+           LIMIT 1`,
+        )
+        .get(conversationId, conversationId, conversationId) as ResearchProjectRow | undefined;
+      return row ? mapResearchProject(row) : null;
     },
 
     createResearchQuestion(input: {
@@ -2064,6 +2926,27 @@ export function createStore(dataDir: string) {
           updatedAt: record.updatedAt,
         });
       }
+      store.upsertProjectDocument({
+        projectId: record.projectId,
+        sourceType: "evidence",
+        sourceRef: record.id,
+        title: record.claim.slice(0, 160),
+        summary: record.summary,
+        body: [
+          `Claim: ${record.claim}`,
+          `Summary: ${record.summary}`,
+          record.uncertainty ? `Uncertainty: ${record.uncertainty}` : "",
+        ].filter(Boolean).join("\n"),
+        reliability: record.confidence,
+        confidence: record.confidence,
+        metadata: {
+          questionId: record.questionId,
+          hypothesisId: record.hypothesisId,
+          sourceType: record.sourceType,
+          sourceRef: record.sourceRef,
+        },
+        updatedAt: record.updatedAt,
+      });
       return record;
     },
 
@@ -2078,6 +2961,133 @@ export function createStore(dataDir: string) {
         )
         .all(projectId) as ResearchEvidenceRow[];
       return rows.map(mapResearchEvidence);
+    },
+
+    createResearchSource(input: {
+      projectId: string;
+      evidenceId?: string | null;
+      url?: string | null;
+      title: string;
+      author?: string | null;
+      institution?: string | null;
+      publishedAt?: string | null;
+      accessedAt?: string | null;
+      summary: string;
+      quote?: string | null;
+      snapshot?: string | null;
+      reliability?: number;
+      relatedClaim?: string | null;
+      metadata?: Record<string, unknown>;
+    }): ResearchSourceRecord {
+      const project = store.getResearchProject(input.projectId);
+      if (!project) {
+        throw new Error("Research project not found.");
+      }
+      if (input.evidenceId) {
+        const evidence = store.listResearchEvidence(input.projectId).find((item) => item.id === input.evidenceId);
+        if (!evidence) {
+          throw new Error("Research evidence not found for project.");
+        }
+      }
+      const id = crypto.randomUUID();
+      const timestamp = now();
+      const reliability = Math.max(0, Math.min(1, input.reliability ?? 0.5));
+      db.prepare(
+        `INSERT INTO research_sources (
+          id, project_id, evidence_id, url, title, author, institution, published_at, accessed_at,
+          summary, quote, snapshot, reliability, related_claim, metadata_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.projectId,
+        input.evidenceId ?? null,
+        input.url ?? null,
+        input.title,
+        input.author ?? null,
+        input.institution ?? null,
+        input.publishedAt ?? null,
+        input.accessedAt ?? new Date(timestamp).toISOString().slice(0, 10),
+        input.summary,
+        input.quote ?? null,
+        input.snapshot ?? null,
+        reliability,
+        input.relatedClaim ?? null,
+        JSON.stringify(input.metadata ?? {}),
+        timestamp,
+        timestamp,
+      );
+      const source = store.getResearchSource(id);
+      if (!source) {
+        throw new Error("Failed to create research source.");
+      }
+      store.upsertSearchDocument({
+        kind: "source",
+        agentId: project.agentId,
+        conversationId: project.conversationId,
+        projectId: project.id,
+        recordId: source.id,
+        title: source.title,
+        body: [
+          source.title,
+          source.url ?? "",
+          source.author ?? "",
+          source.institution ?? "",
+          source.summary,
+          source.quote ?? "",
+          source.relatedClaim ?? "",
+        ].join("\n"),
+        updatedAt: source.updatedAt,
+      });
+      store.upsertProjectDocument({
+        projectId: project.id,
+        sourceType: "source",
+        sourceRef: source.id,
+        title: source.title,
+        summary: source.summary,
+        uri: source.url,
+        body: [
+          source.title,
+          source.url ?? "",
+          source.author ? `Author: ${source.author}` : "",
+          source.institution ? `Institution: ${source.institution}` : "",
+          source.publishedAt ? `Published: ${source.publishedAt}` : "",
+          source.accessedAt ? `Accessed: ${source.accessedAt}` : "",
+          source.summary,
+          source.quote ? `Quote: ${source.quote}` : "",
+          source.snapshot ? `Snapshot: ${source.snapshot}` : "",
+          source.relatedClaim ? `Related claim: ${source.relatedClaim}` : "",
+        ].filter(Boolean).join("\n"),
+        reliability: source.reliability,
+        confidence: source.reliability,
+        metadata: { evidenceId: source.evidenceId, relatedClaim: source.relatedClaim },
+        updatedAt: source.updatedAt,
+      });
+      return source;
+    },
+
+    getResearchSource(sourceId: string): ResearchSourceRecord | null {
+      const row = db
+        .prepare(
+          `SELECT id, project_id, evidence_id, url, title, author, institution, published_at, accessed_at,
+                  summary, quote, snapshot, reliability, related_claim, metadata_json, created_at, updated_at
+           FROM research_sources
+           WHERE id = ?`,
+        )
+        .get(sourceId) as ResearchSourceRow | undefined;
+      return row ? mapResearchSource(row) : null;
+    },
+
+    listResearchSources(projectId: string): ResearchSourceRecord[] {
+      const rows = db
+        .prepare(
+          `SELECT id, project_id, evidence_id, url, title, author, institution, published_at, accessed_at,
+                  summary, quote, snapshot, reliability, related_claim, metadata_json, created_at, updated_at
+           FROM research_sources
+           WHERE project_id = ?
+           ORDER BY updated_at DESC`,
+        )
+        .all(projectId) as ResearchSourceRow[];
+      return rows.map(mapResearchSource);
     },
 
     createResearchLoop(input: {
@@ -2233,6 +3243,28 @@ export function createStore(dataDir: string) {
             .trim();
           if (!existingEvidenceForFlow && combined) {
             const sections = extractResearchSections(combined);
+            const existingHypotheses = store.listResearchHypotheses(loop.projectId);
+            for (const hypothesisText of sections.hypotheses.slice(0, 5)) {
+              const normalizedHypothesis = hypothesisText.trim();
+              if (!normalizedHypothesis) {
+                continue;
+              }
+              const duplicate = existingHypotheses.some(
+                (hypothesis) =>
+                  hypothesis.hypothesis.trim().toLowerCase() === normalizedHypothesis.toLowerCase(),
+              );
+              if (!duplicate) {
+                existingHypotheses.push(
+                  store.createResearchHypothesis({
+                    projectId: loop.projectId,
+                    questionId: loop.selectedQuestionId,
+                    hypothesis: normalizedHypothesis,
+                    status: "proposed",
+                    confidence: 0.4,
+                  }),
+                );
+              }
+            }
             const claim = sections.claims[0] ?? flow.resultSummary ?? report?.summary ?? "Research loop produced evidence.";
             const summary = sections.evidence[0] ?? combined.slice(0, 1200);
             const claimHash = crypto.createHash("sha256").update(claim).digest("hex");
@@ -2242,7 +3274,7 @@ export function createStore(dataDir: string) {
               .some((item) => item.metadata?.extractionKey === extractionKey);
             if (!existingExtraction) {
               const hasContradiction = /\b(contradict|contradicted|contradiction|반박|모순)\b/i.test(`${claim}\n${summary}`);
-              store.createResearchEvidence({
+              const createdEvidence = store.createResearchEvidence({
                 projectId: loop.projectId,
                 questionId: loop.selectedQuestionId,
                 sourceType: "report",
@@ -2260,6 +3292,49 @@ export function createStore(dataDir: string) {
                   structured: Boolean(sections.claims.length || sections.evidence.length),
                 },
               });
+              const existingSources = store.listResearchSources(loop.projectId);
+              for (const parsedSource of extractResearchSources(combined)) {
+                const sourceHash = crypto
+                  .createHash("sha256")
+                  .update(`${parsedSource.url ?? ""}\n${parsedSource.title}\n${parsedSource.summary}`)
+                  .digest("hex");
+                const sourceExtractionKey = `${loop.id}:source:${flow.id}:${sourceHash}`;
+                const duplicateSource = existingSources.some(
+                  (source) =>
+                    source.metadata?.extractionKey === sourceExtractionKey ||
+                    (parsedSource.url && source.url === parsedSource.url) ||
+                    (!parsedSource.url &&
+                      source.title.trim().toLowerCase() === parsedSource.title.trim().toLowerCase() &&
+                      source.summary.trim().toLowerCase() === parsedSource.summary.trim().toLowerCase()),
+                );
+                if (duplicateSource) {
+                  continue;
+                }
+                existingSources.push(
+                  store.createResearchSource({
+                    projectId: loop.projectId,
+                    evidenceId: createdEvidence.id,
+                    url: parsedSource.url,
+                    title: redactSensitiveText(parsedSource.title),
+                    author: parsedSource.author ? redactSensitiveText(parsedSource.author) : null,
+                    institution: parsedSource.institution ? redactSensitiveText(parsedSource.institution) : null,
+                    publishedAt: parsedSource.publishedAt,
+                    accessedAt: parsedSource.accessedAt,
+                    summary: redactSensitiveText(parsedSource.summary),
+                    quote: parsedSource.quote ? redactSensitiveText(parsedSource.quote) : null,
+                    snapshot: parsedSource.snapshot ? redactSensitiveText(parsedSource.snapshot) : null,
+                    reliability: parsedSource.reliability ?? createdEvidence.confidence,
+                    relatedClaim: parsedSource.relatedClaim ? redactSensitiveText(parsedSource.relatedClaim) : createdEvidence.claim,
+                    metadata: {
+                      extractionKey: sourceExtractionKey,
+                      researchLoopId: loop.id,
+                      flowId: flow.id,
+                      evidenceId: createdEvidence.id,
+                      source: "flow_output",
+                    },
+                  }),
+                );
+              }
             }
           }
           if (loop.selectedQuestionId) {
@@ -2291,6 +3366,13 @@ export function createStore(dataDir: string) {
             errorText: flow.errorText ?? `Linked flow ended with status ${flow.status}.`,
             completedAt,
           });
+        }
+      }
+      for (const projectId of new Set(loops.map((loop) => loop.projectId))) {
+        try {
+          store.rebuildProjectRagIndex(projectId);
+        } catch {
+          // Evidence extraction should not fail a terminal flow sync when the auxiliary RAG index cannot rebuild.
         }
       }
       return loops.map((loop) => store.getResearchLoop(loop.id)).filter((loop): loop is ResearchLoopRecord => Boolean(loop));
@@ -2491,6 +3573,26 @@ export function createStore(dataDir: string) {
             title: evidence.claim.slice(0, 120),
             body: `${evidence.claim}\n${evidence.summary}\n${evidence.uncertainty ?? ""}`,
             updatedAt: evidence.updatedAt,
+          });
+        }
+        for (const source of store.listResearchSources(project.id)) {
+          add({
+            kind: "source",
+            agentId: project.agentId,
+            conversationId: project.conversationId,
+            projectId: project.id,
+            recordId: source.id,
+            title: source.title,
+            body: [
+              source.title,
+              source.url ?? "",
+              source.author ?? "",
+              source.institution ?? "",
+              source.summary,
+              source.quote ?? "",
+              source.relatedClaim ?? "",
+            ].join("\n"),
+            updatedAt: source.updatedAt,
           });
         }
       }

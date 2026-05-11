@@ -26,6 +26,18 @@ export function displayConversationTitle(
   if (value.startsWith("??") || /[\uF900-\uFAFF]/u.test(value)) {
     return fallback;
   }
+  if (/^[A-Za-z]:[\\/]/.test(value) || value.startsWith("/") || value.includes("\\") || /(^|\/)workspace\/opencode\//i.test(value)) {
+    const leaf = value
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean)
+      .at(-1)
+      ?.trim();
+    if (!leaf || /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(leaf)) {
+      return fallback;
+    }
+    return leaf;
+  }
   return value;
 }
 

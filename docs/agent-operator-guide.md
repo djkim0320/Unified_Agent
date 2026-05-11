@@ -69,6 +69,14 @@ Research work adds a higher-level loop:
 
 `research project -> question/hypothesis -> proposed flow -> run/task artifacts -> evidence`
 
+Research projects also maintain a project-scoped RAG store:
+
+- `project_documents` normalizes project metadata, linked session summaries, sources, evidence, reports, artifacts, and flow records.
+- `project_document_chunks` stores capped redacted text chunks for local retrieval.
+- SQLite FTS5 is used when available, with a LIKE fallback when the local SQLite build has no FTS5 support.
+- opencode prompts receive concise retrieved snippets, reliability/confidence notes, linked session memory, and project files rather than raw full documents.
+- Vector embeddings are intentionally disabled by default; the embedding provider layer is only a future opt-in extension point.
+
 ## 2.2 Workspace Engine
 
 AetherOps is the local control plane: cockpit UI, scheduler, and log store. It owns sessions, persistence, task flows, heartbeats, operator-facing policy notes, and run/audit events. Actual workspace execution is routed through an `AgentEngine` abstraction.
@@ -80,6 +88,8 @@ AetherOps is the local control plane: cockpit UI, scheduler, and log store. It o
 - Status and operations: `GET /api/engine/status`, `POST /api/engine/opencode/refresh-models`, `POST /api/engine/opencode/auth/login`, `GET /api/engine/runs/:runId?conversationId=<id>`.
 
 The opencode engine always runs inside the active conversation sandbox and uses an allowlisted process environment. It records command metadata, JSON event summaries, external session ids when available, changed files, and exit state into workspace run events.
+
+When a conversation is linked to a research project, future opencode runs also receive project memory from the project RAG store. AetherOps still does not execute tools itself; it only retrieves local research memory and adds bounded context to the prompt.
 
 When a conversation has a saved session summary, `OpenCodeEngine` includes a concise "Persistent session summary" section in the run prompt. The summary is owned by AetherOps persistence, but it is refreshed deterministically from local data rather than by a hidden model call. Optional summary suggestion tasks are ordinary opencode-backed detached tasks and must be reviewed/applied by the operator before they update memory.
 
@@ -155,10 +165,11 @@ The MCP tab is useful by design, but it is still not an AetherOps-owned MCP runt
 - Catalog route: `GET /api/mcp/catalog`.
 - Safe config metadata route: `GET /api/mcp/config/status`.
 - Snippet validation route: `POST /api/mcp/config/validate-snippet`.
+- Snippet apply route: `POST /api/mcp/config/apply-snippet`.
 - Test route: `POST /api/mcp/test-run`.
 - Deprecated execution/registration route: `POST /api/mcp/servers` returns `410 Gone`.
 
-The catalog provides copyable opencode config snippets, risk notes, recommended boundaries, and test prompts for common categories such as Filesystem, Browser/Web, GitHub, and Database. Snippet validation is dry-run only: it parses JSON/JSONC, reports env placeholders and risk warnings, and rejects literal token-looking values. The test route creates a normal detached task through `TaskManager -> AgentEngine.runTurn(...) -> opencode`; it does not directly execute an MCP server.
+The catalog provides copyable opencode config snippets, risk notes, recommended boundaries, and test prompts for common categories such as Filesystem, Browser/Web, GitHub, and Database. Snippet validation parses JSON/JSONC, reports env placeholders and risk warnings, and rejects literal token-looking values. Applying a snippet writes only to AetherOps' managed opencode config overlay at `.data/opencode-config/opencode.json`, and every AetherOps-launched opencode run receives that overlay through the sanitized opencode environment. The test route creates a normal detached task through `TaskManager -> AgentEngine.runTurn(...) -> opencode`; it does not directly execute an MCP server.
 
 Path-safety rule: normal API responses show display-safe config labels. Absolute local config paths are only returned when debug path exposure is explicitly enabled.
 

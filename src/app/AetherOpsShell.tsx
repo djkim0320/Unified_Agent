@@ -37,7 +37,8 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
     flowDraftError, setFlowDraftError, runArtifacts, artifactPreview, setArtifactPreview, artifactDiff, setArtifactDiff,
     runDebug, runDetailLoading, mcpCatalog, mcpLoading, mcpSnippetValidation, mcpStatus, skillTemplates, skillTemplatesLoading,
     activeResearchProject, activeResearchProjectId, researchEvidence, researchHypotheses, researchLastReport,
-    researchLoading, researchLoops, researchPreflight, researchProjects, researchQuestions, researchSearchResults,
+    researchLoading, researchLoops, researchPreflight, researchProjects, researchQuestions, researchRagResults, researchRagStatus,
+    researchSearchResults, researchSources,
     setActiveResearchProjectId, preflightLoading, preflightStatus, providersByKind, activeProvider, activeModelOption, activeModelCount, activeModelsLoading,
     activeModelsError, activeProviderLabel, activeReasoningLabel, selectedRun, manualRunSelectionRef, activeConversationIdRef,
     activeAgentIdRef, updateConversation, createConversationThread, refreshAgentTasks, refreshEngineStatus, refreshMcpMetadata,
@@ -53,10 +54,11 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
     handleSaveFlowDraft, handleSaveProvider, handleSaveStandingOrders, handleSaveSummary, handleSaveTaskFlowAsSkill,
     handleSaveTaskFlowSteps, handleSelectAgent, handleSelectTaskFlow, handleSendMessage, handleTaskFlowControl,
     handleTaskFlowStepControl, handleTestProvider, handleTriggerAutomationRule, handleTriggerHeartbeat, handleUpdateAutomationRule,
-    handleUpdateCustomSkillTemplate, handleValidateMcpSnippet, addResearchEvidence, addResearchHypothesis,
-    addResearchQuestion, cancelResearchLoop, createResearchProject, createResearchReport, createResearchReportTask,
+    handleUpdateCustomSkillTemplate, handleApplyMcpSnippet, handleValidateMcpSnippet, addResearchEvidence, addResearchHypothesis,
+    addResearchQuestion, addResearchSource, cancelResearchLoop, createResearchProject, createResearchReport, createResearchReportTask,
     createResearchSubagent, patchResearchProject, proposeResearchLoop, refreshResearchProjectDetail,
-    refreshResearchProjects, searchResearchRecords, startResearchLoop, requestDeleteAgent, agentSoulDraft,
+    rebuildProjectRagIndex, refreshResearchProjects, searchProjectRagRecords, searchResearchRecords, startResearchGoal, startResearchLoop,
+    startSelfImprovementGoal, stopResearchGoal, tickResearchGoal, tickResearchLoop, requestDeleteAgent, agentSoulDraft,
   } = controller;
 
   const composerControl = activeConversation ? (
@@ -99,13 +101,35 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
       <ConversationList
         activeAgentId={activeAgentId}
         activeNavTarget={activeNavTarget}
+        activeResearchProjectId={activeResearchProjectId}
         agents={agents}
         activeConversationId={activeConversationId}
         conversations={conversations}
+        researchProjects={researchProjects}
         onCreateConversation={() => {
           setActiveNavTarget("chat");
           setActiveSection("chat");
           void createConversationThread(activeConversation?.providerKind, activeAgentId);
+        }}
+        onCreateProject={() => {
+          if (!activeAgentId) {
+            setAppNotice("프로젝트를 만들 에이전트를 먼저 선택해 주세요.");
+            return;
+          }
+          const title = activeConversation
+            ? displayConversationTitle(activeConversation.title)
+            : "새 연구 프로젝트";
+          void createResearchProject({
+            agentId: activeAgentId,
+            conversationId: activeConversation?.id ?? null,
+            title,
+            objective: "이 프로젝트의 연구 목표와 범위를 정리해 주세요.",
+          }).then((project) => {
+            if (!project) return;
+            setActiveNavTarget("research");
+            setActiveSection("research");
+            setActiveResearchProjectId(project.id);
+          });
         }}
         onDeleteConversation={(conversationId) => {
           void handleDeleteConversation(conversationId);
@@ -124,6 +148,10 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
           setPendingAssistantText("");
           setLiveEvents([]);
           setChangedFiles([]);
+        }}
+        onSelectResearchProject={(projectId) => {
+          setActiveResearchProjectId(projectId);
+          void refreshResearchProjectDetail(projectId);
         }}
       />
 
@@ -203,6 +231,7 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
               <div className="cockpit-chat-grid">
                 <section className="cockpit-chat-card">
                   <ChatView
+                    activityEvents={liveEvents}
                     changedFiles={changedFiles}
                     error={chatError}
                     loading={streaming}
@@ -525,6 +554,18 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
               onProposeLoop={(projectId, payload) => {
                 void proposeResearchLoop(projectId, payload);
               }}
+              onStartGoal={(projectId, payload) => {
+                void startResearchGoal(projectId, payload);
+              }}
+              onStartSelfImprovement={(agentId, payload) => {
+                void startSelfImprovementGoal(agentId, payload);
+              }}
+              onStopGoal={(projectId) => {
+                void stopResearchGoal(projectId);
+              }}
+              onTickGoal={(projectId) => {
+                void tickResearchGoal(projectId);
+              }}
               onRefresh={(projectId) => {
                 if (projectId) {
                   void refreshResearchProjectDetail(projectId);
@@ -545,7 +586,22 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
               preflight={researchPreflight}
               projects={researchProjects}
               questions={researchQuestions}
+              ragResults={researchRagResults}
+              ragStatus={researchRagStatus}
               searchResults={researchSearchResults}
+              sources={researchSources}
+              onAddSource={(projectId, payload) => {
+                void addResearchSource(projectId, payload);
+              }}
+              onRebuildRag={(projectId) => {
+                void rebuildProjectRagIndex(projectId);
+              }}
+              onSearchRag={(projectId, query) => {
+                void searchProjectRagRecords(projectId, query);
+              }}
+              onTickLoop={(loopId) => {
+                void tickResearchLoop(loopId);
+              }}
             />
           ) : activeSection === "mcp" || activeSection === "skills" ? (
             <ExtensionsSectionView
@@ -603,6 +659,9 @@ export function AetherOpsShell({ controller }: { controller: AetherOpsController
               }}
               onValidateMcpSnippet={(snippet) => {
                 void handleValidateMcpSnippet(snippet);
+              }}
+              onApplyMcpSnippet={(snippet) => {
+                void handleApplyMcpSnippet(snippet);
               }}
               platformMetadata={platformMetadata}
               providers={providers}

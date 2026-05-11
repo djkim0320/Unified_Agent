@@ -390,6 +390,7 @@ describe("OpenCodeEngine", () => {
           sendEvent() {},
         },
         workspacePath: ".",
+        workspaceMode: "session",
         workspace: brokenWorkspace,
       }),
     ).toThrow("guide read failed");
@@ -399,6 +400,7 @@ describe("OpenCodeEngine", () => {
     const workspace = createWorkspaceManager(projectRoot);
     const { agent, conversation } = createConversation();
     const observed: { env: NodeJS.ProcessEnv | null } = { env: null };
+    const sentEvents: Array<{ eventName: string; payload: Record<string, unknown> }> = [];
     const runner: OpenCodeCommandRunner = {
       async run() {
         return {
@@ -448,10 +450,16 @@ describe("OpenCodeEngine", () => {
       agentId: agent.id,
       userMessage: "Create note.txt",
       messages: store.listMessages(conversation.id),
-      sendEvent() {},
+      sendEvent(eventName, payload) {
+        sentEvents.push({ eventName, payload });
+      },
     });
 
     expect(result.assistantText).toBe("Done from opencode.");
+    expect(sentEvents.filter((event) => event.eventName === "delta")).toHaveLength(1);
+    expect(sentEvents.find((event) => event.eventName === "delta")?.payload).toMatchObject({
+      delta: "Done from opencode.",
+    });
     expect(result.changedFiles).toEqual(["note.txt"]);
     expect(result.engineRun?.externalSessionId).toBe("opencode-session-1");
     expect(result.engineRun?.model).toBe("openai/gpt-5.5");
@@ -465,6 +473,64 @@ describe("OpenCodeEngine", () => {
     expect(workspace.readFile({ conversationId: conversation.id, scope: "sandbox", relativePath: "note.txt" }).content).toBe(
       "created by opencode",
     );
+  });
+
+  it("can run an explicitly approved research goal in the repository workspace", async () => {
+    const workspace = createWorkspaceManager(projectRoot);
+    const { agent, conversation } = createConversation();
+    let observedCwd: string | null = null;
+    const runner: OpenCodeCommandRunner = {
+      async run() {
+        return {
+          exitCode: 0,
+          stdout: "[]",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+      async runStreaming(_args, options) {
+        observedCwd = options.cwd;
+        fs.writeFileSync(path.join(options.cwd, "repo-note.txt"), "repo workspace", "utf8");
+        options.onStdoutChunk?.('{"type":"assistant","text":"Repository run complete."}\n');
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          cancelled: false,
+          errorMessage: null,
+        };
+      },
+    };
+    const engine = createOpenCodeEngine({
+      projectRoot,
+      workspace,
+      store,
+      runner,
+      binary: "opencode",
+    });
+
+    const result = await engine.runTurn({
+      agent,
+      conversation,
+      providerKind: conversation.providerKind,
+      model: conversation.model,
+      reasoningLevel: conversation.reasoningLevel,
+      conversationId: conversation.id,
+      agentId: agent.id,
+      userMessage: "Edit the repository.",
+      messages: store.listMessages(conversation.id),
+      workspaceMode: "repository",
+      sendEvent() {},
+    });
+
+    expect(observedCwd).toBe(projectRoot);
+    expect(fs.existsSync(path.join(projectRoot, "repo-note.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(projectRoot, "workspace", "opencode", "conversations", conversation.id, "repo-note.txt"))).toBe(false);
+    expect(result.changedFiles).toEqual(["repo-note.txt"]);
+    expect(result.engineRun?.workspacePath).toBe("repository-root");
   });
 
   it("adds the opencode permission bypass flag only when explicitly enabled", async () => {

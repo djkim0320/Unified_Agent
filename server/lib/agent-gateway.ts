@@ -7,7 +7,15 @@ import type {
   HeartbeatLogRecord,
   ProviderKind,
   ProviderSecret,
+  ProjectRagQueryResult,
   ReasoningLevel,
+  ResearchLoopRecord,
+  ResearchProjectRecord,
+  ResearchProjectSessionRecord,
+  ResearchQuestionRecord,
+  ResearchEvidenceRecord,
+  ResearchHypothesisRecord,
+  ResearchSourceRecord,
   SessionSummaryRecord,
   TaskKind,
   TaskFlowRecord,
@@ -17,9 +25,11 @@ import type {
   WorkspaceRunRecord,
 } from "../types.js";
 import type { createWorkspaceManager } from "./workspace.js";
+import { buildResearchRagContext } from "./research/rag-context.js";
 
 export function createAgentGateway(params: {
   projectRoot: string;
+  managedOpenCodeConfigPath?: string | null;
   workspace: ReturnType<typeof createWorkspaceManager>;
   store: {
     getAgent: (agentId: string) => AgentRecord | null;
@@ -213,6 +223,20 @@ export function createAgentGateway(params: {
       clearTaskId?: boolean;
       clearCompletedAt?: boolean;
     }) => TaskFlowStepRecord | null;
+    listResearchProjects?: (agentId?: string) => ResearchProjectRecord[];
+    findResearchProjectForConversation?: (conversationId: string) => ResearchProjectRecord | null;
+    listResearchProjectSessions?: (projectId: string) => ResearchProjectSessionRecord[];
+    listResearchQuestions?: (projectId: string) => ResearchQuestionRecord[];
+    listResearchHypotheses?: (projectId: string) => ResearchHypothesisRecord[];
+    listResearchEvidence?: (projectId: string) => ResearchEvidenceRecord[];
+    listResearchSources?: (projectId: string) => ResearchSourceRecord[];
+    listResearchLoops?: (projectId: string) => ResearchLoopRecord[];
+    searchProjectRag?: (input: {
+      projectId: string;
+      q: string;
+      limit?: number;
+      offset?: number;
+    }) => { results: ProjectRagQueryResult[]; indexMode: "fts5" | "like" };
   };
   resolveSecret: (kind: ProviderKind) => Promise<ProviderSecret<ProviderKind> | null>;
 }) {
@@ -220,6 +244,7 @@ export function createAgentGateway(params: {
 
   const agentEngine = createOpenCodeEngine({
     projectRoot: params.projectRoot,
+    managedConfigPath: params.managedOpenCodeConfigPath,
     workspace: params.workspace,
     store: params.store,
   });
@@ -267,6 +292,77 @@ export function createAgentGateway(params: {
     ].join("\n");
   }
 
+  function workspaceModeForTask(task: TaskRecord): "session" | "repository" {
+    if (!task.taskFlowId || !params.store.listResearchProjects || !params.store.listResearchLoops) {
+      return "session";
+    }
+    const projects = params.store.listResearchProjects(task.agentId);
+    for (const project of projects) {
+      const linkedLoop = params.store
+        .listResearchLoops(project.id)
+        .find((loop) => loop.proposedFlowId === task.taskFlowId);
+      if (linkedLoop && project.safetyPolicy.workspaceMode === "repository") {
+        return "repository";
+      }
+    }
+    return "session";
+  }
+
+  function buildProjectSharedContext(input: {
+    conversation: ConversationRecord;
+    userMessage: string;
+  }) {
+    if (
+      !params.store.findResearchProjectForConversation ||
+      !params.store.listResearchProjectSessions ||
+      !params.store.listResearchQuestions ||
+      !params.store.listResearchHypotheses ||
+      !params.store.listResearchEvidence ||
+      !params.store.listResearchSources
+    ) {
+      return null;
+    }
+    const project = params.store.findResearchProjectForConversation(input.conversation.id);
+    if (!project) {
+      return null;
+    }
+    const links = params.store.listResearchProjectSessions(project.id);
+    const sessions = links
+      .filter((link) => link.includeInContext)
+      .slice(0, 8)
+      .map((link) => {
+        const conversation = params.store.getConversation(link.conversationId);
+        return {
+          link,
+          conversation,
+          summary: params.store.getSessionSummary?.(link.conversationId) ?? null,
+          messages: params.store.listMessages(link.conversationId).slice(-8),
+        };
+      });
+    const files = params.workspace.readResearchProjectFiles(project.agentId, project.id).files;
+    const question =
+      params.store
+        .listResearchQuestions(project.id)
+        .find((item) => item.status === "open" || item.status === "investigating") ?? null;
+    const ragResults =
+      params.store.searchProjectRag?.({
+        projectId: project.id,
+        q: input.userMessage,
+        limit: 6,
+      }).results ?? [];
+    return buildResearchRagContext({
+      project,
+      question,
+      goal: input.userMessage,
+      hypotheses: params.store.listResearchHypotheses(project.id),
+      evidence: params.store.listResearchEvidence(project.id),
+      sources: params.store.listResearchSources(project.id),
+      ragResults,
+      sessions,
+      projectFiles: files,
+    });
+  }
+
   async function executeDetachedTask(paramsInput: {
     task: TaskRecord;
     signal: AbortSignal;
@@ -298,6 +394,10 @@ export function createAgentGateway(params: {
       userMessage: paramsInput.task.prompt,
       messages,
       sessionSummary: params.store.getSessionSummary?.(conversation.id) ?? null,
+      researchContext: buildProjectSharedContext({
+        conversation,
+        userMessage: paramsInput.task.prompt,
+      }),
       signal: paramsInput.signal,
       isDetachedTask: paramsInput.task.taskKind !== "heartbeat" && paramsInput.task.taskKind !== "subagent",
       isHeartbeatRun: paramsInput.task.taskKind === "heartbeat",
@@ -306,6 +406,7 @@ export function createAgentGateway(params: {
       nestingDepth: paramsInput.task.nestingDepth ?? 0,
       conversationTitle: conversation.title,
       parentRunId: paramsInput.task.originRunId ?? conversation.ownerRunId ?? null,
+      workspaceMode: workspaceModeForTask(paramsInput.task),
       sendEvent(eventName, payload) {
         if (eventName === "delta") {
           return;
@@ -453,6 +554,7 @@ export function createAgentGateway(params: {
     conversationId: string;
     title: string;
     originRunId?: string | null;
+    triggerSource?: TaskFlowRecord["triggerSource"];
     autoStart?: boolean;
     steps: Array<{
       stepKey: string;
@@ -476,7 +578,7 @@ export function createAgentGateway(params: {
       agentId: input.agentId,
       conversationId: input.conversationId,
       title: input.title,
-      triggerSource: "manual",
+      triggerSource: input.triggerSource ?? "manual",
       originRunId: input.originRunId ?? null,
     });
     const steps = input.steps.map((step, index) =>
@@ -547,6 +649,10 @@ export function createAgentGateway(params: {
         content: message.content,
       })),
       sessionSummary: params.store.getSessionSummary?.(conversation.id) ?? null,
+      researchContext: buildProjectSharedContext({
+        conversation,
+        userMessage: paramsInput.userMessage,
+      }),
       sendEvent: paramsInput.sendEvent,
       signal: paramsInput.signal,
       unsafeShellEnabled: paramsInput.unsafeShellEnabled,
